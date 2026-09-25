@@ -8,6 +8,9 @@ export interface TableColumn {
 }
 
 export type ForeignKey = {
+  // Absent when the driver doesn't say which schema the target is in.
+  // eslint-disable-next-line camelcase
+  target_schema?: string;
   // eslint-disable-next-line camelcase
   target_table: string;
   // eslint-disable-next-line camelcase
@@ -230,6 +233,8 @@ export type ForeignKeysQueryResult = {
   table_name: string
   // eslint-disable-next-line camelcase
   column_name: string
+  // eslint-disable-next-line camelcase
+  target_schema?: string
   // eslint-disable-next-line camelcase
   target_table: string
   // eslint-disable-next-line camelcase

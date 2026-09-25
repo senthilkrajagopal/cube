@@ -209,4 +209,45 @@ describe('DatabricksDriver', () => {
       });
     });
   });
+
+  describe('table types', () => {
+    const answer = (views: () => unknown) => async (sql: string) => {
+      if (sql.startsWith('SHOW TABLES')) {
+        return [
+          { database: 'sales', tableName: 'orders', isTemporary: false },
+          { database: 'sales', tableName: 'big_orders', isTemporary: false },
+          { database: 'sales', tableName: 'orders_daily', isTemporary: false },
+        ];
+      }
+      return views();
+    };
+
+    test('labels views and materialized views from SHOW VIEWS, and the rest as tables', async () => {
+      const driver = new DatabricksDriver({});
+      const query = jest.spyOn(driver, 'query').mockImplementation(answer(() => [
+        { namespace: 'sales', viewName: 'big_orders', isTemporary: false, isMaterialized: false },
+        { namespace: 'sales', viewName: 'orders_daily', isTemporary: false, isMaterialized: true },
+      ]) as any);
+
+      await expect(driver.getTablesForSpecificSchemas([{ schema_name: 'sales' }])).resolves.toEqual([
+        { schema_name: 'sales', table_name: 'orders', table_type: 'TABLE' },
+        { schema_name: 'sales', table_name: 'big_orders', table_type: 'VIEW' },
+        { schema_name: 'sales', table_name: 'orders_daily', table_type: 'MATERIALIZED VIEW' },
+      ]);
+      expect(query.mock.calls.map(([sql]) => sql)).toEqual(['SHOW TABLES IN `sales`', 'SHOW VIEWS IN `sales`']);
+    });
+
+    test('lists tables without types when SHOW VIEWS fails', async () => {
+      const driver = new DatabricksDriver({});
+      jest.spyOn(driver, 'query').mockImplementation(answer(() => {
+        throw new Error('SHOW VIEWS is not supported');
+      }) as any);
+
+      await expect(driver.getTablesForSpecificSchemas([{ schema_name: 'sales' }])).resolves.toEqual([
+        { schema_name: 'sales', table_name: 'orders' },
+        { schema_name: 'sales', table_name: 'big_orders' },
+        { schema_name: 'sales', table_name: 'orders_daily' },
+      ]);
+    });
+  });
 });

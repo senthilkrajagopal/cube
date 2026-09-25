@@ -202,7 +202,7 @@ export class MySqlDriver extends BaseDriver implements DriverInterface {
       TABLE_NAME as ${this.quoteIdentifier('table_name')},
       COLUMN_NAME as ${this.quoteIdentifier('column_name')}
   FROM
-      information_schema.KEY_COLUMN_USAGE
+      information_schema.KEY_COLUMN_USAGE AS columns
   WHERE
       CONSTRAINT_NAME = 'PRIMARY'
       AND TABLE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
@@ -214,21 +214,20 @@ export class MySqlDriver extends BaseDriver implements DriverInterface {
   }
 
   protected foreignKeysQuery(conditionString?: string): string | null {
+    // A foreign key's own row in key_column_usage names the column it
+    // references; `columns` is the one `conditionString` names a table of.
     return `SELECT
-        tc.table_schema as ${this.quoteIdentifier('table_schema')},
-        tc.table_name as ${this.quoteIdentifier('table_name')},
-        kcu.column_name as ${this.quoteIdentifier('column_name')},
-        columns.table_name as ${this.quoteIdentifier('target_table')},
-        columns.column_name as ${this.quoteIdentifier('target_column')}
+        columns.table_schema as ${this.quoteIdentifier('table_schema')},
+        columns.table_name as ${this.quoteIdentifier('table_name')},
+        columns.column_name as ${this.quoteIdentifier('column_name')},
+        columns.referenced_table_schema as ${this.quoteIdentifier('target_schema')},
+        columns.referenced_table_name as ${this.quoteIdentifier('target_table')},
+        columns.referenced_column_name as ${this.quoteIdentifier('target_column')}
     FROM
-        information_schema.table_constraints AS tc
-    JOIN information_schema.key_column_usage AS kcu
-        ON tc.constraint_name = kcu.constraint_name
-    JOIN information_schema.key_column_usage AS columns
-        ON columns.constraint_name = tc.constraint_name
+        information_schema.key_column_usage AS columns
     WHERE
-        columns.table_name NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
-        AND tc.constraint_type = 'FOREIGN KEY'${conditionString ? ` AND (${conditionString})` : ''};`;
+        columns.referenced_table_name IS NOT NULL
+        AND columns.table_schema NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')${conditionString ? ` AND (${conditionString})` : ''};`;
   }
 
   public readOnly() {

@@ -763,9 +763,9 @@ the data model names it. An unknown data source answers `404`.
 
 <Note>
 
-Data sources whose driver doesn't load schemas incrementally are read in full
-for each request, and their tables have no `type`. On Postgres, materialized
-views are not listed.
+Data sources whose driver doesn't load schemas incrementally, such as Druid,
+Dremio, Firebolt, Hive, Oracle, Pinot and Vertica, are read in full for each
+request, and their tables have no `type`.
 
 </Note>
 
@@ -799,7 +799,7 @@ sorted by schema and name.
 | `schema` | A schema to list. Repeat it to list several | ✅ Yes |
 | `search` | Keep tables whose name contains this, ignoring case | No |
 | `type` | Keep tables of this type: `table`, `view`, `materialized_view` or `external`. Repeat it to keep several | No |
-| `limit` | Most tables to return, up to `10000`. By default, all | No |
+| `limit` | Most tables to return. By default, all | No |
 | `offset` | Tables to skip. Defaults to `0` | No |
 
 `type` is `null` when the driver can't tell, and `rawType` is the data
@@ -818,9 +818,12 @@ source's own word for it. `total` counts every table that matches, before
 
 ### `{base_path}/v1/introspection/data-sources/{dataSource}/columns`
 
-Send a `POST` request with up to 100 tables to get their columns, in the order
-asked for. `type` is the Cube type [scaffolding](#base_path/v1/introspection/data-sources/dataSource/scaffold)
-gives the column. A table the data source doesn't have answers `404`, naming it.
+Send a `POST` request with up to
+[`CUBEJS_INTROSPECTION_MAX_TABLES`](/reference/configuration/environment-variables#cubejs_introspection_max_tables)
+tables to get their columns, in the order asked for. `type` is the Cube type
+[scaffolding](#base_path/v1/introspection/data-sources/dataSource/scaffold)
+gives the column, and a foreign key's `schema` is `null` when the driver doesn't
+say. A table the data source doesn't have answers `404`, naming it.
 
 ```json
 { "tables": [{ "schema": "public", "table": "orders" }] }
@@ -834,7 +837,7 @@ gives the column. A table the data source doesn't have answers `404`, naming it.
     "columns": [
       { "name": "id", "rawType": "integer", "type": "number", "primaryKey": true, "foreignKeys": [] },
       { "name": "customer_id", "rawType": "integer", "type": "number", "primaryKey": false,
-        "foreignKeys": [{ "table": "customers", "column": "id" }] },
+        "foreignKeys": [{ "schema": "public", "table": "customers", "column": "id" }] },
       { "name": "created_at", "rawType": "timestamp with time zone", "type": "time", "primaryKey": false, "foreignKeys": [] }
     ]
   }]
@@ -843,8 +846,8 @@ gives the column. A table the data source doesn't have answers `404`, naming it.
 
 ### `{base_path}/v1/introspection/data-sources/{dataSource}/scaffold`
 
-Send a `POST` request with up to 100 tables to generate a cube for each. The
-cubes are returned, not saved. Each has a dimension per string, boolean, time
+Send a `POST` request with the same tables as for `/columns` to generate a cube
+for each. The cubes are returned, not saved. Each has a dimension per string, boolean, time
 and key column, a `sum` for each number named like a measure (`amount`,
 `total`, `price`…), a `count`, and joins to the other given tables that
 foreign keys or `<table>_id` columns connect it to. `unmappedColumns` lists the
@@ -856,8 +859,9 @@ table's columns the cube leaves out, and why: `underscore_prefix` or
 | `tables` | The tables, as for `/columns` | ✅ Yes |
 | `format` | `yaml` or `js`. Defaults to `yaml` | No |
 
-Tables whose cubes would have the same name, such as `public.orders` and
-`sales.orders`, answer `400`: generate them separately.
+A cube is named after its table. Tables of the same name in different schemas,
+such as `public.orders` and `sales.orders`, are named after both instead
+(`public_orders`, `sales_orders`), and joins use those names.
 
 ```json
 {

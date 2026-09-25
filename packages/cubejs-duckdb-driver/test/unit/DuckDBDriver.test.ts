@@ -360,3 +360,52 @@ describe('DuckDBDriver lifecycle', () => {
     }
   });
 });
+
+describe('DuckDBDriver schema introspection', () => {
+  const initSql = [
+    'CREATE SCHEMA sales',
+    'CREATE TABLE sales.orders (id INTEGER PRIMARY KEY, amount DECIMAL(10, 2), placed_at TIMESTAMP)',
+    'CREATE VIEW sales.big_orders AS SELECT * FROM sales.orders WHERE amount > 100',
+    "ATTACH ':memory:' AS other",
+    'CREATE SCHEMA other.sales',
+    'CREATE TABLE other.sales.returns (id INTEGER)',
+  ].join('; ');
+
+  test('loads schemas, tables with their types, and columns a level at a time', async () => {
+    const driver = new DuckDBDriver({ initSql });
+
+    try {
+      expect(driver.capabilities().incrementalSchemaLoading).toBe(true);
+      expect(await driver.getSchemas()).toContainEqual({ schema_name: 'sales' });
+
+      const tables = await driver.getTablesForSpecificSchemas([{ schema_name: 'sales' }]);
+      expect(tables).toEqual(expect.arrayContaining([
+        { schema_name: 'sales', table_name: 'orders', table_type: 'BASE TABLE' },
+        { schema_name: 'sales', table_name: 'big_orders', table_type: 'VIEW' },
+      ]));
+
+      const columns = await driver.getColumnsForSpecificTables([{ schema_name: 'sales', table_name: 'orders' }]);
+      expect(columns.map(({ column_name: name, data_type: type }) => [name, type])).toEqual([
+        ['id', 'INTEGER'],
+        ['amount', 'DECIMAL(10,2)'],
+        ['placed_at', 'TIMESTAMP'],
+      ]);
+    } finally {
+      await driver.release();
+    }
+  });
+
+  test('keeps to the configured catalog', async () => {
+    const driver = new DuckDBDriver({ initSql, schema: 'memory' });
+
+    try {
+      const tables = await driver.getTablesForSpecificSchemas([{ schema_name: 'sales' }]);
+      expect(tables.map(t => t.table_name).sort()).toEqual(['big_orders', 'orders']);
+
+      const columns = await driver.getColumnsForSpecificTables([{ schema_name: 'sales', table_name: 'returns' }]);
+      expect(columns).toEqual([]);
+    } finally {
+      await driver.release();
+    }
+  });
+});

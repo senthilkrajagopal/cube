@@ -131,4 +131,42 @@ describe('MySqlDriver', () => {
       );
     }
   });
+
+  describe('schema introspection', () => {
+    beforeAll(async () => {
+      await mySqlDriver.createSchemaIfNotExists('introspection');
+      await mySqlDriver.query('CREATE TABLE introspection.customers (id int PRIMARY KEY, name text)', []);
+      await mySqlDriver.query(
+        'CREATE TABLE introspection.orders (id int PRIMARY KEY, customer_id int, ' +
+        'CONSTRAINT orders_customer FOREIGN KEY (customer_id) REFERENCES introspection.customers (id))',
+        []
+      );
+      await mySqlDriver.query('CREATE VIEW introspection.customer_names AS SELECT name FROM introspection.customers', []);
+    });
+
+    test('says whether each relation is a table or a view', async () => {
+      const tables = await mySqlDriver.getTablesForSpecificSchemas([{ schema_name: 'introspection' }]);
+
+      expect(tables).toEqual(expect.arrayContaining([
+        { schema_name: 'introspection', table_name: 'orders', table_type: 'BASE TABLE' },
+        { schema_name: 'introspection', table_name: 'customer_names', table_type: 'VIEW' },
+      ]));
+    });
+
+    test('gives a column the table and column its foreign key references', async () => {
+      const columns = await mySqlDriver.getColumnsForSpecificTables([{ schema_name: 'introspection', table_name: 'orders' }]);
+
+      expect(columns.find(c => c.column_name === 'customer_id')?.foreign_keys).toEqual([
+        { target_schema: 'introspection', target_table: 'customers', target_column: 'id' },
+      ]);
+      expect(columns.find(c => c.column_name === 'id')?.foreign_keys).toEqual([]);
+    });
+
+    test('marks a primary key column', async () => {
+      const columns = await mySqlDriver.getColumnsForSpecificTables([{ schema_name: 'introspection', table_name: 'orders' }]);
+
+      expect(columns.find(c => c.column_name === 'id')?.attributes).toEqual(['primaryKey']);
+      expect(columns.find(c => c.column_name === 'customer_id')?.attributes).toBeUndefined();
+    });
+  });
 });

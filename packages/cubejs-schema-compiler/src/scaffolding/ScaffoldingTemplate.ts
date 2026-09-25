@@ -38,6 +38,7 @@ export type ScaffoldingTemplateOptions = {
   format?: SchemaFormat;
   snakeCase?: boolean;
   catalog?: string | null;
+  cubeNameFor?: (schema: string, table: string) => string | undefined;
 };
 
 export class ScaffoldingTemplate {
@@ -53,6 +54,7 @@ export class ScaffoldingTemplate {
     const formatterOptions = {
       snakeCase: Boolean(this.options.snakeCase),
       catalog: this.options.catalog,
+      cubeNameFor: this.options.cubeNameFor,
     };
     
     this.formatStrategy =

@@ -128,6 +128,14 @@ type ShowTableRow = {
   isTemporary: boolean,
 };
 
+type ShowViewRow = {
+  namespace: string,
+  viewName: string,
+  isTemporary: boolean,
+  // Absent on runtimes without materialized views.
+  isMaterialized?: boolean,
+};
+
 type ShowDatabasesRow = {
   databaseName: string,
 };
@@ -606,16 +614,44 @@ export class DatabricksDriver extends JDBCDriver {
   public override async getTablesForSpecificSchemas(schemas: QuerySchemasResult[]): Promise<QueryTablesResult[]> {
     const tables = await Promise.all(
       // eslint-disable-next-line camelcase
-      schemas.map(async ({ schema_name }) => this.query<ShowTableRow>(
-        `SHOW TABLES IN ${this.getSchemaFullName(schema_name)}`,
-        []
-      ))
+      schemas.map(async ({ schema_name }) => {
+        const [rows, viewTypes] = await Promise.all([
+          this.query<ShowTableRow>(`SHOW TABLES IN ${this.getSchemaFullName(schema_name)}`, []),
+          this.viewTypesIn(schema_name),
+        ]);
+
+        return rows.map(({ database, tableName }) => ({
+          table_name: tableName,
+          schema_name: database,
+          ...(viewTypes ? { table_type: viewTypes.get(tableName) || 'TABLE' } : {}),
+        }));
+      })
     );
 
-    return tables.flat().map(({ database, tableName }) => ({
-      table_name: tableName,
-      schema_name: database,
-    }));
+    return tables.flat();
+  }
+
+  /**
+   * The views in a schema, as `VIEW` or `MATERIALIZED VIEW` by name: SHOW
+   * TABLES lists views too but doesn't say which rows are views. Nothing when
+   * SHOW VIEWS fails, so the tables are listed without types.
+   */
+  private async viewTypesIn(schemaName: string): Promise<Map<string, string> | null> {
+    try {
+      const views = await this.query<ShowViewRow>(`SHOW VIEWS IN ${this.getSchemaFullName(schemaName)}`, []);
+
+      return new Map(views.map(({ viewName, isMaterialized }) => [
+        viewName,
+        isMaterialized ? 'MATERIALIZED VIEW' : 'VIEW',
+      ]));
+    } catch (e: any) {
+      this.logger?.('Databricks SHOW VIEWS failed. Tables will be listed without types', {
+        schema: schemaName,
+        error: (e.stack || e).toString(),
+      });
+
+      return null;
+    }
   }
 
   public override async getColumnsForSpecificTables(tables: QueryTablesResult[]): Promise<QueryColumnsResult[]> {

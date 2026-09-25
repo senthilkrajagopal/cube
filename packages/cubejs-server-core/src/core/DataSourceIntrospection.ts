@@ -7,7 +7,6 @@ import type {
 import type { QueryOrchestrator } from '@cubejs-backend/query-orchestrator';
 import {
   CubejsHandlerError,
-  UserError,
   type DataSourceColumn,
   type DataSourceIntrospectionApi,
   type DataSourceScaffoldedCube,
@@ -25,6 +24,7 @@ import {
   ScaffoldingTemplate,
   SchemaFormat,
   TableSchema,
+  toSnakeCase,
 } from '@cubejs-backend/schema-compiler';
 
 /**
@@ -67,7 +67,11 @@ function toColumn(row: QueryColumnsResult): DataSourceColumn {
     rawType: row.data_type,
     type: columnTypeOf(row.data_type),
     primaryKey: Boolean(row.attributes?.includes('primaryKey')),
-    foreignKeys: (row.foreign_keys || []).map(fk => ({ table: fk.target_table, column: fk.target_column })),
+    foreignKeys: (row.foreign_keys || []).map(fk => ({
+      schema: fk.target_schema ?? null,
+      table: fk.target_table,
+      column: fk.target_column,
+    })),
   };
 }
 
@@ -193,8 +197,11 @@ export class DataSourceIntrospection implements DataSourceIntrospectionApi {
    * given tables where foreign keys or `<table>_id` columns connect them. The
    * cubes are returned, not written anywhere.
    *
+   * A cube is named after its table. Tables of the same name in different
+   * schemas are named after their schema and table instead, `sales_orders`,
+   * and joins between the given tables follow those names.
+   *
    * @throws CubejsHandlerError 404 naming every table the data source doesn't have
-   * @throws UserError when two tables would generate cubes of the same name
    */
   public async scaffold(
     tables: DataSourceTableRef[],
@@ -213,17 +220,25 @@ export class DataSourceIntrospection implements DataSourceIntrospectionApi {
         name: column.name,
         type: column.rawType,
         attributes: column.primaryKey ? ['primaryKey'] : [],
-        foreign_keys: column.foreignKeys.map(fk => ({ target_table: fk.table, target_column: fk.column })),
+        foreign_keys: column.foreignKeys.map(fk => ({
+          ...(fk.schema !== null ? { target_schema: fk.schema } : {}),
+          target_table: fk.table,
+          target_column: fk.column,
+        })),
       }));
     }
 
     const tableNames = tableColumns.map<[string, string]>(({ schema, name }) => [schema, name]);
-    const tableSchemas = new ScaffoldingSchema(dbSchema, { snakeCase: true }).generateForTables(tableNames);
-    this.assertDistinctCubes(tableSchemas);
+    const cubeNameFor = this.distinctCubeNames(
+      new ScaffoldingSchema(dbSchema, { snakeCase: true }).generateForTables(tableNames)
+    );
+    const tableSchemas = new ScaffoldingSchema(dbSchema, { snakeCase: true, cubeNameFor })
+      .generateForTables(tableNames);
 
     const template = new ScaffoldingTemplate(dbSchema, await this.driverFactory(), {
       format: format === 'js' ? SchemaFormat.JavaScript : SchemaFormat.Yaml,
       snakeCase: true,
+      cubeNameFor,
     });
     const files = template.generateFilesByTableNames(
       tableNames,
@@ -259,21 +274,35 @@ export class DataSourceIntrospection implements DataSourceIntrospectionApi {
       });
   }
 
-  protected assertDistinctCubes(tableSchemas: TableSchema[]) {
-    const tablesByCube = new Map<string, string[]>();
+  /**
+   * A cube name for each table that no other table's cube has: the name
+   * scaffolding gives it where that is unique, `<schema>_<table>` where tables
+   * of the same name in different schemas would share it, and a numbered one
+   * should even that be taken.
+   */
+  protected distinctCubeNames(defaultNamed: TableSchema[]): (schema: string, table: string) => string {
+    const counts = new Map<string, number>();
+    defaultNamed.forEach(({ cube }) => counts.set(cube, (counts.get(cube) || 0) + 1));
 
-    for (const { cube, schema, table } of tableSchemas) {
-      tablesByCube.set(cube, [...(tablesByCube.get(cube) || []), `${schema}.${table}`]);
+    const taken = new Set<string>(defaultNamed.map(({ cube }) => cube).filter(cube => counts.get(cube) === 1));
+    const names = new Map<string, string>();
+
+    for (const { cube, schema, table } of defaultNamed) {
+      let name = cube;
+      if (counts.get(cube) !== 1) {
+        const qualified = toSnakeCase(`${schema}_${table}`);
+
+        name = qualified;
+
+        for (let n = 2; taken.has(name); n++) {
+          name = `${qualified}_${n}`;
+        }
+        taken.add(name);
+      }
+      names.set(tableKey(schema, table), name);
     }
 
-    const clashes = [...tablesByCube.entries()].filter(([, names]) => names.length > 1);
-    if (clashes.length) {
-      throw new UserError(
-        `These tables would generate cubes of the same name, so generate them separately: ${
-          clashes.map(([cube, names]) => `${names.join(' and ')} (${cube})`).join('; ')
-        }`
-      );
-    }
+    return (schema, table) => names.get(tableKey(schema, table)) as string;
   }
 
   protected distinct(tables: DataSourceTableRef[]): DataSourceTableRef[] {

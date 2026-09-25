@@ -246,6 +246,11 @@ describe('PostgresDriver', () => {
         []
       );
       await driver.query('CREATE VIEW introspection.customer_names AS SELECT name FROM introspection.customers', []);
+      await driver.query(
+        'CREATE MATERIALIZED VIEW introspection.orders_per_customer AS ' +
+        'SELECT customer_id, count(*) AS order_count, now() AS refreshed_at FROM introspection.orders GROUP BY 1',
+        []
+      );
     });
 
     test('says whether each relation is a table or a view', async () => {
@@ -255,14 +260,33 @@ describe('PostgresDriver', () => {
         { schema_name: 'introspection', table_name: 'customers', table_type: 'BASE TABLE' },
         { schema_name: 'introspection', table_name: 'orders', table_type: 'BASE TABLE' },
         { schema_name: 'introspection', table_name: 'customer_names', table_type: 'VIEW' },
+        { schema_name: 'introspection', table_name: 'orders_per_customer', table_type: 'MATERIALIZED VIEW' },
       ]));
+    });
+
+    test('gives a materialized view\'s columns, in order', async () => {
+      const columns = await driver.getColumnsForSpecificTables([
+        { schema_name: 'introspection', table_name: 'orders_per_customer' },
+      ]);
+
+      expect(columns.map(({ column_name: name, data_type: type }) => [name, type])).toEqual([
+        ['customer_id', 'integer'],
+        ['order_count', 'bigint'],
+        ['refreshed_at', 'timestamp with time zone'],
+      ]);
+    });
+
+    test('gives a table\'s columns in order', async () => {
+      const columns = await driver.getColumnsForSpecificTables([{ schema_name: 'introspection', table_name: 'orders' }]);
+
+      expect(columns.map(c => c.column_name)).toEqual(['id', 'customer_id']);
     });
 
     test('gives a column its foreign key when the referenced table isn\'t asked for', async () => {
       const columns = await driver.getColumnsForSpecificTables([{ schema_name: 'introspection', table_name: 'orders' }]);
 
       expect(columns.find(c => c.column_name === 'customer_id')?.foreign_keys).toEqual([
-        { target_table: 'customers', target_column: 'id' },
+        { target_schema: 'introspection', target_table: 'customers', target_column: 'id' },
       ]);
       expect(columns.find(c => c.column_name === 'id')?.attributes).toEqual(['primaryKey']);
     });

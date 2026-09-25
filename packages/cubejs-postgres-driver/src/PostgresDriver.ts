@@ -186,6 +186,58 @@ export class PostgresDriver<Config extends PostgresDriverConfiguration = Postgre
     return client;
   }
 
+  /**
+   * Whether the catalog has `pg_matviews` and relkind `m`, where materialized
+   * views are listed: `information_schema` leaves them out. Drivers for
+   * Postgres-compatible databases that lack them turn this off.
+   */
+  protected listsMaterializedViews(): boolean {
+    return true;
+  }
+
+  protected override getTablesForSpecificSchemasQuery(schemasPlaceholders: string) {
+    const tables = super.getTablesForSpecificSchemasQuery(schemasPlaceholders);
+    if (!this.listsMaterializedViews()) {
+      return tables;
+    }
+
+    return `${tables}
+      UNION ALL
+      SELECT schemaname as ${this.quoteIdentifier('schema_name')},
+            matviewname as ${this.quoteIdentifier('table_name')},
+            'MATERIALIZED VIEW' as ${this.quoteIdentifier('table_type')}
+      FROM pg_catalog.pg_matviews
+      WHERE schemaname IN (${schemasPlaceholders})
+    `;
+  }
+
+  protected override getColumnsForSpecificTablesQuery(conditionString: string) {
+    if (!this.listsMaterializedViews()) {
+      return super.getColumnsForSpecificTablesQuery(conditionString);
+    }
+
+    // `conditionString` names `columns.table_schema` and `columns.table_name`,
+    // so both sources are read as one relation of that name.
+    return `
+      SELECT columns.column_name as ${this.quoteIdentifier('column_name')},
+             columns.table_name as ${this.quoteIdentifier('table_name')},
+             columns.table_schema as ${this.quoteIdentifier('schema_name')},
+             columns.data_type as ${this.quoteIdentifier('data_type')}
+      FROM (
+        SELECT column_name, table_name, table_schema, data_type, ordinal_position
+        FROM information_schema.columns
+        UNION ALL
+        SELECT a.attname, c.relname, n.nspname, format_type(a.atttypid, NULL), a.attnum
+        FROM pg_catalog.pg_attribute a
+        JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relkind = 'm' AND a.attnum > 0 AND NOT a.attisdropped
+      ) AS columns
+      WHERE ${conditionString}
+      ORDER BY columns.table_schema, columns.table_name, columns.ordinal_position
+    `;
+  }
+
   protected primaryKeysQuery(conditionString?: string): string | null {
     return `SELECT
       columns.table_schema as ${this.quoteIdentifier('table_schema')},
@@ -206,6 +258,7 @@ export class PostgresDriver<Config extends PostgresDriverConfiguration = Postgre
         columns.table_schema as ${this.quoteIdentifier('table_schema')},
         columns.table_name as ${this.quoteIdentifier('table_name')},
         columns.column_name as ${this.quoteIdentifier('column_name')},
+        target.table_schema as ${this.quoteIdentifier('target_schema')},
         target.table_name as ${this.quoteIdentifier('target_table')},
         target.column_name as ${this.quoteIdentifier('target_column')}
       FROM

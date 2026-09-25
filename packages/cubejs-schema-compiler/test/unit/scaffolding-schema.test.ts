@@ -555,6 +555,55 @@ describe('ScaffoldingSchema', () => {
     ]);
   });
 
+  describe('tables of the same name in different schemas', () => {
+    const dbSchema = {
+      public: {
+        orders: [
+          { name: 'id', type: 'integer', attributes: ['primaryKey'] },
+          { name: 'customer_id', type: 'integer', attributes: [] },
+        ],
+        customers: [{ name: 'id', type: 'integer', attributes: ['primaryKey'] }],
+      },
+      sales: {
+        orders: [
+          { name: 'id', type: 'integer', attributes: ['primaryKey'] },
+          {
+            name: 'buyer_id',
+            type: 'integer',
+            attributes: [],
+            foreign_keys: [{ target_schema: 'public', target_table: 'customers', target_column: 'id' }],
+          },
+        ],
+        customers: [{ name: 'id', type: 'integer', attributes: ['primaryKey'] }],
+      },
+    };
+    const cubeNameFor = (schema: string, table: string) => `${schema}_${table}`;
+
+    it('names each cube as cubeNameFor says, in the cube and in joins to it', () => {
+      const schema = new ScaffoldingSchema(dbSchema, { snakeCase: true, cubeNameFor });
+
+      const [publicOrders, salesOrders] = schema.generateForTables([
+        ['public', 'orders'], ['sales', 'orders'], ['public', 'customers'], ['sales', 'customers'],
+      ]);
+
+      expect(publicOrders.cube).toEqual('public_orders');
+      expect(salesOrders.cube).toEqual('sales_orders');
+      // `customer_id` joins the customers of its own schema, not both.
+      expect(publicOrders.joins.map(j => j.cubeToJoin)).toEqual(['public_customers']);
+      // A foreign key that names its target's schema joins that one.
+      expect(salesOrders.joins.map(j => j.cubeToJoin)).toEqual(['public_customers']);
+    });
+
+    it('keeps the default names without cubeNameFor', () => {
+      const schema = new ScaffoldingSchema(dbSchema, { snakeCase: true });
+
+      const [orders] = schema.generateForTables([['public', 'orders'], ['public', 'customers']]);
+
+      expect(orders.cube).toEqual('orders');
+      expect(orders.joins.map(j => j.cubeToJoin)).toEqual(['customers']);
+    });
+  });
+
   describe('columnType mapping for numeric types', () => {
     it('should map FLOAT types to number', () => {
       const floatSchemas = {

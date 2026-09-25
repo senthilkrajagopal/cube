@@ -35,6 +35,8 @@ export type DataSourceTable = {
 };
 
 export type DataSourceForeignKey = {
+  /** `null` when the driver doesn't say which schema the target is in. */
+  schema: string | null;
   table: string;
   column: string;
 };

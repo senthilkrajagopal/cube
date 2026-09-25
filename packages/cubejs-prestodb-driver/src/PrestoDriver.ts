@@ -356,7 +356,8 @@ export class PrestoDriver extends BaseDriver implements DriverInterface {
 
   public capabilities(): DriverCapabilities {
     return {
-      unloadWithoutTempTable: true
+      unloadWithoutTempTable: true,
+      incrementalSchemaLoading: true,
     };
   }
 

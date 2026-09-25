@@ -677,7 +677,7 @@ class ApiGateway {
       userAsyncHandler(async (req, res) => {
         await this.introspect(req, res, async (context) => {
           const { tables } = this.validDataSourceRequest<DataSourceTableRefsRequest>(
-            dataSourceColumnsRequestSchema,
+            dataSourceColumnsRequestSchema(),
             req.body,
           );
           const introspection = await this.dataSourceIntrospection(context, req.params.dataSource);
@@ -693,7 +693,7 @@ class ApiGateway {
       userAsyncHandler(async (req, res) => {
         await this.introspect(req, res, async (context) => {
           const { tables, format } = this.validDataSourceRequest<DataSourceScaffoldRequest>(
-            dataSourceScaffoldRequestSchema,
+            dataSourceScaffoldRequestSchema(),
             req.body,
           );
           const introspection = await this.dataSourceIntrospection(context, req.params.dataSource);

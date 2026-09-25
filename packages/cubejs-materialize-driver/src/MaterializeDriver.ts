@@ -29,6 +29,10 @@ export type ReadableStreamTableDataWithTypes = StreamTableDataWithTypes & {
  * Materialize driver class.
  */
 export class MaterializeDriver extends PostgresDriver {
+  protected override listsMaterializedViews(): boolean {
+    return false;
+  }
+
   /**
    * Returns default concurrency value.
    */

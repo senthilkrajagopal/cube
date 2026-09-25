@@ -57,6 +57,10 @@ const IGNORED_SCHEMAS = ['pg_catalog', 'pg_internal', 'information_schema', 'mys
 export class RedshiftDriver extends PostgresDriver<RedshiftDriverConfiguration> {
   private readonly credentials: RedshiftCredentialsProvider;
 
+  protected override listsMaterializedViews(): boolean {
+    return false;
+  }
+
   /**
    * Returns default concurrency value.
    */

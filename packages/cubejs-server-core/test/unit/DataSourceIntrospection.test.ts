@@ -56,7 +56,9 @@ const orchestrator = () => ({
       column_name: column.name,
       data_type: column.type,
       attributes: column.attributes,
-      foreign_keys: column.name === 'customer_id' ? [{ target_table: 'customers', target_column: 'id' }] : [],
+      foreign_keys: column.name === 'customer_id'
+        ? [{ target_schema: 'public', target_table: 'customers', target_column: 'id' }]
+        : [],
     }))
   )),
   queryDataSourceTablesSchema: jest.fn(async () => CATALOG),
@@ -145,7 +147,7 @@ describe('DataSourceIntrospection', () => {
       });
       expect(orders.columns.find(c => c.name === 'created_at')).toMatchObject({ type: 'time' });
       expect(orders.columns.find(c => c.name === 'customer_id')).toMatchObject({
-        foreignKeys: [{ table: 'customers', column: 'id' }],
+        foreignKeys: [{ schema: 'public', table: 'customers', column: 'id' }],
       });
     });
 
@@ -255,15 +257,40 @@ describe('DataSourceIntrospection', () => {
       expect(customers.content).toContain('cube(`customers`');
     });
 
-    test('refuses two tables that would generate cubes of the same name', async () => {
+    test('names tables of the same name after their schema, and joins them by that name', async () => {
       const { introspection: subject } = introspection();
 
-      await expect(subject.scaffold(
-        [{ schema: 'public', table: 'orders' }, { schema: 'sales', table: 'orders' }],
+      const cubes = await subject.scaffold(
+        [{ schema: 'public', table: 'orders' }, { schema: 'sales', table: 'orders' }, { schema: 'public', table: 'customers' }],
         { format: 'yaml' },
-      )).rejects.toThrow(
-        'These tables would generate cubes of the same name, so generate them separately: public.orders and sales.orders (orders)'
       );
+
+      expect(cubes.map(({ cube, fileName }) => [cube, fileName])).toEqual([
+        ['public_orders', 'public_orders.yml'],
+        ['sales_orders', 'sales_orders.yml'],
+        ['customers', 'customers.yml'],
+      ]);
+      expect(cubes[0].content).toContain('- name: public_orders');
+      expect(cubes[0].content).toContain('sql_table: public.orders');
+      expect(cubes[0].content).toContain('sql: "{CUBE}.customer_id = {customers.id}"');
+      expect(cubes[1].content).toContain('sql_table: sales.orders');
+    });
+
+    test('numbers a schema-qualified name that another table\'s cube already has', async () => {
+      const api = orchestrator();
+      api.queryColumnsForTables.mockImplementation(async (tables: { schema_name: string, table_name: string }[]) => tables.map(
+        ({ schema_name: schema, table_name: table }) => ({
+          schema_name: schema, table_name: table, column_name: 'id', data_type: 'integer', attributes: [], foreign_keys: [],
+        })
+      ));
+      const subject = new DataSourceIntrospection(api as any, () => driver(true) as any, 'default');
+
+      const cubes = await subject.scaffold(
+        [{ schema: 'a', table: 'b_c' }, { schema: 'x', table: 'b_c' }, { schema: 'y', table: 'a_b_c' }],
+        { format: 'yaml' },
+      );
+
+      expect(cubes.map(({ cube }) => cube)).toEqual(['a_b_c_2', 'x_b_c', 'a_b_c']);
     });
 
     test('refuses with a 404 when a table is missing, generating nothing', async () => {

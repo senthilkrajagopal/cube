@@ -215,6 +215,15 @@ describe('Data source introspection API', () => {
       expect(introspection.tables).toHaveBeenCalledWith(['public', 'staging']);
     });
 
+    test('pages with any limit', async () => {
+      const { app } = await createGateway();
+
+      const res = await get(app, '/cubejs-api/v1/introspection/data-sources/default/tables?schema=public&limit=100000').expect(200);
+
+      expect(res.body.total).toEqual(5);
+      expect(res.body.tables).toHaveLength(5);
+    });
+
     test('filters by search and type, then pages', async () => {
       const { app, introspection } = await createGateway();
 
@@ -233,7 +242,6 @@ describe('Data source introspection API', () => {
     test.each([
       ['type=synonym', '"type" must be one of [table, view, materialized_view, external]'],
       ['limit=0', '"limit" must be greater than or equal to 1'],
-      ['limit=10001', '"limit" must be less than or equal to 10000'],
       ['offset=-1', '"offset" must be greater than or equal to 0'],
       ['unexpected=1', '"unexpected" is not allowed'],
     ])('refuses %s', async (param, error) => {
@@ -276,6 +284,23 @@ describe('Data source introspection API', () => {
 
       expect(res.body.error).toEqual(`Invalid request: ${error}`);
       expect(introspection.columns).not.toHaveBeenCalled();
+    });
+
+    test('takes as many tables as CUBEJS_INTROSPECTION_MAX_TABLES allows', async () => {
+      const { app, introspection } = await createGateway();
+      const tables = (n: number) => Array.from({ length: n }, (_, i) => ({ schema: 'public', table: `t${i}` }));
+      process.env.CUBEJS_INTROSPECTION_MAX_TABLES = '2';
+
+      try {
+        await post(app, '/cubejs-api/v1/introspection/data-sources/default/columns', { tables: tables(2) }).expect(200);
+        const res = await post(app, '/cubejs-api/v1/introspection/data-sources/default/columns', { tables: tables(3) })
+          .expect(400);
+
+        expect(res.body.error).toEqual('Invalid request: "tables" must contain less than or equal to 2 items');
+        expect(introspection.columns).toHaveBeenCalledTimes(1);
+      } finally {
+        delete process.env.CUBEJS_INTROSPECTION_MAX_TABLES;
+      }
     });
 
     test('answers a missing table with the introspection\'s 404', async () => {

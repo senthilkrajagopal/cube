@@ -82,4 +82,20 @@ describe('TrinoDriver', () => {
       expect(informationSchemaQuery).toContain('columns.table_schema = \'sf1\'');
     });
   });
+
+  it('loads schemas, tables and columns a level at a time', async () => {
+    await doWithDriver(async (driver: TrinoDriver) => {
+      expect(driver.capabilities().incrementalSchemaLoading).toBe(true);
+      expect(await driver.getSchemas()).toContainEqual({ schema_name: 'sf1' });
+
+      const tables = await driver.getTablesForSpecificSchemas([{ schema_name: 'sf1' }]);
+      expect(tables).toContainEqual({ schema_name: 'sf1', table_name: 'orders', table_type: 'BASE TABLE' });
+
+      const columns = await driver.getColumnsForSpecificTables([{ schema_name: 'sf1', table_name: 'orders' }]);
+      expect(columns).toContainEqual(expect.objectContaining({
+        schema_name: 'sf1', table_name: 'orders', column_name: 'orderkey', data_type: 'bigint',
+      }));
+      expect(columns.every(c => c.table_name === 'orders')).toBe(true);
+    });
+  });
 });

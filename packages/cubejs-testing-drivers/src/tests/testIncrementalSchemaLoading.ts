@@ -44,13 +44,10 @@ export function incrementalSchemaLoadingSuite(
       schema_name: expect.any(String),
       table_name: expect.any(String),
     }));
-    // Every driver that loads schemas incrementally says what each relation is,
-    // except Databricks, whose SHOW TABLES doesn't.
-    if (driver().constructor.name !== 'DatabricksDriver') {
-      inputTables.forEach((it) => {
-        expect(it.table_type).toEqual(expect.any(String));
-      });
-    }
+    // Every driver that loads schemas incrementally says what each relation is.
+    inputTables.forEach((it) => {
+      expect(it.table_type).toEqual(expect.any(String));
+    });
   });
 
   execute('should load columns for specific tables', async () => {

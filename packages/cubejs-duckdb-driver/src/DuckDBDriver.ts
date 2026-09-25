@@ -1,5 +1,6 @@
 import {
   BaseDriver,
+  DriverCapabilities,
   DriverInterface,
   StreamOptions,
   QueryOptions,
@@ -234,6 +235,25 @@ export class DuckDBDriver extends BaseDriver implements DriverInterface {
       `;
     }
     return super.getSchemasQuery();
+  }
+
+  protected override getTablesForSpecificSchemasQuery(schemasPlaceholders: string): string {
+    const query = super.getTablesForSpecificSchemasQuery(schemasPlaceholders);
+
+    return this.schema ? `${query} AND table_catalog = '${this.schema}'` : query;
+  }
+
+  protected override getColumnsForSpecificTablesQuery(conditionString: string): string {
+    return super.getColumnsForSpecificTablesQuery(
+      this.schema ? `(${conditionString}) AND columns.table_catalog = '${this.schema}'` : conditionString
+    );
+  }
+
+  public override capabilities(): DriverCapabilities {
+    return {
+      ...super.capabilities(),
+      incrementalSchemaLoading: true,
+    };
   }
 
   protected async getInitiatedState(): Promise<InitPromise> {

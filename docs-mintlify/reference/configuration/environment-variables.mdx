@@ -1293,6 +1293,16 @@ downloading Cube Store.
 | ------------------ | ---------------------- | --------------------- |
 | A valid GitHub PAT | `false`                | `false`               |
 
+## `CUBEJS_INTROSPECTION_MAX_TABLES`
+
+The most tables one request to the data source introspection
+[`/columns`](/reference/core-data-apis/rest-api/reference#data-source-introspection)
+or `/scaffold` endpoint may name.
+
+| Possible Values           | Default in Development | Default in Production |
+| ------------------------- | ---------------------- | --------------------- |
+| A valid number of tables  | `100`                  | `100`                 |
+
 ## `CUBEJS_JWK_URL`
 
 Enables [JSON Web Key (JWK)][ietf-jwk-ref]-based authentication in Cube.

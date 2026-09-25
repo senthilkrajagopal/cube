@@ -302,6 +302,9 @@ const variables: Record<string, (...args: any) => any> = {
     });
   },
   preAggregationsBuilder: () => get('CUBEJS_PRE_AGGREGATIONS_BUILDER').asBool(),
+  introspectionMaxTables: () => get('CUBEJS_INTROSPECTION_MAX_TABLES')
+    .default('100')
+    .asIntPositive(),
   gracefulShutdown: () => get('CUBEJS_GRACEFUL_SHUTDOWN')
     .asIntPositive(),
   dockerImageVersion: () => get('CUBEJS_DOCKER_IMAGE_VERSION')

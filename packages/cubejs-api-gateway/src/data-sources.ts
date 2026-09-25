@@ -1,17 +1,7 @@
 import Joi from 'joi';
+import { getEnv } from '@cubejs-backend/shared';
 
 import type { DataSourceTable, DataSourceTableRef, DataSourceTableType } from './types/data-sources';
-
-/**
- * Most tables one columns or scaffold request may name. Each is a condition in
- * one catalog query, and scaffolding holds all of them in memory at once.
- */
-export const MAX_TABLES_PER_REQUEST = 100;
-
-/**
- * Most tables one page of a tables listing may hold.
- */
-export const MAX_TABLES_PAGE_SIZE = 10000;
 
 const TABLE_TYPES: DataSourceTableType[] = ['table', 'view', 'materialized_view', 'external'];
 
@@ -23,13 +13,16 @@ const oneOrMany = (item: Joi.Schema) => Joi.array()
 
 const searchSchema = Joi.string().allow('').max(256);
 
-const tableRefsSchema = Joi.array().items(Joi.object({
+// Each table named is a condition in one catalog query, and scaffolding holds
+// all of them in memory at once, so their number is capped by
+// CUBEJS_INTROSPECTION_MAX_TABLES, read per request.
+const tableRefsSchema = () => Joi.array().items(Joi.object({
   // Some data sources have no schemas; their tables list with an empty one.
   schema: Joi.string().allow('').required(),
   table: Joi.string().required(),
 }))
   .min(1)
-  .max(MAX_TABLES_PER_REQUEST)
+  .max(getEnv('introspectionMaxTables'))
   .required();
 
 export const dataSourceSchemasRequestSchema = Joi.object({
@@ -40,16 +33,16 @@ export const dataSourceTablesRequestSchema = Joi.object({
   schema: oneOrMany(Joi.string().allow('')).required(),
   search: searchSchema,
   type: oneOrMany(Joi.string().valid(...TABLE_TYPES)),
-  limit: Joi.number().integer().min(1).max(MAX_TABLES_PAGE_SIZE),
+  limit: Joi.number().integer().min(1),
   offset: Joi.number().integer().min(0).default(0),
 });
 
-export const dataSourceColumnsRequestSchema = Joi.object({
-  tables: tableRefsSchema,
+export const dataSourceColumnsRequestSchema = () => Joi.object({
+  tables: tableRefsSchema(),
 });
 
-export const dataSourceScaffoldRequestSchema = Joi.object({
-  tables: tableRefsSchema,
+export const dataSourceScaffoldRequestSchema = () => Joi.object({
+  tables: tableRefsSchema(),
   format: Joi.string().valid('yaml', 'js').default('yaml'),
 });
 

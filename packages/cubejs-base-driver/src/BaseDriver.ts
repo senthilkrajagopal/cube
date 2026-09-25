@@ -371,6 +371,7 @@ export abstract class BaseDriver implements DriverInterface {
         tablesSchema[foreignKey.table_schema][foreignKey.table_name] = tablesSchema[foreignKey.table_schema][foreignKey.table_name].map((it: any) => {
           if (it.name === foreignKey.column_name) {
             it.foreign_keys = [...(it.foreign_keys || []), {
+              ...(foreignKey.target_schema ? { target_schema: foreignKey.target_schema } : {}),
               target_table: foreignKey.target_table,
               target_column: foreignKey.target_column
             }];
@@ -446,6 +447,7 @@ export abstract class BaseDriver implements DriverInterface {
       }
 
       column.foreign_keys = foreignKeys.filter(fk => fk.table_schema === column.schema_name && fk.table_name === column.table_name && fk.column_name === column.column_name).map(fk => ({
+        ...(fk.target_schema ? { target_schema: fk.target_schema } : {}),
         target_table: fk.target_table,
         target_column: fk.target_column
       }));

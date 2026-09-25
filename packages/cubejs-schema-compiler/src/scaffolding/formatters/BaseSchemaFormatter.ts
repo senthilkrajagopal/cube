@@ -29,6 +29,7 @@ export type SchemaFile = {
 export type SchemaFormatterOptions = {
   snakeCase: boolean;
   catalog?: string | null;
+  cubeNameFor?: (schema: string, table: string) => string | undefined;
 };
 
 export abstract class BaseSchemaFormatter {

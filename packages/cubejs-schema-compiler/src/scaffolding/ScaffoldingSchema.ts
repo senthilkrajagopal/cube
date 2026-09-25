@@ -122,6 +122,9 @@ const MEASURE_DICTIONARY = [
 const idRegex = '_id$|id$';
 
 type ForeignKey = {
+  // Absent when the driver doesn't say which schema the target is in.
+  // eslint-disable-next-line camelcase
+  target_schema?: string;
   // eslint-disable-next-line camelcase
   target_table: string;
   // eslint-disable-next-line camelcase
@@ -148,6 +151,12 @@ type TableData = {
 type ScaffoldingSchemaOptions = {
   includeNonDictionaryMeasures?: boolean;
   snakeCase?: boolean;
+  /**
+   * The cube name for a table, in place of the one made from the table's name
+   * alone, e.g. to tell apart tables of the same name in different schemas.
+   * Nothing keeps the default.
+   */
+  cubeNameFor?: (schema: string, table: string) => string | undefined;
 };
 
 export class ScaffoldingSchema {
@@ -256,7 +265,7 @@ export class ScaffoldingSchema {
     const dimensions = this.dimensions(tableDefinition);
 
     return {
-      cube: this.options.snakeCase ? toSnakeCase(table) : inflection.camelize(table),
+      cube: this.cubeName(schema, table),
       tableName,
       schema,
       table,
@@ -339,8 +348,23 @@ export class ScaffoldingSchema {
     return value.toLocaleLowerCase();
   }
 
+  protected cubeName(schema: string, table: string): string {
+    return this.options.cubeNameFor?.(schema, table) ??
+      (this.options.snakeCase ? toSnakeCase(table) : inflection.camelize(table));
+  }
+
+  /**
+   * Of the tables a join could target, those in `schema` when there are any:
+   * a table of the same name in another schema is a different table.
+   */
+  private preferSchema(definitions: TableData[], schema: string | undefined): TableData[] {
+    const inSchema = definitions.filter(definition => definition.schema === schema);
+
+    return inSchema.length ? inSchema : definitions;
+  }
+
   protected joins(tableName: TableName, tableDefinition: ColumnData[]): Join[] {
-    const cubeName = (name: string) => (this.options.snakeCase ? toSnakeCase(name) : inflection.camelize(name));
+    const [thisSchema] = this.parseTableName(tableName);
 
     return R.unnest(tableDefinition
       .map(column => {
@@ -348,10 +372,13 @@ export class ScaffoldingSchema {
 
         if (column.foreign_keys?.length) {
           column.foreign_keys.forEach(fk => {
-            const targetTableDefinition = this.tableNamesToTables[fk.target_table]?.find(t => t.table === fk.target_table);
+            const [targetTableDefinition] = this.preferSchema(
+              (this.tableNamesToTables[fk.target_table] || []).filter(t => t.table === fk.target_table),
+              fk.target_schema ?? thisSchema,
+            );
             if (targetTableDefinition) {
               columnsToJoin.push({
-                cubeToJoin: cubeName(fk.target_table),
+                cubeToJoin: this.cubeName(targetTableDefinition.schema, targetTableDefinition.table),
                 columnToJoin: fk.target_column,
                 tableName: targetTableDefinition.tableName
               });
@@ -368,7 +395,7 @@ export class ScaffoldingSchema {
             return null;
           }
 
-          columnsToJoin = tablesToJoin.map(definition => {
+          columnsToJoin = this.preferSchema(tablesToJoin, thisSchema).map(definition => {
             if (tableName === definition.tableName) {
               return null;
             }
@@ -378,7 +405,7 @@ export class ScaffoldingSchema {
               return null;
             }
             return {
-              cubeToJoin: cubeName(definition.table),
+              cubeToJoin: this.cubeName(definition.schema, definition.table),
               columnToJoin: columnForJoin.name,
               tableName: definition.tableName
             };
