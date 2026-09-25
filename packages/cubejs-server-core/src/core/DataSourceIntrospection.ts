@@ -4,7 +4,7 @@ import type {
   QueryColumnsResult,
   QueryTablesResult,
 } from '@cubejs-backend/base-driver';
-import type { QueryOrchestrator } from '@cubejs-backend/query-orchestrator';
+import { ContinueWaitError, type QueryOrchestrator } from '@cubejs-backend/query-orchestrator';
 import {
   CubejsHandlerError,
   type DataSourceColumn,
@@ -96,7 +96,7 @@ export class DataSourceIntrospection implements DataSourceIntrospectionApi {
 
   public async schemas(): Promise<string[]> {
     const names = await this.isIncremental()
-      ? (await this.orchestrator.queryDataSourceSchemas(this.dataSource, this.queryOptions()))
+      ? (await this.queued(() => this.orchestrator.queryDataSourceSchemas(this.dataSource, this.queryOptions())))
         .map(({ schema_name: schema }) => schema)
       : Object.keys(await this.tablesSchema());
 
@@ -111,11 +111,11 @@ export class DataSourceIntrospection implements DataSourceIntrospectionApi {
 
     let rows: QueryTablesResult[];
     if (await this.isIncremental()) {
-      rows = await this.orchestrator.queryTablesForSchemas(
+      rows = await this.queued(() => this.orchestrator.queryTablesForSchemas(
         wanted.map(schema => ({ schema_name: schema })),
         this.dataSource,
         this.queryOptions(),
-      );
+      ));
     } else {
       const structure = await this.tablesSchema();
       rows = wanted.flatMap(schema => Object.keys(structure[schema] || {})
@@ -151,11 +151,11 @@ export class DataSourceIntrospection implements DataSourceIntrospectionApi {
 
     let rows: QueryColumnsResult[];
     if (await this.isIncremental()) {
-      rows = await this.orchestrator.queryColumnsForTables(
+      rows = await this.queued(() => this.orchestrator.queryColumnsForTables(
         wanted.map(({ schema, table }) => ({ schema_name: schema, table_name: table })),
         this.dataSource,
         this.queryOptions(),
-      );
+      ));
     } else {
       const structure = await this.tablesSchema();
       rows = wanted.flatMap(({ schema, table }) => (structure[schema]?.[table] || []).map(column => ({
@@ -319,7 +319,26 @@ export class DataSourceIntrospection implements DataSourceIntrospectionApi {
   }
 
   protected tablesSchema(): Promise<DatabaseStructure> {
-    return this.orchestrator.queryDataSourceTablesSchema(this.dataSource, this.queryOptions());
+    return this.queued(() => this.orchestrator.queryDataSourceTablesSchema(this.dataSource, this.queryOptions()));
+  }
+
+  /**
+   * A call to the data source's queue, its outlasted wait said as a query's
+   * is: `{ error: 'Continue wait' }`, which the gateway answers with 200 for
+   * the client to ask again. The queue's own `ContinueWaitError` would be
+   * answered with 500 (as `OrchestratorApi` converts it for queries).
+   */
+  protected async queued<T>(ask: () => Promise<T>): Promise<T> {
+    try {
+      return await ask();
+    } catch (e) {
+      if (e instanceof ContinueWaitError) {
+        // eslint-disable-next-line no-throw-literal
+        throw { error: 'Continue wait' };
+      }
+
+      throw e;
+    }
   }
 
   protected queryOptions() {

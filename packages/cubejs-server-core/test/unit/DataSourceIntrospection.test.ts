@@ -1,4 +1,5 @@
 import { CubejsHandlerError } from '@cubejs-backend/api-gateway';
+import { ContinueWaitError } from '@cubejs-backend/query-orchestrator';
 
 import { DataSourceIntrospection, tableTypeOf } from '../../src/core/DataSourceIntrospection';
 
@@ -298,6 +299,46 @@ describe('DataSourceIntrospection', () => {
 
       await expect(subject.scaffold([{ schema: 'public', table: 'missing' }], { format: 'yaml' }))
         .rejects.toMatchObject({ status: 404 });
+    });
+  });
+
+  /**
+   * The queue's wait outlasted, answered as a query's is: the gateway sends
+   * 200 `{"error":"Continue wait"}` for `{ error: 'Continue wait' }`, and 500
+   * for the queue's own `ContinueWaitError`.
+   */
+  describe('a wait the queue outlasts', () => {
+    const waiting = (incremental: boolean) => {
+      const api = orchestrator();
+      const wait = async () => {
+        throw new ContinueWaitError();
+      };
+      api.queryDataSourceSchemas.mockImplementation(wait);
+      api.queryTablesForSchemas.mockImplementation(wait);
+      api.queryColumnsForTables.mockImplementation(wait);
+      api.queryDataSourceTablesSchema.mockImplementation(wait);
+      return new DataSourceIntrospection(api as any, () => driver(incremental) as any, 'default');
+    };
+
+    test.each([true, false])('is said as the gateway says a query\'s (incremental: %s)', async (incremental) => {
+      const subject = waiting(incremental);
+
+      await expect(subject.schemas()).rejects.toEqual({ error: 'Continue wait' });
+      await expect(subject.tables(['public'])).rejects.toEqual({ error: 'Continue wait' });
+      await expect(subject.columns([{ schema: 'public', table: 'orders' }])).rejects.toEqual({ error: 'Continue wait' });
+      await expect(subject.scaffold([{ schema: 'public', table: 'orders' }], { format: 'yaml' }))
+        .rejects.toEqual({ error: 'Continue wait' });
+    });
+
+    test('leaves any other failure as it is', async () => {
+      const api = orchestrator();
+      const failure = new Error('connection refused');
+      api.queryDataSourceSchemas.mockImplementation(async () => {
+        throw failure;
+      });
+      const subject = new DataSourceIntrospection(api as any, () => driver(true) as any, 'default');
+
+      await expect(subject.schemas()).rejects.toBe(failure);
     });
   });
 });
