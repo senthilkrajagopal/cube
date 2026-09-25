@@ -1,0 +1,4 @@
+node_modules
+dist
+# Cube ignores lockfiles; this package is installed with npm ci from its own.
+!package-lock.json

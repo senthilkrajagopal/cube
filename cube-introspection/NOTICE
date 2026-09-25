@@ -1,0 +1,17 @@
+cube-introspection
+
+This package contains code from Cube (https://github.com/cube-js/cube),
+Copyright Cube Dev, Inc., licensed under the Apache License, Version 2.0.
+
+src/scaffolding/ is copied from @cubejs-backend/schema-compiler 1.7.45
+(packages/cubejs-schema-compiler/src/scaffolding) and changed:
+
+- `numeric` and `bignumeric` columns are typed as numbers.
+- A cube can be given a name per table (`cubeNameFor`), and joins prefer the
+  target table in the schema a foreign key names, or in the table's own.
+- A time-typed key column stays a key, and members whose names would clash
+  within a cube are numbered (`amount_2`) instead of dropped.
+
+src/catalog/views.ts contains catalog queries adapted from Cube's drivers
+(@cubejs-backend/base-driver, postgres-driver, mysql-driver, prestodb-driver,
+clickhouse-driver, bigquery-driver, databricks-jdbc-driver 1.7.45).

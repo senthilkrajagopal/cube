@@ -1,0 +1,72 @@
+{
+  "name": "cube-introspection",
+  "version": "1.7.45-1",
+  "description": "Data source introspection and cube scaffolding API for Cube, as a package over an unmodified Cube",
+  "license": "Apache-2.0",
+  "private": true,
+  "main": "dist/src/index.js",
+  "typings": "dist/src/index.d.ts",
+  "bin": {
+    "cube-introspection-server": "dist/src/bin/server.js"
+  },
+  "files": [
+    "dist/src",
+    "NOTICE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "jest --runInBand --forceExit",
+    "unit": "jest --runInBand --forceExit test/unit"
+  },
+  "peerDependencies": {
+    "@cubejs-backend/api-gateway": "1.7.45",
+    "@cubejs-backend/base-driver": "1.7.45",
+    "@cubejs-backend/query-orchestrator": "1.7.45",
+    "@cubejs-backend/schema-compiler": "1.7.45",
+    "@cubejs-backend/server": "1.7.45",
+    "@cubejs-backend/server-core": "1.7.45",
+    "@cubejs-backend/shared": "1.7.45",
+    "body-parser": "^1.20.3",
+    "inflection": "^1.13.1",
+    "joi": "^17.13.3",
+    "ramda": "^0.27.2"
+  },
+  "devDependencies": {
+    "@cubejs-backend/api-gateway": "1.7.45",
+    "@cubejs-backend/base-driver": "1.7.45",
+    "@cubejs-backend/duckdb-driver": "1.7.45",
+    "@cubejs-backend/mysql-driver": "1.7.45",
+    "@cubejs-backend/postgres-driver": "1.7.45",
+    "@cubejs-backend/query-orchestrator": "1.7.45",
+    "@cubejs-backend/schema-compiler": "1.7.45",
+    "@cubejs-backend/server": "1.7.45",
+    "@cubejs-backend/server-core": "1.7.45",
+    "@cubejs-backend/shared": "1.7.45",
+    "@cubejs-backend/trino-driver": "1.7.45",
+    "@types/body-parser": "^1.19.5",
+    "@types/express": "^4.17.21",
+    "@types/inflection": "^1.13.2",
+    "@types/jest": "^29.5.14",
+    "@types/js-yaml": "^4.0.9",
+    "@types/jsonwebtoken": "^9.0.9",
+    "@types/node": "^22.10.0",
+    "@types/ramda": "^0.27.40",
+    "@types/supertest": "^6.0.3",
+    "body-parser": "^1.20.3",
+    "express": "^4.22.1",
+    "inflection": "^1.13.1",
+    "jest": "^29.7.0",
+    "joi": "^17.13.3",
+    "js-yaml": "^4.3.2",
+    "jsonwebtoken": "^9.0.2",
+    "ramda": "^0.27.2",
+    "supertest": "^7.1.4",
+    "ts-jest": "^29.4.4",
+    "typescript": "~6.0.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
