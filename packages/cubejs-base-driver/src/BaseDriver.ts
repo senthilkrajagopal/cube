@@ -133,7 +133,8 @@ export abstract class BaseDriver implements DriverInterface {
   protected getTablesForSpecificSchemasQuery(schemasPlaceholders: string) {
     const query = `
       SELECT table_schema as ${this.quoteIdentifier('schema_name')},
-            table_name as ${this.quoteIdentifier('table_name')}
+            table_name as ${this.quoteIdentifier('table_name')},
+            table_type as ${this.quoteIdentifier('table_type')}
       FROM information_schema.tables as columns
       WHERE table_schema IN (${schemasPlaceholders})
     `;

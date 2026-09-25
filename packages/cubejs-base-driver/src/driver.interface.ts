@@ -192,13 +192,24 @@ export type DownloadQueryResultsResult = DownloadTableMemoryData | DownloadTable
 export type StreamTableDataWithTypes = DownloadStreamTableData;
 
 // eslint-disable-next-line camelcase
-export type TableQueryResult = { table_name?: string, TABLE_NAME?: string };
+export type TableQueryResult = { table_name?: string, TABLE_NAME?: string, table_type?: string };
 
 // eslint-disable-next-line camelcase
 export type QuerySchemasResult = { schema_name: string };
 
-// eslint-disable-next-line camelcase
-export type QueryTablesResult = { schema_name: string, table_name: string };
+export type QueryTablesResult = {
+  // eslint-disable-next-line camelcase
+  schema_name: string,
+  // eslint-disable-next-line camelcase
+  table_name: string,
+  /**
+   * The data source's own word for what the relation is, as its catalog
+   * reports it: `BASE TABLE`, `VIEW`, `MATERIALIZED VIEW`, `EXTERNAL TABLE`
+   * and so on. Absent when the driver can't tell.
+   */
+  // eslint-disable-next-line camelcase
+  table_type?: string,
+};
 
 // eslint-disable-next-line camelcase
 export type QueryColumnsResult = { schema_name: string, table_name: string } & TableColumnQueryResult;

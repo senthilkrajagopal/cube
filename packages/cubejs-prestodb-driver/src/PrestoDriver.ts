@@ -319,7 +319,8 @@ export class PrestoDriver extends BaseDriver implements DriverInterface {
 
     const query = `
       SELECT table_schema as ${this.quoteIdentifier('schema_name')},
-            table_name as ${this.quoteIdentifier('table_name')}
+            table_name as ${this.quoteIdentifier('table_name')},
+            table_type as ${this.quoteIdentifier('table_type')}
       FROM ${catalogPrefix}information_schema.tables as columns
       WHERE table_schema IN (${schemasPlaceholders})
     `;

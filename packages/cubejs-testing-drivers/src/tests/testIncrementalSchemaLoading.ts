@@ -40,10 +40,17 @@ export function incrementalSchemaLoadingSuite(
     const inputTables = await driver().getTablesForSpecificSchemas(inputSchemas);
     expect(inputTables).toBeInstanceOf(Array);
     expect(inputTables.length).toBeGreaterThan(0);
-    expect(inputTables).toContainEqual({
+    expect(inputTables).toContainEqual(expect.objectContaining({
       schema_name: expect.any(String),
       table_name: expect.any(String),
-    });
+    }));
+    // Every driver that loads schemas incrementally says what each relation is,
+    // except Databricks, whose SHOW TABLES doesn't.
+    if (driver().constructor.name !== 'DatabricksDriver') {
+      inputTables.forEach((it) => {
+        expect(it.table_type).toEqual(expect.any(String));
+      });
+    }
   });
 
   execute('should load columns for specific tables', async () => {

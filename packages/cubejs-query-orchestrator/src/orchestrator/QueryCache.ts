@@ -83,6 +83,19 @@ export type QueryWithParams = [
   options?: QueryOptions
 ];
 
+/**
+ * Prefix of the pseudo-SQL `QueryOrchestrator` builds for a metadata
+ * operation (`METADATA:GET_SCHEMAS` and so on). Such a query is never sent
+ * to the data source as SQL: it runs through the queue's `metadata` handler,
+ * which calls the matching driver method.
+ */
+export const METADATA_QUERY_PREFIX = 'METADATA:';
+
+export type MetadataQuery = {
+  operation: MetadataOperationType;
+  params: Record<string, any>;
+};
+
 export type LoadRefreshKeyOptions = {
   requestId?: string;
   skipRefreshKeyWaitForRenew?: boolean;
@@ -584,6 +597,22 @@ export class QueryCache {
   }
 
   /**
+   * The metadata operation a query built by `QueryOrchestrator` stands for,
+   * or nothing when it is SQL for the data source.
+   */
+  public static metadataQueryOf(query: string | QueryWithParams): MetadataQuery | null {
+    if (!Array.isArray(query) || typeof query[0] !== 'string' || !query[0].startsWith(METADATA_QUERY_PREFIX)) {
+      return null;
+    }
+
+    const [sql, params] = query;
+    return {
+      operation: sql.slice(METADATA_QUERY_PREFIX.length) as MetadataOperationType,
+      params: params?.length ? JSON.parse(params[0]) : {},
+    };
+  }
+
+  /**
    * Determines queue type, resolves `QueryQueue` instance and runs the
    * `executeInQueue` method passing incoming `query` into it. Resolves
    * promise with the `executeInQueue` method result for the not persistent
@@ -637,6 +666,17 @@ export class QueryCache {
       requestId,
       spanId,
     };
+
+    const metadataQuery = QueryCache.metadataQueryOf(query);
+    if (metadataQuery) {
+      return queue.executeInQueue('metadata', cacheKey as QueryKey, {
+        queryKey: cacheKey,
+        operation: metadataQuery.operation,
+        params: metadataQuery.params,
+        dataSource,
+        requestId,
+      }, priority, opt);
+    }
 
     if (!persistent) {
       return queue.executeInQueue('query', cacheKey as QueryKey, _query, priority, opt);
@@ -787,6 +827,9 @@ export class QueryCache {
                 requestId: req.requestId
               });
               return client.getColumnsForSpecificTables(params.tables);
+            case MetadataOperationType.GET_TABLES_SCHEMA:
+              queue.logger('Getting datasource tables schema', { dataSource: req.dataSource, requestId: req.requestId });
+              return client.tablesSchema();
             default:
               throw new Error(`Unknown metadata operation: ${operation}`);
           }

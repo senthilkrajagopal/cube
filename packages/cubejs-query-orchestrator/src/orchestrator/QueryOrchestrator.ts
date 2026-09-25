@@ -3,13 +3,22 @@ import R from 'ramda';
 import { CacheMode, getEnv, LoggerFn } from '@cubejs-backend/shared';
 import { CubeStoreDriver } from '@cubejs-backend/cubestore-driver';
 import {
+  DatabaseStructure,
   QuerySchemasResult,
   QueryTablesResult,
   QueryColumnsResult,
   QueryKey
 } from '@cubejs-backend/base-driver';
 
-import { QueryCache, QueryBody, TempTable, PreAggTableToTempTable, QueryWithParams, CacheKey } from './QueryCache';
+import {
+  QueryCache,
+  QueryBody,
+  TempTable,
+  PreAggTableToTempTable,
+  QueryWithParams,
+  CacheKey,
+  METADATA_QUERY_PREFIX,
+} from './QueryCache';
 import { PreAggregations, PreAggregationDescription, getLastUpdatedAtTimestamp } from './PreAggregations';
 import { DriverFactory, DriverFactoryByDataSource } from './DriverFactory';
 import { QueryStream } from './QueryStream';
@@ -25,7 +34,10 @@ export enum DriverType {
 export enum MetadataOperationType {
   GET_SCHEMAS = 'GET_SCHEMAS',
   GET_TABLES_FOR_SCHEMAS = 'GET_TABLES_FOR_SCHEMAS',
-  GET_COLUMNS_FOR_TABLES = 'GET_COLUMNS_FOR_TABLES'
+  GET_COLUMNS_FOR_TABLES = 'GET_COLUMNS_FOR_TABLES',
+  // Every schema, table and column at once, for drivers without
+  // incremental schema loading.
+  GET_TABLES_SCHEMA = 'GET_TABLES_SCHEMA',
 }
 
 export interface QueryOrchestratorOptions {
@@ -457,7 +469,7 @@ export class QueryOrchestrator {
 
   private createMetadataQuery(operation: string, params: Record<string, any>): QueryWithParams {
     return [
-      `METADATA:${operation}`,
+      `${METADATA_QUERY_PREFIX}${operation}`,
       // TODO (@MikeNitsenko): Metadata queries need object params like [{ schema, table }]
       // but QueryWithParams expects string[]. This forces JSON.stringify workaround.
       [JSON.stringify(params)],
@@ -554,6 +566,27 @@ export class QueryOrchestrator {
     return this.queryDataSourceMetadata<QueryColumnsResult[]>(
       MetadataOperationType.GET_COLUMNS_FOR_TABLES,
       { tables },
+      dataSource,
+      options
+    );
+  }
+
+  /**
+   * Query the data source for every schema, table and column at once. For
+   * drivers without incremental schema loading, which cannot list them level
+   * by level.
+   */
+  public async queryDataSourceTablesSchema(
+    dataSource: string = 'default',
+    options: {
+      requestId?: string;
+      syncJobId?: string;
+      expiration?: number;
+    } = {}
+  ): Promise<DatabaseStructure> {
+    return this.queryDataSourceMetadata<DatabaseStructure>(
+      MetadataOperationType.GET_TABLES_SCHEMA,
+      {},
       dataSource,
       options
     );

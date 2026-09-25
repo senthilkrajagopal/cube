@@ -199,18 +199,23 @@ export class PostgresDriver<Config extends PostgresDriverConfiguration = Postgre
   }
 
   protected foreignKeysQuery(conditionString?: string): string | null {
+    // `columns` is the referencing side, the one `conditionString` names a
+    // table of (`columns.table_schema`, `columns.table_name`); `target` is
+    // the referenced one.
     return `SELECT
-        tc.table_schema as ${this.quoteIdentifier('table_schema')},
-        tc.table_name as ${this.quoteIdentifier('table_name')},
-        kcu.column_name as ${this.quoteIdentifier('column_name')},
-        columns.table_name as ${this.quoteIdentifier('target_table')},
-        columns.column_name as ${this.quoteIdentifier('target_column')}
+        columns.table_schema as ${this.quoteIdentifier('table_schema')},
+        columns.table_name as ${this.quoteIdentifier('table_name')},
+        columns.column_name as ${this.quoteIdentifier('column_name')},
+        target.table_name as ${this.quoteIdentifier('target_table')},
+        target.column_name as ${this.quoteIdentifier('target_column')}
       FROM
         information_schema.table_constraints AS tc
-      JOIN information_schema.key_column_usage AS kcu
-        ON tc.constraint_name = kcu.constraint_name
-      JOIN information_schema.constraint_column_usage AS columns
-        ON columns.constraint_name = tc.constraint_name
+      JOIN information_schema.key_column_usage AS columns
+        ON columns.constraint_schema = tc.constraint_schema
+        AND columns.constraint_name = tc.constraint_name
+      JOIN information_schema.constraint_column_usage AS target
+        ON target.constraint_schema = tc.constraint_schema
+        AND target.constraint_name = tc.constraint_name
       WHERE
          constraint_type = 'FOREIGN KEY'
          AND ${this.getColumnNameForSchemaName()} NOT IN ('pg_catalog', 'information_schema', 'mysql', 'performance_schema', 'sys', 'INFORMATION_SCHEMA')

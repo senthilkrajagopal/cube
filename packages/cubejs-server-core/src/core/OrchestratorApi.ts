@@ -11,6 +11,7 @@ import {
 } from '@cubejs-backend/query-orchestrator';
 
 import { DatabaseType, RequestContext } from './types';
+import { DataSourceIntrospection } from './DataSourceIntrospection';
 
 export interface OrchestratorApiOptions extends QueryOrchestratorOptions {
   contextToDbType: (dataSource: string) => Promise<DatabaseType>;
@@ -270,6 +271,19 @@ export class OrchestratorApi {
 
   public addDataSeenSource(dataSource) {
     this.seenDataSources[dataSource] = true;
+  }
+
+  /**
+   * Browses the data source's schemas, tables and columns and generates cubes
+   * from its tables, through this orchestrator's queue for it.
+   */
+  public dataSourceIntrospection(dataSource: string, requestId?: string): DataSourceIntrospection {
+    return new DataSourceIntrospection(
+      this.orchestrator,
+      () => this.driverFactory(dataSource),
+      dataSource,
+      requestId,
+    );
   }
 
   public getPreAggregationVersionEntries(context: RequestContext, preAggregations, preAggregationsSchema): Promise<any> {

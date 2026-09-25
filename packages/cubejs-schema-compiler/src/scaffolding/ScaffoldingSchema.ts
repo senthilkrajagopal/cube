@@ -4,11 +4,40 @@ import { notEmpty } from '@cubejs-backend/shared';
 import { UserError } from '../compiler';
 import { toSnakeCase } from './utils';
 
-enum ColumnType {
+export enum ColumnType {
   Time = 'time',
   Number = 'number',
   String = 'string',
   Boolean = 'boolean',
+}
+
+/**
+ * The Cube type scaffolding gives a column of this data source type, from the
+ * type's name alone.
+ */
+export function columnTypeOf(dataType: string): ColumnType {
+  const type = dataType.toLowerCase();
+
+  if (['time', 'date'].find(t => type.includes(t))) {
+    return ColumnType.Time;
+  } else if ([
+    'int', // integer, bigint, smallint, tinyint, mediumint, uint8, uint16, uint32, uint64, uinteger, ubigint, usmallint, hugeint, byteint, etc.
+    'dec', // decimal
+    'double', // double, double precision
+    'numb', // number
+    'numeric', // numeric, bignumeric
+    'float', // float, float4, float8, float32, float64, binary_float
+    'real', // real
+    'serial', // serial, bigserial, smallserial
+    'money', // money, smallmoney
+  ].find(t => type.includes(t))) {
+    // enums are not Numbers
+    return ColumnType.Number;
+  } else if (['bool'].find(t => type.includes(t))) {
+    return ColumnType.Boolean;
+  }
+
+  return ColumnType.String;
 }
 
 export enum MemberType {
@@ -383,26 +412,6 @@ export class ScaffoldingSchema {
   }
 
   protected columnType(column): ColumnType {
-    const type = this.fixCase(column.type);
-
-    if (['time', 'date'].find(t => type.includes(t))) {
-      return ColumnType.Time;
-    } else if ([
-      'int', // integer, bigint, smallint, tinyint, mediumint, uint8, uint16, uint32, uint64, uinteger, ubigint, usmallint, hugeint, byteint, etc.
-      'dec', // decimal
-      'double', // double, double precision
-      'numb', // number, numeric, bignumeric
-      'float', // float, float4, float8, float32, float64, binary_float
-      'real', // real
-      'serial', // serial, bigserial, smallserial
-      'money', // money, smallmoney
-    ].find(t => type.includes(t))) {
-      // enums are not Numbers
-      return ColumnType.Number;
-    } else if (['bool'].find(t => type.includes(t))) {
-      return ColumnType.Boolean;
-    }
-
-    return ColumnType.String;
+    return columnTypeOf(this.fixCase(column.type));
   }
 }

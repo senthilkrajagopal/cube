@@ -109,7 +109,8 @@ type ApiScopes =
   'meta' |
   'data' |
   'sql' |
-  'jobs';
+  'jobs' |
+  'introspection';
 
 export {
   RequestType,

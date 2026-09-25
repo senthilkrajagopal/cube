@@ -242,7 +242,7 @@ export class RedshiftDriver extends PostgresDriver<RedshiftDriverConfiguration> 
     for (const externalSchema of missedSchemas) {
       const tablesRes = await this.tablesForExternalSchema(externalSchema.schema_name);
       tablesRes.forEach(t => {
-        tables.push({ schema_name: externalSchema.schema_name, table_name: t.table_name });
+        tables.push({ schema_name: externalSchema.schema_name, table_name: t.table_name, table_type: 'EXTERNAL TABLE' });
       });
     }
 

@@ -6,5 +6,6 @@ export * from './user-error';
 
 export { getRequestIdFromRequest } from './request-parser';
 export { TransformDataRequest } from './types/responses';
+export * from './types/data-sources';
 
 export type { SubscriptionServer, WebSocketSendMessageFn } from './ws';

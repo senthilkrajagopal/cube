@@ -639,6 +639,40 @@ describe('ScaffoldingSchema', () => {
       });
     });
 
+    it('should map NUMERIC types to number', () => {
+      const numericSchemas = {
+        public: {
+          test: [
+            { name: 'numeric_col', type: 'numeric', attributes: [] },
+            { name: 'numeric_scaled_col', type: 'numeric(10,2)', attributes: [] },
+            { name: 'bignumeric_col', type: 'BIGNUMERIC', attributes: [] },
+            { name: 'number_col', type: 'NUMBER', attributes: [] },
+          ]
+        }
+      };
+      [new ScaffoldingSchema(numericSchemas), new ScaffoldingSchema(numericSchemas, { snakeCase: true })].forEach(schema => {
+        numericSchemas.public.test.forEach(col => {
+          expect((schema as any).columnType(col)).toBe('number');
+        });
+      });
+    });
+
+    it('should sum a NUMERIC column named like a measure', () => {
+      const schema = new ScaffoldingSchema({
+        public: {
+          orders: [
+            { name: 'id', type: 'integer', attributes: ['primaryKey'] },
+            { name: 'total_amount', type: 'numeric', attributes: [] },
+          ]
+        }
+      }, { snakeCase: true });
+
+      const [orders] = schema.generateForTables([['public', 'orders']]);
+
+      expect(orders.measures.map(m => m.name)).toEqual(['total_amount']);
+      expect(orders.dimensions.map(d => d.name)).toEqual(['id']);
+    });
+
     it('should be case insensitive for type matching', () => {
       const caseSchemas = {
         public: {

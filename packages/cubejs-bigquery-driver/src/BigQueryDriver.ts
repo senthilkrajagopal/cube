@@ -258,7 +258,11 @@ export class BigQueryDriver extends BaseDriver implements DriverInterface {
         const tables = await this.getTablesQuery(schema.schema_name);
         return tables
           .filter(table => table.table_name)
-          .map(table => ({ schema_name: schema.schema_name, table_name: table.table_name! }));
+          .map(table => ({
+            schema_name: schema.schema_name,
+            table_name: table.table_name!,
+            ...(table.table_type ? { table_type: table.table_type } : {}),
+          }));
       });
 
       const allTables = await Promise.all(allTablePromises);
@@ -299,7 +303,8 @@ export class BigQueryDriver extends BaseDriver implements DriverInterface {
         return [];
       }
       const [tables] = await this.bigquery.dataset(schemaName).getTables();
-      return tables.map(t => ({ table_name: t.id }));
+      // `metadata.type` is TABLE, VIEW, MATERIALIZED_VIEW, EXTERNAL or SNAPSHOT.
+      return tables.map(t => ({ table_name: t.id, table_type: t.metadata?.type }));
     } catch (e) {
       if ((<any>e).toString().indexOf('Not found')) {
         return [];

@@ -5,6 +5,7 @@ import jwt, { Algorithm as JWTAlgorithm } from 'jsonwebtoken';
 import R from 'ramda';
 import { v4 as uuidv4 } from 'uuid';
 import bodyParser from 'body-parser';
+import type Joi from 'joi';
 import { graphqlHTTP } from 'express-graphql';
 import structuredClone from '@ungap/structured-clone';
 import {
@@ -98,6 +99,18 @@ import {
   preAggsJobsRequestSchema,
   remapToQueryAdapterFormat,
 } from './query';
+import {
+  dataSourceColumnsRequestSchema,
+  DataSourceScaffoldRequest,
+  dataSourceScaffoldRequestSchema,
+  dataSourceSchemasRequestSchema,
+  DataSourceTableRefsRequest,
+  DataSourceTablesRequest,
+  dataSourceTablesRequestSchema,
+  matchesSearch,
+  pageOfTables,
+} from './data-sources';
+import type { DataSourceDescription, DataSourceIntrospectionApi } from './types/data-sources';
 import { cachedHandler } from './cached-handler';
 import { createJWKsFetcher } from './jwk';
 import { SQLServer, SQLServerConstructorOptions } from './sql-server';
@@ -614,6 +627,82 @@ class ApiGateway {
     );
 
     /** **************************************************************
+     * introspection scope                                           *
+     *************************************************************** */
+
+    app.get(
+      `${this.basePath}/v1/introspection/data-sources`,
+      userMiddlewares,
+      userAsyncHandler(async (req, res) => {
+        await this.introspect(req, res, async (context) => ({
+          dataSources: await this.dataSourceDescriptions(context),
+        }));
+      })
+    );
+
+    app.get(
+      `${this.basePath}/v1/introspection/data-sources/:dataSource/schemas`,
+      userMiddlewares,
+      userAsyncHandler(async (req, res) => {
+        await this.introspect(req, res, async (context) => {
+          const { search } = this.validDataSourceRequest<{ search?: string }>(dataSourceSchemasRequestSchema, req.query);
+          const introspection = await this.dataSourceIntrospection(context, req.params.dataSource);
+          const schemas = await introspection.schemas();
+          return {
+            schemas: schemas.filter(name => matchesSearch(name, search)).map(name => ({ name })),
+          };
+        });
+      })
+    );
+
+    app.get(
+      `${this.basePath}/v1/introspection/data-sources/:dataSource/tables`,
+      userMiddlewares,
+      userAsyncHandler(async (req, res) => {
+        await this.introspect(req, res, async (context) => {
+          const { schema, ...page } = this.validDataSourceRequest<DataSourceTablesRequest>(
+            dataSourceTablesRequestSchema,
+            req.query,
+          );
+          const introspection = await this.dataSourceIntrospection(context, req.params.dataSource);
+          return pageOfTables(await introspection.tables(schema), page);
+        });
+      })
+    );
+
+    app.post(
+      `${this.basePath}/v1/introspection/data-sources/:dataSource/columns`,
+      jsonParser,
+      userMiddlewares,
+      userAsyncHandler(async (req, res) => {
+        await this.introspect(req, res, async (context) => {
+          const { tables } = this.validDataSourceRequest<DataSourceTableRefsRequest>(
+            dataSourceColumnsRequestSchema,
+            req.body,
+          );
+          const introspection = await this.dataSourceIntrospection(context, req.params.dataSource);
+          return { tables: await introspection.columns(tables) };
+        });
+      })
+    );
+
+    app.post(
+      `${this.basePath}/v1/introspection/data-sources/:dataSource/scaffold`,
+      jsonParser,
+      userMiddlewares,
+      userAsyncHandler(async (req, res) => {
+        await this.introspect(req, res, async (context) => {
+          const { tables, format } = this.validDataSourceRequest<DataSourceScaffoldRequest>(
+            dataSourceScaffoldRequestSchema,
+            req.body,
+          );
+          const introspection = await this.dataSourceIntrospection(context, req.params.dataSource);
+          return { cubes: await introspection.scaffold(tables, { format }) };
+        });
+      })
+    );
+
+    /** **************************************************************
      * Private API (no scopes)                                       *
      *************************************************************** */
 
@@ -1106,6 +1195,86 @@ class ApiGateway {
     } catch (e: any) {
       this.handleError({ e, context, query, res: response, requestStarted });
     }
+  }
+
+  /**
+   * Answers a data source introspection request with what `handler` returns,
+   * once the context holds the `introspection` scope, and answers any error as
+   * every other endpoint does.
+   */
+  private async introspect(
+    req: Request,
+    res: ExpressResponse,
+    handler: (context: RequestContext) => Promise<unknown>,
+  ) {
+    const response = this.resToResultFn(res);
+    const requestStarted = new Date();
+    const context = <RequestContext>req.context;
+
+    try {
+      await this.assertApiScope('introspection', context?.securityContext);
+      response(await handler(context), { status: 200 });
+    } catch (e: any) {
+      this.handleError({
+        e,
+        context,
+        query: { dataSource: req.params?.dataSource, ...req.query, ...req.body },
+        res: response,
+        requestStarted,
+      });
+    }
+  }
+
+  private validDataSourceRequest<T>(schema: Joi.ObjectSchema, input: unknown): T {
+    const { error, value } = schema.validate(input || {});
+    if (error) {
+      throw new UserError(`Invalid request: ${error.message || error.toString()}`);
+    }
+
+    return value;
+  }
+
+  /**
+   * The data sources a client may browse: those declared in
+   * `CUBEJS_DATASOURCES` (or just `default` when none are), and those the
+   * data model names. The data model's are skipped when it doesn't compile,
+   * so a broken model doesn't stop anyone browsing tables to fix it.
+   */
+  protected async dataSourceDescriptions(context: RequestContext): Promise<DataSourceDescription[]> {
+    const compilerApi = await this.getCompilerApi(context);
+    const declared = getEnv('dataSources');
+    const names = new Set<string>(declared.length ? declared : ['default']);
+
+    try {
+      const { dataSources } = await compilerApi.dataSources(await this.getAdapterApi(context));
+      dataSources.forEach(({ dataSource }) => names.add(dataSource));
+    } catch (e: any) {
+      this.log({
+        type: 'Data sources of the data model skipped',
+        error: (e.stack || e).toString(),
+      }, context);
+    }
+
+    return Promise.all([...names].sort().map(async (dataSource) => ({
+      dataSource,
+      dbType: await compilerApi.getDbType(dataSource),
+    })));
+  }
+
+  /**
+   * @throws CubejsHandlerError 404 when the data source isn't one the client may browse
+   */
+  protected async dataSourceIntrospection(
+    context: RequestContext,
+    dataSource: string,
+  ): Promise<DataSourceIntrospectionApi> {
+    const known = await this.dataSourceDescriptions(context);
+    if (!known.some(description => description.dataSource === dataSource)) {
+      throw new CubejsHandlerError(404, 'Not Found', `Unknown data source: '${dataSource}'`);
+    }
+
+    const orchestratorApi = await this.getAdapterApi(context);
+    return orchestratorApi.dataSourceIntrospection(dataSource, context.requestId);
   }
 
   /**
@@ -2821,7 +2990,7 @@ class ApiGateway {
           );
         } else {
           scopes.forEach((p) => {
-            if (['graphql', 'meta', 'data', 'sql', 'jobs'].indexOf(p) === -1) {
+            if (['graphql', 'meta', 'data', 'sql', 'jobs', 'introspection'].indexOf(p) === -1) {
               throw new Error(
                 `A user-defined contextToApiScopes function returns a wrong scope: ${p}`
               );

@@ -237,6 +237,43 @@ describe('PostgresDriver', () => {
     }
   });
 
+  describe('schema introspection', () => {
+    beforeAll(async () => {
+      await driver.query('CREATE SCHEMA introspection', []);
+      await driver.query('CREATE TABLE introspection.customers (id serial PRIMARY KEY, name text)', []);
+      await driver.query(
+        'CREATE TABLE introspection.orders (id serial PRIMARY KEY, customer_id integer REFERENCES introspection.customers(id))',
+        []
+      );
+      await driver.query('CREATE VIEW introspection.customer_names AS SELECT name FROM introspection.customers', []);
+    });
+
+    test('says whether each relation is a table or a view', async () => {
+      const tables = await driver.getTablesForSpecificSchemas([{ schema_name: 'introspection' }]);
+
+      expect(tables).toEqual(expect.arrayContaining([
+        { schema_name: 'introspection', table_name: 'customers', table_type: 'BASE TABLE' },
+        { schema_name: 'introspection', table_name: 'orders', table_type: 'BASE TABLE' },
+        { schema_name: 'introspection', table_name: 'customer_names', table_type: 'VIEW' },
+      ]));
+    });
+
+    test('gives a column its foreign key when the referenced table isn\'t asked for', async () => {
+      const columns = await driver.getColumnsForSpecificTables([{ schema_name: 'introspection', table_name: 'orders' }]);
+
+      expect(columns.find(c => c.column_name === 'customer_id')?.foreign_keys).toEqual([
+        { target_table: 'customers', target_column: 'id' },
+      ]);
+      expect(columns.find(c => c.column_name === 'id')?.attributes).toEqual(['primaryKey']);
+    });
+
+    test('gives a referenced table\'s columns no foreign keys of the tables referencing it', async () => {
+      const columns = await driver.getColumnsForSpecificTables([{ schema_name: 'introspection', table_name: 'customers' }]);
+
+      expect(columns.find(c => c.column_name === 'id')?.foreign_keys).toEqual([]);
+    });
+  });
+
   // Note: This test MUST be the last in the list.
   test('release', async () => {
     expect(async () => {

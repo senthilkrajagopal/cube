@@ -414,7 +414,12 @@ export class ClickHouseDriver extends BaseDriver implements DriverInterface {
   protected override getTablesForSpecificSchemasQuery(schemasPlaceholders: string) {
     const query = `
       SELECT database as schema_name,
-            name as table_name
+            name as table_name,
+            multiIf(
+              engine = 'View', 'VIEW',
+              engine = 'MaterializedView', 'MATERIALIZED VIEW',
+              'BASE TABLE'
+            ) as table_type
       FROM system.tables
       WHERE database IN (${schemasPlaceholders})
     `;

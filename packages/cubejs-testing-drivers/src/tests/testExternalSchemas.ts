@@ -28,6 +28,7 @@ export function redshiftExternalSchemasSuite(
     expect(inputTables).toContainEqual({
       schema_name: EXTERNAL_SCHEMA,
       table_name: EXTERNAL_TABLE,
+      table_type: 'EXTERNAL TABLE',
     });
   });
 

@@ -180,8 +180,8 @@ configuration option.
 Each REST (JSON) API endpoint belongs to an API scope, e.g., the `/v1/load` endpoint
 belongs to the `data` scope. API scopes allow to secure access to API endpoints
 by making them accessible to specific users only or disallowing access for
-everyone. By default, API endpoints in all scopes, except for `jobs`, are
-accessible for everyone.
+everyone. By default, API endpoints in all scopes, except for `jobs` and
+`introspection`, are accessible for everyone.
 
 | API scope | REST (JSON) API endpoints | Accessible by default? |
 | --- | --- | --- |
@@ -190,6 +190,7 @@ accessible for everyone.
 | `graphql` | `/graphql` | ✅ Yes |
 | `sql`     | [`/v1/sql`][ref-ref-sql] | ✅ Yes |
 | `jobs`    | [`/v1/pre-aggregations/jobs`][ref-ref-paj] | ❌ No |
+| `introspection` | [`/v1/introspection/data-sources`][ref-ref-introspection] and the endpoints under it | ❌ No |
 | No scope  | `/livez`, `/readyz` | ✅ Yes |
 
 You can set accessible API scopes _for all requests_ using the
@@ -330,6 +331,7 @@ warehouse][ref-data-warehouses].
 [ref-ref-sql]: /reference/core-data-apis/rest-api/reference#base_path/v1/sql
 [ref-ref-cubesql]: /reference/core-data-apis/rest-api/reference#base_path/v1/cubesql
 [ref-ref-paj]: /reference/core-data-apis/rest-api/reference#base_path/v1/pre-aggregations/jobs
+[ref-ref-introspection]: /reference/core-data-apis/rest-api/reference#data-source-introspection
 [ref-security-context]: /docs/data-modeling/access-control/context
 [ref-graphql-api]: /reference/core-data-apis/graphql-api
 [ref-orchestration-api]: /reference/orchestration-api
