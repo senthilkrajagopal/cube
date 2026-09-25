@@ -604,6 +604,64 @@ describe('ScaffoldingSchema', () => {
     });
   });
 
+  describe('joins to a table of the same name in another schema', () => {
+    const customers = [{ name: 'id', type: 'integer', attributes: ['primaryKey'] }];
+    const dbSchema = {
+      public: {
+        orders: [
+          { name: 'id', type: 'integer', attributes: ['primaryKey'] },
+          // Joined by its name alone.
+          { name: 'customer_id', type: 'integer', attributes: [] },
+          {
+            name: 'buyer_id',
+            type: 'integer',
+            attributes: [],
+            foreign_keys: [{ target_table: 'customers', target_column: 'id' }],
+          },
+          {
+            name: 'seller_id',
+            type: 'integer',
+            attributes: [],
+            foreign_keys: [{ target_schema: 'crm', target_table: 'customers', target_column: 'id' }],
+          },
+        ],
+        customers,
+      },
+      sales: { customers },
+      crm: { customers },
+    };
+    const joinsOfOrders = (tables: [string, string][]) => {
+      const [orders] = new ScaffoldingSchema(dbSchema, {
+        snakeCase: true,
+        cubeNameFor: (schema: string, table: string) => `${schema}_${table}`,
+      }).generateForTables([['public', 'orders'], ...tables]);
+
+      return orders.joins.map(j => [j.thisTableColumn, j.cubeToJoin]);
+    };
+
+    it('joins the table of the order\'s own schema where there is one', () => {
+      expect(joinsOfOrders([['public', 'customers'], ['sales', 'customers'], ['crm', 'customers']])).toEqual([
+        ['customer_id', 'public_customers'],
+        ['buyer_id', 'public_customers'],
+        ['seller_id', 'crm_customers'],
+      ]);
+    });
+
+    it('joins a foreign key that names its schema to that schema\'s table or none', () => {
+      expect(joinsOfOrders([['sales', 'customers']])).toEqual([
+        ['customer_id', 'sales_customers'],
+        ['buyer_id', 'sales_customers'],
+      ]);
+    });
+
+    it('joins by name alone only the one table of that name, when there is no choice to make', () => {
+      expect(joinsOfOrders([['sales', 'customers'], ['crm', 'customers']])).toEqual([
+        ['buyer_id', 'sales_customers'],
+        ['seller_id', 'crm_customers'],
+      ]);
+    });
+  });
+
   describe('columnType mapping for numeric types', () => {
     it('should map FLOAT types to number', () => {
       const floatSchemas = {

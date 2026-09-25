@@ -357,13 +357,18 @@ export class ScaffoldingSchema {
   }
 
   /**
-   * Of the tables a join could target, those in `schema` when there are any:
-   * a table of the same name in another schema is a different table.
+   * Of the tables a join could target, those in `schema` when there are any,
+   * and otherwise those `elsewhere` picks: a table of the same name in
+   * another schema is a different table.
    */
-  private preferSchema(definitions: TableData[], schema: string | undefined): TableData[] {
+  private preferSchema(
+    definitions: TableData[],
+    schema: string,
+    elsewhere: (definitions: TableData[]) => TableData[],
+  ): TableData[] {
     const inSchema = definitions.filter(definition => definition.schema === schema);
 
-    return inSchema.length ? inSchema : definitions;
+    return inSchema.length ? inSchema : elsewhere(definitions);
   }
 
   protected joins(tableName: TableName, tableDefinition: ColumnData[]): Join[] {
@@ -378,6 +383,8 @@ export class ScaffoldingSchema {
             const [targetTableDefinition] = this.preferSchema(
               (this.tableNamesToTables[fk.target_table] || []).filter(t => t.table === fk.target_table),
               fk.target_schema ?? thisSchema,
+              // A key that names its target's schema means that schema's table or none.
+              others => (fk.target_schema == null ? others : []),
             );
             if (targetTableDefinition) {
               columnsToJoin.push({
@@ -398,7 +405,13 @@ export class ScaffoldingSchema {
             return null;
           }
 
-          columnsToJoin = this.preferSchema(tablesToJoin, thisSchema).map(definition => {
+          columnsToJoin = this.preferSchema(
+            tablesToJoin,
+            thisSchema,
+            // By its name alone, a column means a table in another schema only when that
+            // is the one table its name could mean: of several, any would be a guess.
+            others => (others.length === 1 ? others : []),
+          ).map(definition => {
             if (tableName === definition.tableName) {
               return null;
             }
