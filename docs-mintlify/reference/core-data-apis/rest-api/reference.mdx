@@ -863,6 +863,23 @@ A cube is named after its table. Tables of the same name in different schemas,
 such as `public.orders` and `sales.orders`, are named after both instead
 (`public_orders`, `sales_orders`), and joins use those names.
 
+A foreign key that names its target's schema joins the table in that schema,
+and nothing when that table isn't given. A foreign key that names no schema,
+and a `<table>_id` column, prefer a table in their own schema. Failing that,
+such a foreign key joins the first given table of that name in another schema,
+and a `<table>_id` column joins a table in another schema only when it is the
+one table its name could mean.
+
+Each member is named after its column, in snake_case, and its `sql` names the
+column. Where two members would share a name, as for the columns `Amount` and
+`amount`, the first named keeps it and the other gets the lowest free numbered
+name, `amount_2`, then `amount_3`, and never the unnumbered name of another
+column's member. Dimensions are named before measures. `count` is kept for the
+cube's count measure, so a number column named `count` is summed as `count_2`.
+A key column (a primary key, or a column named `id`) is one dimension with
+`primary_key: true` whatever its type, `time` included. A column whose member
+has a numbered name is mapped, and not in `unmappedColumns`.
+
 ```json
 {
   "cubes": [{
