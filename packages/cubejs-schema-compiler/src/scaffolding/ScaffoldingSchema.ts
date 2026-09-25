@@ -328,9 +328,12 @@ export class ScaffoldingSchema {
         this.fixCase(column.name) === 'id'
     );
 
+    // A key column is a dimension already, as a key, whatever its type: listed
+    // again as a time, it would replace the key under the same name.
     const timeColumns = R.pipe(
       // @ts-ignore
-      R.filter(column => !column.name.startsWith('_') && this.columnType(column) === 'time'),
+      R.filter((column: ColumnData) => !column.name.startsWith('_') && this.columnType(column) === 'time' &&
+        !dimensionColumns.includes(column)),
       R.sortBy(column => this.timeColumnIndex(column)),
       // @ts-ignore
       R.map(column => ({ ...column, columnType: 'time' })) // TODO do we need it?

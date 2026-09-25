@@ -32,6 +32,12 @@ export type SchemaFormatterOptions = {
   cubeNameFor?: (schema: string, table: string) => string | undefined;
 };
 
+/** Each member's name in its cube, by the column it's made from. */
+type MemberNames = {
+  dimensions: Map<string, string>;
+  measures: Map<string, string>;
+};
+
 export abstract class BaseSchemaFormatter {
   protected readonly scaffoldingSchema: ScaffoldingSchema;
 
@@ -85,10 +91,42 @@ export abstract class BaseSchemaFormatter {
       };
     });
 
+    // Named before any is rendered, so a join can name the other cube's member.
+    const names = new Map(tableSchemas.map(tableSchema => [tableSchema.cube, this.memberNames(tableSchema)]));
+
     return tableSchemas.map((tableSchema) => ({
       fileName: `${tableSchema.cube}.${this.fileExtension()}`,
-      content: this.renderFile(this.schemaDescriptorForTable(tableSchema, schemaContext)),
+      content: this.renderFile(this.schemaDescriptorForTable(tableSchema, schemaContext, cube => names.get(cube))),
     }));
+  }
+
+  /**
+   * Each member's name in its cube: the one its title gives it, and where
+   * another member of the cube, or its `count`, has that name already, the
+   * lowest numbered one, `amount_2`, that no member has and no other member's
+   * title gives it. A file keeps one member of a name, so without this a
+   * column whose name its neighbour's shares, or a number column named
+   * `count`, would be dropped without a word. Dimensions are named first.
+   */
+  protected memberNames(tableSchema: TableSchema): MemberNames {
+    const titled = new Set([...tableSchema.dimensions, ...tableSchema.measures].map(m => this.memberName(m)));
+    const taken = new Set<string>(['count']);
+    const unique = (member: { title: string }) => {
+      const named = this.memberName(member);
+      let name = named;
+
+      for (let n = 2; taken.has(name) || (name !== named && titled.has(name)); n++) {
+        name = `${named}_${n}`;
+      }
+
+      taken.add(name);
+      return name;
+    };
+
+    const dimensions = new Map(tableSchema.dimensions.map(m => [m.name, unique(m)]));
+    const measures = new Map(tableSchema.measures.map(m => [m.name, unique(m)]));
+
+    return { dimensions, measures };
   }
 
   protected sqlForMember(m) {
@@ -126,7 +164,19 @@ export abstract class BaseSchemaFormatter {
     return !!name.match(/^[a-z0-9_]+$/);
   }
 
-  protected schemaDescriptorForTable(tableSchema: TableSchema, schemaContext: SchemaContext = {}) {
+  /**
+   * @param namesOf The member names of another cube this one joins, by its name.
+   */
+  protected schemaDescriptorForTable(
+    tableSchema: TableSchema,
+    schemaContext: SchemaContext = {},
+    namesOf: (cube: string) => MemberNames | undefined = () => undefined,
+  ) {
+    // From this table itself: another cube given in the same run may share its name.
+    const own = this.memberNames(tableSchema);
+    const dimensionName = (cube: string, column: string) => (cube === tableSchema.cube ? own : namesOf(cube))
+      ?.dimensions.get(column) ?? this.memberName({ title: column });
+
     let table = `${
       tableSchema.schema?.length ? `${this.escapeName(tableSchema.schema)}.` : ''
     }${this.escapeName(tableSchema.table)}`;
@@ -158,12 +208,12 @@ export abstract class BaseSchemaFormatter {
     const joins = tableSchema.joins
       .map((j) => {
         const thisTableColumnRef = j.thisTableColumnIncludedAsDimension
-          ? this.cubeReference(`CUBE.${this.memberName({ title: j.thisTableColumn })}`)
+          ? this.cubeReference(`CUBE.${dimensionName(tableSchema.cube, j.thisTableColumn)}`)
           : `${this.cubeReference('CUBE')}.${this.escapeName(
             j.thisTableColumn
           )}`;
         const columnToJoinRef = j.columnToJoinIncludedAsDimension
-          ? this.cubeReference(`${j.cubeToJoin}.${this.memberName({ title: j.columnToJoin })}`)
+          ? this.cubeReference(`${j.cubeToJoin}.${dimensionName(j.cubeToJoin, j.columnToJoin)}`)
           : `${this.cubeReference(j.cubeToJoin)}.${this.escapeName(j.columnToJoin)}`;
 
         return ({
@@ -185,7 +235,7 @@ export abstract class BaseSchemaFormatter {
       joins,
       dimensions: tableSchema.dimensions.sort((a) => (a.isPrimaryKey ? -1 : 0))
         .map((m) => ({
-          [this.memberName(m)]: {
+          [own.dimensions.get(m.name) ?? this.memberName(m)]: {
             sql: this.sqlForMember(m),
             type: m.type ?? m.types[0],
             title: this.memberTitle(m),
@@ -197,7 +247,7 @@ export abstract class BaseSchemaFormatter {
         .reduce((a, b) => ({ ...a, ...b }), {}),
       measures: tableSchema.measures
         .map((m) => ({
-          [this.memberName(m)]: {
+          [own.measures.get(m.name) ?? this.memberName(m)]: {
             sql: this.sqlForMember(m),
             type: m.type ?? m.types[0],
             title: this.memberTitle(m),
