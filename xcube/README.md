@@ -326,9 +326,18 @@ errors, probes, items, itemsHash, currentRevision }`.
 item set, resolving every item afresh: the first import, and a recovery. A
 model in items mode refuses a file set (`409 mode`).
 
-**The items hash** (`itemsHash`) is the SHA-256 of the items sorted by folder
-id then name, as the JSON `[{"folderId","name","kind","yaml"}, …]`; the client
-can compute it to know whether xcube holds its items.
+**The items hash** (`itemsHash`) is the SHA-256 of the items sorted by
+`folderId + "/" + name` (byte order), as the JSON
+`[{"folderId","name","kind","yaml"}, …]`; the client can compute it to know
+whether xcube holds its items. Golden vector: the items
+`froot/customers` (`"cubes:\n  - name: customers\n"`) and `fsales/orders`
+(`"cubes:\n  - name: orders\n"`), both `kind: "cube"`, hash to
+`49ef16c81790839fe68a0306e4942506ba81c09e060c18c32341864ff0ffeee4`.
+
+**Errors from Cube's compile** name the item but carry no line: Cube reads
+xcube's resolved rewrite of an item, whose lines aren't the author's. YAML
+errors, found before anything is resolved, carry the author's line and
+column.
 
 #### `GET …/items`
 

@@ -1689,19 +1689,17 @@ export class XcubeRuntime {
       .map(({ folderId, name, fullName }) => ({ folderId, name, fullName }));
   }
 
-  /** Cube's errors, placed on the items whose resolved files they name. */
+  /**
+   * Cube's errors, placed on the items whose resolved files they name.
+   * Their lines are left out: Cube reads xcube's resolved rewrite of an item,
+   * not what the author wrote. (YAML errors, with the author's lines, are
+   * found before anything is resolved.)
+   */
   protected static itemErrors(validation: ValidationResult, items: PublishedItem[]): ItemError[] {
     const byPath = new Map(items.map((item) => [`${item.fullName}.yml`, item]));
-    return validation.errors.map(({ path, line, column, kind, message }) => {
+    return validation.errors.map(({ path, kind, message }) => {
       const item = path ? byPath.get(path) : undefined;
-      return {
-        folderId: item?.folderId ?? null,
-        name: item?.name ?? null,
-        ...(line !== undefined ? { line } : {}),
-        ...(column !== undefined ? { column } : {}),
-        kind,
-        message,
-      };
+      return { folderId: item?.folderId ?? null, name: item?.name ?? null, kind, message };
     });
   }
 

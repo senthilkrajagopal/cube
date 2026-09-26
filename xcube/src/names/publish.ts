@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import camelCase from 'camelcase';
 import inflection from 'inflection';
 import yaml from 'js-yaml';
 
@@ -37,9 +38,10 @@ function base32(text: string, length: number): string {
   return out;
 }
 
-/** Cube's default title for a name (`CubeToMetaTransformer.titleize`), for snake_case names. */
+/** Cube's default title for a name, by Cube's own steps (`CubeToMetaTransformer.ts:181-185`). */
 export function titleOf(name: string): string {
-  return inflection.titleize(name).replace(/\bId(s?)\b/g, (_m, plural) => `ID${plural}`);
+  return inflection.titleize(inflection.underscore(camelCase(name, { pascalCase: true })))
+    .replace(/\bId(s?)\b/g, (_m, plural) => `ID${plural}`);
 }
 
 /** The alias xcube gives a prefixed cube or view without one: short names stay, long ones become a stable hash. */

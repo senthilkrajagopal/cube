@@ -3,7 +3,7 @@ import { prepareCompiler } from '@cubejs-backend/schema-compiler';
 
 import { chainsIn, chainsInFString } from '../../src/names/expr';
 import { FolderTree, type AuthoredItem, type PublishedItem } from '../../src/names/items';
-import { aliasOf, filesOf, publish, titleOf } from '../../src/names/publish';
+import { aliasOf, filesOf, itemsHash, publish, titleOf } from '../../src/names/publish';
 
 const tree = new FolderTree([
   { id: 'froot', parentId: null },
@@ -535,5 +535,28 @@ describe('review findings', () => {
     const v = view('fsales', 'overview', `    cubes:\n      - join_path: customers\n        includes:\n          - name: amount\n            alias: ${longMember}\n        prefix: true\n`);
     const { errors } = publish({ tree, current: [], upserts: [withAmount, v], deletes: [] });
     expect(errors.map((e) => e.message)).toEqual([expect.stringMatching(new RegExp(`Member customers_${longMember}'s SQL alias would be longer than 63`))]);
+  });
+});
+
+describe('titles match Cube\'s own', () => {
+  test('for names with digit words, ids and single letters', async () => {
+    const names = ['orders', 'order_items', 'sales_2023', 'q3_sales', 'user_id', 'user_ids', 'a2b_c', 'v1', 'x_2_y', 'id', 'kpi_2023_q4'];
+    const files = names.map((name) => ({ fileName: `${name}.yml`, content: `cubes:\n  - name: ${name}\n    sql: "SELECT 1 AS x"\n    measures:\n      - name: count\n        type: count\n` }));
+    const { compiler, metaTransformer } = prepareCompiler({ localPath: () => '/nowhere', dataSchemaFiles: async () => files }, { standalone: true, allowNodeRequire: false });
+    await compiler.compile();
+    const cubeTitles = Object.fromEntries(metaTransformer.cubes.map((c: any) => [c.config.name, c.config.title]));
+    expect(Object.fromEntries(names.map((n) => [n, titleOf(n)]))).toEqual(cubeTitles);
+  });
+});
+
+describe('itemsHash', () => {
+  // The golden vector wechart tests its own hash against.
+  test('is the SHA-256 of the items sorted by folderId/name, as [{folderId, name, kind, yaml}]', () => {
+    const items = [
+      { folderId: 'fsales', name: 'orders', kind: 'cube' as const, yaml: 'cubes:\n  - name: orders\n' },
+      { folderId: 'froot', name: 'customers', kind: 'cube' as const, yaml: 'cubes:\n  - name: customers\n' },
+    ];
+    expect(itemsHash(items)).toBe('49ef16c81790839fe68a0306e4942506ba81c09e060c18c32341864ff0ffeee4');
+    expect(itemsHash([...items].reverse())).toBe(itemsHash(items));
   });
 });
