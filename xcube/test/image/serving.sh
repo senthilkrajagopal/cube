@@ -65,7 +65,7 @@ chmod 777 "$keys/credential"
 docker run --rm --user 1000 -v "$keys/credential:/keys" --entrypoint node "$IMAGE" \
   /cube/node_modules/xcube/dist/src/bin/keygen.js /keys > "$keys/credential.jwk"
 credential_kid="$(sed -E 's/.*"kid":"([^"]+)".*/\1/' "$keys/credential.jwk")"
-chmod -R a+rX "$keys/credential"
+# The files are uid 1000's, as the server is: on Linux the host user can't chmod them, and needn't.
 mkdir -p "$conf/model"
 echo "module.exports = require('xcube').config({ modelClaim: 'wechartModel', revisionClaim: 'wechartRevision', overlayClaim: 'wechartOverlay' });" > "$conf/cube.js"
 chmod -R a+rX "$conf"
