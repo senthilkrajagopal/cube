@@ -7,6 +7,8 @@ import {
 } from '@cubejs-backend/server-core';
 import type { ApiGatewayOptions } from '@cubejs-backend/api-gateway';
 import type { DriverFactoryByDataSource } from '@cubejs-backend/query-orchestrator';
+// Only a type in the package's index: the class is needed to read its protected cache.
+import { OrchestratorStorage } from '@cubejs-backend/server-core/dist/src/core/OrchestratorStorage';
 
 import { CatalogQueues } from './catalog/queue';
 import { globalRuntime, runtimeOf } from './config';
@@ -14,6 +16,18 @@ import { XcubeApiGateway } from './gateway';
 import { DataSourceIntrospection } from './introspection';
 import { FolderGateCompilerApi } from './security/gate';
 import type { ServingCore, XcubeRuntime } from './runtime/runtime';
+import { markedDataSources, MAX_OVERLAY_ORCHESTRATORS } from './overlays/connections';
+
+/**
+ * Drops an entry of Cube's orchestrator cache, from a subclass so the compiler
+ * checks the protected `storage` against Cube's declarations. Never
+ * instantiated.
+ */
+class OrchestratorStorageInternals extends OrchestratorStorage {
+  public static drop(storage: OrchestratorStorage, orchestratorId: string) {
+    (storage as OrchestratorStorageInternals).storage.delete(orchestratorId);
+  }
+}
 
 /**
  * Cube's server core, serving the introspection routes, and models from
@@ -25,6 +39,9 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
   protected readonly driverFactories = new WeakMap<OrchestratorApi, DriverFactoryByDataSource>();
 
   protected readonly catalogQueues = new CatalogQueues((msg, params) => this.logger(msg, params || {}));
+
+  /** Cube's 100 orchestrators, and room for previews' own, which xcube keeps to `MAX_OVERLAY_ORCHESTRATORS`. */
+  protected override readonly orchestratorStorage = new OrchestratorStorage({ compilerCacheSize: 100 + MAX_OVERLAY_ORCHESTRATORS });
 
   /**
    * The runtime serving this core: the one its options were configured for,
@@ -65,14 +82,21 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
     const model = runtime?.serving ? runtime.modelOfContext(context) : undefined;
     if (runtime && model) {
       const dataSource = context.dataSource ?? 'default';
-      const driver = await runtime.connections.driverFor(model, dataSource, {
+      const driverOptions = {
         preAggregations: Boolean(context.preAggregations),
         maxPoolSize: await CubejsServerCore.getDriverMaxPool(context, options),
-      });
+      };
+      // A preview's data source its overlay brings: the overlay's, never the published one.
+      const overlay = runtime.overlayConnectionsOf(context);
+      const brought = overlay?.connections.get(dataSource);
+      if (brought) {
+        return runtime.connections.overlayDriverFor({ ...brought, name: dataSource }, driverOptions);
+      }
+      const driver = await runtime.connections.driverFor(model, dataSource, driverOptions);
       if (driver) {
         return driver;
       }
-      if (dataSource !== 'default' && (await runtime.connections.of(model)).size) {
+      if (dataSource !== 'default' && ((await runtime.connections.of(model)).size || overlay)) {
         throw new Error(`Data source "${dataSource}" of model "${model}" has no connection`);
       }
     }
@@ -89,9 +113,16 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
     if (!runtime?.serving) {
       return super.createCompilerApi(repository, options);
     }
+    // A cube bound to a data source an overlay brings is marked with its driver
+    // type: the dialect comes from what is compiled, never from the context
+    // that happened to compile it.
+    const dbType = options.dbType || this.options.dbType;
+    const marks = Array.isArray(repository?.xcubeFiles) ? markedDataSources(repository.xcubeFiles) : new Map<string, string>();
     return new FolderGateCompilerApi(
       repository,
-      options.dbType || this.options.dbType,
+      marks.size && typeof dbType === 'function'
+        ? async (dataSourceContext: any) => marks.get(dataSourceContext?.dataSource ?? 'default') ?? dbType(dataSourceContext)
+        : dbType,
       this.createCompilerApiOptions(options),
       runtime.permissionsSourceFor(options.context),
     );
@@ -148,6 +179,11 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
   }
 
   /** Drops a compiled model from Cube's compiler cache, which disposes it. */
+  /** Drops an orchestrator Cube holds: Cube's cache releases it, with its drivers. */
+  public retireOrchestrator(orchestratorId: string) {
+    OrchestratorStorageInternals.drop(this.orchestratorStorage, orchestratorId);
+  }
+
   public retireAppId(appId: string) {
     this.compilerCache.delete(appId);
   }

@@ -91,13 +91,26 @@ export type PutKeysResult =
   | { outcome: 'stale' | 'conflict'; current: StoredKeySet };
 
 /** A workspace's or a proposal's unpublished items, as stored. */
+/** A data source an overlay brings: a connection as it would land in its folder, secrets sealed. */
+export interface OverlayConnection {
+  folderId: string;
+  /** Its short name in the folder. */
+  name: string;
+  driver: string;
+  authMethod: string;
+  fields: Record<string, string | number | boolean | null>;
+  sealed: Record<string, unknown>;
+}
+
 export interface StoredOverlay {
   model: string;
   id: string;
   version: number;
   upserts: AuthoredItem[];
   deletes: { folderId: string; name: string }[];
-  /** SHA-256 of the upserts and deletes: a push of the same content changes nothing but the expiry. */
+  /** Data sources previews of it query in place of, or beside, the published ones. */
+  connections: OverlayConnection[];
+  /** SHA-256 of the upserts, deletes and connections: a push of the same content changes nothing but the expiry. */
   contentHash: string;
   /** The published revision it was last checked against. */
   validatedRevision: number | null;
@@ -143,10 +156,13 @@ export class PermissionsError extends Error {
   }
 }
 
-/** Security can't be turned on while an xcube without the gate still serves the schema. */
+/** What older code would serve wrongly can't be turned on while it still serves the schema. */
 export class OlderInstancesError extends Error {
-  public constructor(public readonly instances: string[]) {
-    super('xcube instances older than schema version 4 are connected; they serve without the folder gate. Turn security on once every instance runs this version');
+  public constructor(
+    public readonly instances: string[],
+    message = 'xcube instances older than schema version 4 are connected; they serve without the folder gate. Turn security on once every instance runs this version',
+  ) {
+    super(message);
   }
 }
 
@@ -358,7 +374,7 @@ export class PgRevisionStore implements RevisionStore {
         throw new SecurityModeError(model);
       }
       if (security === true && !locked.security) {
-        const older = await this.olderInstances(client);
+        const older = await this.olderInstances(client, 4);
         if (older.length) {
           throw new OlderInstancesError(older);
         }
@@ -381,16 +397,18 @@ export class PgRevisionStore implements RevisionStore {
 
   /**
    * The xcube connections to this database from code before schema version
-   * 4, which named them without a version (`db.ts` `applicationName`).
+   * `below`. Code before version 4 named them without a version (`db.ts`
+   * `applicationName`).
    */
-  protected async olderInstances(client: PoolClient): Promise<string[]> {
+  protected async olderInstances(client: PoolClient, below: number): Promise<string[]> {
     const { rows } = await client.query(
       `SELECT DISTINCT application_name FROM pg_stat_activity
         WHERE datname = current_database() AND pid <> pg_backend_pid()
           AND application_name ~ '^xcube(-listen)?:'
           AND (application_name !~ '^xcube(-listen)?:v[0-9]+:'
-               OR substring(application_name from '^xcube(?:-listen)?:v([0-9]+):')::int < 4)
-        ORDER BY 1`
+               OR substring(application_name from '^xcube(?:-listen)?:v([0-9]+):')::int < $1)
+        ORDER BY 1`,
+      [below]
     );
     return rows.map((row) => row.application_name);
   }
@@ -527,6 +545,7 @@ export class PgRevisionStore implements RevisionStore {
       version: versionOf(row.version),
       upserts: row.upserts,
       deletes: row.deletes,
+      connections: row.connections ?? [],
       contentHash: row.content_hash,
       validatedRevision: row.validated_rev,
       validatedTree: row.validated_tree,
@@ -557,18 +576,25 @@ export class PgRevisionStore implements RevisionStore {
           return { outcome: 'too_many', overlay: null };
         }
       }
+      if (overlay.connections.length) {
+        // Code before version 7 would preview it on the published data sources.
+        const older = await this.olderInstances(client, 7);
+        if (older.length) {
+          throw new OlderInstancesError(older, 'xcube instances older than schema version 7 are connected; they would preview the overlay on the published data sources. Push its connections once every instance runs this version');
+        }
+      }
       const same = known && known.content_hash === overlay.contentHash;
       const { rows: [row] } = await client.query(
-        `INSERT INTO ${s}.overlays (model, id, version, upserts, deletes, content_hash, validated_rev, validated_tree, expires_at)
-         VALUES ($1, $2, nextval('${s}.overlay_versions'), $3::jsonb, $4::jsonb, $5, $6, $7, $8)
+        `INSERT INTO ${s}.overlays (model, id, version, upserts, deletes, connections, content_hash, validated_rev, validated_tree, expires_at)
+         VALUES ($1, $2, nextval('${s}.overlay_versions'), $3::jsonb, $4::jsonb, $5::jsonb, $6, $7, $8, $9)
          ON CONFLICT (model, id) DO UPDATE SET
            version = CASE WHEN ${s}.overlays.content_hash = EXCLUDED.content_hash THEN ${s}.overlays.version ELSE EXCLUDED.version END,
-           upserts = EXCLUDED.upserts, deletes = EXCLUDED.deletes, content_hash = EXCLUDED.content_hash,
-           validated_rev = EXCLUDED.validated_rev, validated_tree = EXCLUDED.validated_tree,
+           upserts = EXCLUDED.upserts, deletes = EXCLUDED.deletes, connections = EXCLUDED.connections,
+           content_hash = EXCLUDED.content_hash, validated_rev = EXCLUDED.validated_rev, validated_tree = EXCLUDED.validated_tree,
            expires_at = EXCLUDED.expires_at, updated_at = now()
          RETURNING *`,
-        [overlay.model, overlay.id, JSON.stringify(overlay.upserts), JSON.stringify(overlay.deletes), overlay.contentHash,
-          overlay.validatedRevision, overlay.validatedTree, overlay.expiresAt]
+        [overlay.model, overlay.id, JSON.stringify(overlay.upserts), JSON.stringify(overlay.deletes), JSON.stringify(overlay.connections),
+          overlay.contentHash, overlay.validatedRevision, overlay.validatedTree, overlay.expiresAt]
       );
       const stored = this.overlayOf(row);
       await client.query('SELECT pg_notify($1, $2)', [

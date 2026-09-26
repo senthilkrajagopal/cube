@@ -28,9 +28,12 @@ import {
 } from '../names/items';
 import { filesOf, itemsHash, publish } from '../names/publish';
 import { rollupsToStrip, withoutRollups } from '../overlays/rollups';
+import {
+  boundDataSource, MAX_OVERLAY_ORCHESTRATORS, overlayOfAppId, withDataSourceMark,
+} from '../overlays/connections';
 import { Connections, ConnectionError, type ConnectionInput } from '../connections/connections';
 import { CredentialError, CredentialKeys, type SealedV1 } from '../credentials/credentials';
-import { isDriverType } from '../connections/drivers';
+import { DRIVERS, isDriverType } from '../connections/drivers';
 import { createListenClient, createPool, type Logger } from '../store/db';
 import { migrate } from '../store/migrate';
 import {
@@ -40,6 +43,7 @@ import {
   type ModelHead,
   type ModelMode,
   type ModelStatus,
+  type OverlayConnection,
   type RevisionStore,
   type StoredModule,
   type StoredOverlay,
@@ -76,6 +80,8 @@ export interface ServingCore {
   getCompilerApi(context: any): Promise<{ getCompilers(options?: { requestId?: string }): Promise<unknown> }>;
   /** Drops a compiled model from Cube's compiler cache, which disposes it. */
   retireAppId(appId: string): void;
+  /** Drops an orchestrator Cube holds, which releases its drivers. */
+  retireOrchestrator?(orchestratorId: string): void;
   /** Cube's API gateway, whose `sql()` answers probes. */
   xcubeGateway(): { sql(request: any): Promise<void> };
   logger: (message: string, params?: any) => void;
@@ -361,6 +367,27 @@ export class KeySetError extends Error {
 
 /** Most keys one model's set may hold: the current key, the next, and a few being retired. */
 export const MAX_MODEL_KEYS = 10;
+
+/** The most data sources one overlay may bring. */
+export const MAX_OVERLAY_CONNECTIONS = 20;
+
+/** A JSON value with every object's keys in one order. */
+function canonical(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(canonical);
+  }
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).sort(([a], [b]) => (a < b ? -1 : 1)).map(([k, v]) => [k, canonical(v)]));
+  }
+  return value;
+}
+
+/** An overlay's data sources as its content: each with every field and envelope, in one order. */
+function connectionsHash(connections: OverlayConnection[]): string {
+  return JSON.stringify([...connections]
+    .sort((a, b) => (fullNameOf(a.folderId, a.name) < fullNameOf(b.folderId, b.name) ? -1 : 1))
+    .map((c) => canonical([c.folderId, c.name, c.driver, c.authMethod, c.fields, c.sealed])));
+}
 
 export interface RuntimeDependencies {
   /** Defaults to Postgres at `settings.databaseUrl`. */
@@ -1299,6 +1326,12 @@ export class XcubeRuntime {
         { key, id: record.id, version: record.version, base: base.key },
       );
       served.items = applied.items;
+      if (record.connections.length) {
+        this.overlayConnectionSets.set(
+          `${base.model}/${record.id}/${record.version}`,
+          new Map(record.connections.map((c) => [fullNameOf(c.folderId, c.name), c])),
+        );
+      }
     }
     served.lastUsed = Date.now();
     try {
@@ -1356,24 +1389,53 @@ export class XcubeRuntime {
    * pre-aggregations of every item its changes reach left out (and of their
    * ancestors, whose rollups they would inherit); modules kept from the
    * published revision's where unchanged.
+   *
+   * The data sources it brings are bound as published ones are, nearest-first.
+   * A cube bound to one, published or not, is previewed on it: it counts as
+   * changed, and its file is marked with the data source's driver type, so
+   * its module compiles apart, in that dialect.
    */
   protected applyOverlay(
     tree: FolderTree,
     current: PublishedItem[],
-    overlay: { upserts: AuthoredItem[]; deletes: { folderId: string; name: string }[] },
+    overlay: { upserts: AuthoredItem[]; deletes: { folderId: string; name: string }[]; connections?: OverlayConnection[] },
     previous: StoredModule[],
     dataSources?: { folderId: string; name: string }[],
   ): { items: PublishedItem[]; changed: string[]; files: SnapshotFile[]; modules: StoredModule[] } | { errors: ItemError[] } {
+    const brought = overlay.connections ?? [];
+    const own = new Map(brought.map((c) => [fullNameOf(c.folderId, c.name), DRIVERS[c.driver as keyof typeof DRIVERS].cubeType]));
+    const sources = [
+      ...(dataSources ?? []).filter((d) => !own.has(fullNameOf(d.folderId, d.name))),
+      ...brought.map(({ folderId, name }) => ({ folderId, name })),
+    ];
     const published = publish({
-      tree, current, upserts: overlay.upserts, deletes: overlay.deletes, lenientDeletes: true, overlay: true, dataSources,
+      tree,
+      current,
+      upserts: overlay.upserts,
+      deletes: overlay.deletes,
+      lenientDeletes: true,
+      overlay: true,
+      dataSources: sources.length ? sources : undefined,
     });
     if (published.errors.length) {
       return { errors: published.errors };
     }
     const byKey = new Map(published.items.map((item) => [`${item.folderId}/${item.name}`, item.fullName]));
     const changed = published.changed.map((key) => byKey.get(key)!);
-    const stripped = rollupsToStrip(published.items, new Set(changed));
-    const files = filesOf(published.items).map((f) => (stripped.has(f.path.slice(0, -'.yml'.length)) ? withoutRollups(f) : f));
+    const onOwn = new Map<string, string>();
+    for (const item of published.items) {
+      const bound = item.kind === 'cube' ? boundDataSource(item) : null;
+      if (bound !== null && own.has(bound)) {
+        onOwn.set(item.fullName, bound);
+      }
+    }
+    const stripped = rollupsToStrip(published.items, new Set([...changed, ...onOwn.keys()]));
+    const files = filesOf(published.items).map((f) => {
+      const name = f.path.slice(0, -'.yml'.length);
+      const file = stripped.has(name) ? withoutRollups(f) : f;
+      const bound = onOwn.get(name);
+      return bound ? withDataSourceMark(file, bound, own.get(bound)!) : file;
+    });
     return {
       items: published.items,
       changed: published.changed,
@@ -1394,6 +1456,7 @@ export class XcubeRuntime {
     body: {
       upserts: AuthoredItem[];
       deletes: { folderId: string; name: string }[];
+      connections?: OverlayConnection[];
       ttlSeconds?: number;
       baseVersion?: number | null;
     },
@@ -1415,14 +1478,21 @@ export class XcubeRuntime {
       return { status: 'too_many' };
     }
     const expiresAt = new Date(Date.now() + 1000 * Math.min(body.ttlSeconds ?? settings.ttlS, settings.maxTtlS));
-    const hash = crypto.createHash('sha256')
-      .update(JSON.stringify([itemsHash(body.upserts), [...body.deletes].map((d) => `${d.folderId}/${d.name}`).sort()]), 'utf8')
-      .digest('hex');
     const folders = await store.folders(model);
+    const connections = this.checkOverlayConnections(folders, body.connections ?? []);
+    const hash = crypto.createHash('sha256')
+      .update(JSON.stringify([
+        itemsHash(body.upserts),
+        [...body.deletes].map((d) => `${d.folderId}/${d.name}`).sort(),
+        ...(connections.length ? [connectionsHash(connections)] : []),
+      ]), 'utf8')
+      .digest('hex');
     const treeHash = folderTreeHash(folders);
     const tree = new FolderTree(folders);
     const current = await this.itemsAt(head);
-    const applied = this.applyOverlay(tree, current, body, await store.modules(model, head.revision), await this.dataSourcesOf(model));
+    const applied = this.applyOverlay(
+      tree, current, { ...body, connections }, await store.modules(model, head.revision), await this.dataSourcesOf(model),
+    );
     if ('errors' in applied) {
       return { status: 'invalid', errors: applied.errors, cubeMessage: null };
     }
@@ -1439,6 +1509,7 @@ export class XcubeRuntime {
       id,
       upserts: body.upserts,
       deletes: body.deletes,
+      connections,
       contentHash: hash,
       validatedRevision: head.revision,
       validatedTree: treeHash,
@@ -1482,8 +1553,121 @@ export class XcubeRuntime {
       validatedRevision: record.validatedRevision,
       upserts: record.upserts.map(({ folderId, name, kind }) => ({ folderId, name, kind })),
       deletes: record.deletes,
+      connections: record.connections.map((c) => ({
+        folderId: c.folderId,
+        name: c.name,
+        fullName: fullNameOf(c.folderId, c.name),
+        driver: c.driver,
+        authMethod: c.authMethod,
+        fields: c.fields,
+        secrets: Object.keys(c.sealed).sort(),
+      })),
       instance: { revision: active?.revision ?? null, ...instance },
     };
+  }
+
+  /**
+   * The data sources an overlay brings, checked as a connection's are: its
+   * fields right, and every secret opening for its target (a copy's opens
+   * only while its target is the original's, AC-312). Nothing connects here.
+   */
+  protected checkOverlayConnections(folders: Folder[], list: OverlayConnection[]): OverlayConnection[] {
+    if (list.length > MAX_OVERLAY_CONNECTIONS) {
+      throw new ConnectionError(`An overlay brings at most ${MAX_OVERLAY_CONNECTIONS} data sources`);
+    }
+    const seen = new Set<string>();
+    return list.map((c) => {
+      const where = `${c.folderId}/${c.name}`;
+      if (!SHORT_NAME.test(c.name)) {
+        throw new ConnectionError(`Data source ${where} has no valid short name`, ['a short name has letters, digits and single underscores']);
+      }
+      if (c.folderId !== ROOT && !folders.some((f) => f.id === c.folderId)) {
+        throw new ConnectionError(`Data source ${where} is in folder ${c.folderId}, which is not in the folder tree`);
+      }
+      const fullName = fullNameOf(c.folderId, c.name);
+      if (seen.has(fullName)) {
+        throw new ConnectionError(`Data source ${where} is brought twice`);
+      }
+      seen.add(fullName);
+      try {
+        const { driver, fields } = this.connections.check(c);
+        return {
+          folderId: c.folderId,
+          name: c.name,
+          driver,
+          authMethod: c.authMethod,
+          fields: fields as OverlayConnection['fields'],
+          sealed: c.sealed ?? {},
+        };
+      } catch (e) {
+        if (e instanceof ConnectionError) {
+          throw new ConnectionError(`Data source ${where}: ${e.message}`, e.problems, e.code);
+        }
+        if (e instanceof CredentialError) {
+          throw new CredentialError(`Data source ${where}: ${e.message}`);
+        }
+        throw e;
+      }
+    });
+  }
+
+  /** Each overlay version's data sources, by `<model>/<id>/<version>`: what previews of it connect to. */
+  protected readonly overlayConnectionSets = new Map<string, Map<string, OverlayConnection>>();
+
+  /** The orchestrators Cube built for previews of an overlay version, by `<model>/<id>/<version>`. */
+  protected readonly overlayOrchestrators = new Map<string, Set<string>>();
+
+  /**
+   * Overlay versions that brought data sources and are no longer served: a
+   * query still running in one's orchestrator is refused a driver, never
+   * given a published one.
+   */
+  protected readonly retiredOverlayConnections = new Set<string>();
+
+  /**
+   * The overlay version a preview request is pinned to, when it brings data
+   * sources. Its previews get an orchestrator of their own: their own
+   * drivers, queues and result cache, which Cube keys by the SQL alone.
+   */
+  public overlayConnectionsOf(
+    context: any,
+    { strict = true }: { strict?: boolean } = {},
+  ): { key: string; model: string; id: string; version: number; connections: Map<string, OverlayConnection> } | undefined {
+    const appId = context?.xcubePin?.appId;
+    const overlay = typeof appId === 'string' ? overlayOfAppId(appId) : undefined;
+    if (!overlay) {
+      return undefined;
+    }
+    const key = `${overlay.model}/${overlay.id}/${overlay.version}`;
+    const connections = this.overlayConnectionSets.get(key);
+    if (connections) {
+      return { key, ...overlay, connections };
+    }
+    if (strict && (this.retiredOverlayConnections.has(key) || this.overlayOrchestrators.has(key))) {
+      // Never the published data sources in an overlay's place.
+      throw unavailable('The overlay this request was pinned to is no longer compiled here; try again');
+    }
+    // An overlay that brings none. Cube may keep such a context for the model's
+    // own orchestrator, whose drivers it builds from it long after.
+    return undefined;
+  }
+
+  /**
+   * A preview of an overlay version uses its orchestrator: it goes when the
+   * version does, or when more than `MAX_OVERLAY_ORCHESTRATORS` versions'
+   * are kept and it is the least recently used.
+   */
+  public noteOverlayOrchestrator(key: string, orchestratorId: string) {
+    const ids = this.overlayOrchestrators.get(key) ?? new Set<string>();
+    // Most recently used last.
+    this.overlayOrchestrators.delete(key);
+    this.overlayOrchestrators.set(key, ids.add(orchestratorId));
+    for (const [oldest, orchestrators] of [...this.overlayOrchestrators].slice(0, Math.max(0, this.overlayOrchestrators.size - MAX_OVERLAY_ORCHESTRATORS))) {
+      // Its version is still served: its next preview builds another.
+      this.overlayOrchestrators.delete(oldest);
+      orchestrators.forEach((id) => this.core?.retireOrchestrator?.(id));
+      this.log('xcube: released the least recently used overlay\'s data sources', { overlay: oldest });
+    }
   }
 
   public async deleteOverlay(model: string, id: string): Promise<boolean> {
@@ -1581,12 +1765,8 @@ export class XcubeRuntime {
     }
     const users: string[] = [];
     for (const item of await this.itemsAt(head)) {
-      if (item.kind === 'cube') {
-        const bound = /^(?: {4}| {2}- )(?:data_source|dataSource): *"?([^"\n]+?)"? *$/m.exec(item.resolvedYaml)?.[1];
-        const extendsOther = /^(?: {4}| {2}- )extends:/m.test(item.resolvedYaml);
-        if (bound === name || (name === 'default' && bound === undefined && !extendsOther)) {
-          users.push(`${item.folderId}/${item.name}`);
-        }
+      if (item.kind === 'cube' && boundDataSource(item) === name) {
+        users.push(`${item.folderId}/${item.name}`);
       }
     }
     return users.sort();
@@ -2396,6 +2576,29 @@ export class XcubeRuntime {
         core?.retireAppId(resident.appId);
         this.log('xcube: retired compiled model', { model: resident.model, appId: resident.appId });
       }
+    }
+    // An overlay version no kept revision serves: its data sources and their drivers go.
+    const overlays = new Set<string>();
+    for (const revision of this.served.values()) {
+      if (revision.overlay) {
+        overlays.add(`${revision.model}/${revision.overlay.id}/${revision.overlay.version}`);
+      }
+    }
+    for (const [key, orchestrators] of [...this.overlayOrchestrators]) {
+      if (!overlays.has(key)) {
+        this.overlayOrchestrators.delete(key);
+        orchestrators.forEach((id) => core?.retireOrchestrator?.(id));
+        this.log('xcube: released an overlay\'s data sources', { overlay: key, orchestrators: [...orchestrators] });
+      }
+    }
+    for (const key of [...this.overlayConnectionSets.keys()]) {
+      if (!overlays.has(key)) {
+        this.overlayConnectionSets.delete(key);
+        this.retiredOverlayConnections.add(key);
+      }
+    }
+    for (const key of [...this.retiredOverlayConnections].slice(0, Math.max(0, this.retiredOverlayConnections.size - 10000))) {
+      this.retiredOverlayConnections.delete(key);
     }
   }
 

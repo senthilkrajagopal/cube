@@ -178,6 +178,11 @@ const rewrapSchema = Joi.object({
 const overlaySchema = Joi.object({
   upserts: Joi.array().max(2000).items(itemSchema).default([]),
   deletes: Joi.array().max(2000).items(itemRefSchema).default([]),
+  // The workspace's data sources, as they would land: short names in their folders.
+  connections: Joi.array().max(20).items(connectionTestSchema.keys({
+    folderId: Joi.string().max(64).required(),
+    name: Joi.string().max(64).required(),
+  })).default([]),
   ttlSeconds: Joi.number().integer().min(1),
   baseVersion: Joi.number().integer().min(1).allow(null),
 });
@@ -599,7 +604,13 @@ export function initAdminRoutes(
     const started = Date.now();
     const outcome = await runtime.putOverlay(model, id, body);
     logger('xcube: overlay pushed', {
-      model, overlay: id, upserts: body.upserts.length, deletes: body.deletes.length, status: outcome.status, durationMs: Date.now() - started,
+      model,
+      overlay: id,
+      upserts: body.upserts.length,
+      deletes: body.deletes.length,
+      connections: body.connections.length,
+      status: outcome.status,
+      durationMs: Date.now() - started,
     });
     switch (outcome.status) {
       case 'unknown':

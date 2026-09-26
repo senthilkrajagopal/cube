@@ -284,7 +284,11 @@ export class Connections {
   }
 
   /** Builds and tests a connection's driver; errors are redacted of its secrets. */
-  protected async connect(connection: StoredConnection, preAggregations: boolean, maxPoolSize?: number) {
+  protected async connect(
+    connection: Pick<StoredConnection, 'name' | 'driver' | 'authMethod' | 'fields' | 'sealed'>,
+    preAggregations: boolean,
+    maxPoolSize?: number,
+  ) {
     const built = this.create(connection, { preAggregations, maxPoolSize });
     try {
       await withTimeout(Promise.resolve(built.driver.testConnection()), 30000, 'Connecting');
@@ -329,6 +333,26 @@ export class Connections {
     this.live.set(key, (this.live.get(key) ?? new Set()).add(entry));
     this.report(model, name, connection.version, 'live');
     return entry.switchable.proxy;
+  }
+
+  /**
+   * A driver for a data source an overlay brings, for the orchestrator of its
+   * previews: built and tested as a connection's is, errors redacted, and
+   * released with that orchestrator. It never changes: another version of the
+   * overlay gets another orchestrator.
+   */
+  public async overlayDriverFor(
+    connection: Pick<StoredConnection, 'name' | 'driver' | 'authMethod' | 'fields' | 'sealed'>,
+    options: { preAggregations: boolean; maxPoolSize?: number },
+  ): Promise<any> {
+    let built: Awaited<ReturnType<Connections['connect']>>;
+    try {
+      built = await this.connect(connection, options.preAggregations, options.maxPoolSize);
+    } catch (e: any) {
+      throw new Error(`Data source "${connection.name}" of the overlay can't be used: ${String(e?.message ?? e)}`);
+    }
+    const { secrets } = built;
+    return new SwitchableDriver(connection.name, built.driver, () => undefined, (text) => redact(text, secrets)).proxy;
   }
 
   /**

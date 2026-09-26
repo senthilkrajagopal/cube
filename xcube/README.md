@@ -343,6 +343,27 @@ query previews when its token names it.
   theirs: their previews read the source. The rest keep their built rollups.
 - **Everything else applies:** the folder gate by each item's folder, `/v1/meta`
   merged across the overlay's modules, unions for queries spanning modules.
+- **Its own data sources** (AC-280). An overlay may bring the workspace's
+  data sources: copies of published ones pointed elsewhere, or new ones.
+  - **Checked as connections are.** A copy keeps the published envelopes, which
+    open only while its target is the original's (AC-312). They are opened when
+    pushed and again when previews connect, never stored opened.
+  - **Bound.** They bind like published data sources, nearest-first. Every cube
+    bound to one, published or not, is previewed on it, without rollups, in its
+    driver's dialect. The preview binds as the model would once they land, so
+    only `default` may then fall back to Cube's environment.
+  - **Their own orchestrator.** Previews of an overlay version that brings data
+    sources get an orchestrator of their own: drivers, queues and result cache.
+    Cube keys cached results by their SQL alone, and a copy shares its
+    original's name. Its drivers are released when that version is no longer
+    served. At most 20 such orchestrators are kept, and the least recently used
+    goes first. Cube's cache is 20 larger than its usual 100, so previews
+    never push out a model's.
+  - **Upgrades.** They are refused (`409 older_instances`) while an xcube
+    older than this one serves, since it would preview them on the published
+    data sources. The check is made at the push, so an older xcube started
+    afterwards (a rollback) previews such overlays on the published data
+    sources, and its own pushes leave their data sources in place.
 
 ### Connections
 
@@ -610,7 +631,10 @@ no_keys` when the model has none.
 Stores a workspace's or a proposal's items as an overlay:
 
 ```json
-{ "upserts": [{ "folderId": "fsales", "name": "orders", "kind": "cube", "yaml": "…" }], "deletes": [], "ttlSeconds": 86400, "baseVersion": 41 }
+{ "upserts": [{ "folderId": "fsales", "name": "orders", "kind": "cube", "yaml": "…" }], "deletes": [], "ttlSeconds": 86400, "baseVersion": 41,
+  "connections": [{ "folderId": "froot", "name": "default", "driver": "postgres", "authMethod": "password",
+    "fields": { "host": "db", "port": 5432, "database": "sales_copy", "user": "cube", "ssl": true },
+    "sealed": { "password": { "v": 1, "kid": "…", "enc": "…", "ct": "…" } } }] }
 ```
 
 - **The id** is 1 to 64 of `A-Z`, `a-z`, `0-9`, `_` and `-`.
@@ -619,6 +643,11 @@ Stores a workspace's or a proposal's items as an overlay:
 - **It is taken only if it applies to what is published now and every module it
   changes compiles.** Otherwise `422 invalid_items`, with `errors`, and the
   overlay stays as it was.
+- **Connections** (optional, at most 20) are the workspace's data sources,
+  each by its short name in the folder it would land in, with the fields and
+  envelopes of `PUT …/connections/{name}` (see Overlays). A bad one answers
+  as a connection's would: `400 invalid_connection` (naming it), or
+  `422 invalid_secret` when an envelope doesn't open for its target.
 - **The same content again** changes nothing but the expiry.
 - **Lifetime.** `ttlSeconds` (default `XCUBE_OVERLAY_TTL_S`, at most
   `XCUBE_OVERLAY_MAX_TTL_S`) counts from this push.
@@ -638,12 +667,15 @@ It answers `201` (created) or `200` with
 | `404` | `unknown_model` |
 | `409` | `mode`: a model holding a file set |
 | `409` | `too_many_overlays` |
+| `409` | `older_instances`: connections, while an older xcube serves |
 
 #### `GET …/overlays/{id}`
 
-`{ model, id, version, expiresAt, validatedRevision, upserts, deletes, instance }`.
+`{ model, id, version, expiresAt, validatedRevision, upserts, deletes, connections, instance }`.
 
 - `upserts` lists `{ folderId, name, kind }`.
+- `connections` lists `{ folderId, name, fullName, driver, authMethod, fields, secrets }`,
+  `secrets` naming the sealed fields; never an envelope.
 - `instance` is what the answering instance makes of the overlay over its
   current revision: `serving`, `idle` (not compiled now), or `broken` with its
   `errors`.

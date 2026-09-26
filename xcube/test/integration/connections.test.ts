@@ -1,8 +1,10 @@
 /**
  * Slice 6 end to end, in one Cube process: a model's data source pushed as a
  * connection with its password sealed to xcube's credential key, queried
- * through it, tested, swapped while Cube runs, and dropped. The warehouse is
- * the test Postgres itself. Runs when XCUBE_TEST_DATABASE_URL names one.
+ * through it, tested, swapped while Cube runs, and dropped; then an overlay's
+ * own data sources, previewed apart from the published ones (AC-280). The
+ * warehouse is the test Postgres itself, and a second database on it. Runs
+ * when XCUBE_TEST_DATABASE_URL names one.
  */
 import fs from 'fs';
 import os from 'os';
@@ -25,6 +27,22 @@ const describeWithDatabase = DATABASE_URL ? describe : describe.skip;
 jest.setTimeout(180 * 1000);
 
 const API_SECRET = 'connections-test-secret';
+
+// Widens what the runtime keeps protected: replaced revisions retire now, not after their grace.
+class TestRuntime extends XcubeRuntime {
+  public retireNow() {
+    for (const revision of this.served.values()) {
+      if (revision.state === 'retiring') {
+        revision.retireAfter = 0;
+      }
+    }
+    this.retireDue();
+  }
+
+  public overlayOrchestratorIds() {
+    return [...this.overlayOrchestrators.values()].flatMap((ids) => [...ids]);
+  }
+}
 const ADMIN_TOKEN = 'admin-token-0123456789abcdef-connections';
 
 describeWithDatabase('connections: data sources served from sealed credentials', () => {
@@ -32,17 +50,23 @@ describeWithDatabase('connections: data sources served from sealed credentials',
   const schema = `xcube_t_${suffix}`;
   const warehouse = `conn_w_${suffix}`;
   const role = `conn_r_${suffix}`;
+  const workspaceDb = `conn_ws_${suffix}`;
   const url = new URL(DATABASE_URL ?? 'postgres://x@localhost/x');
   const target = { host: url.hostname, port: Number(url.port || 5432), database: url.pathname.slice(1), ssl: false };
   let keysDir: string;
   let key: ReturnType<typeof generateCredentialKey>;
   let modelDir: string;
-  let runtime: XcubeRuntime;
+  let runtime: TestRuntime;
   let core: XcubeServerCore;
+  let options: any;
   let server: http.Server;
 
-  const sql = async (text: string) => {
-    const client = new Client({ connectionString: DATABASE_URL });
+  const sql = async (text: string, database?: string) => {
+    const at = new URL(DATABASE_URL!);
+    if (database) {
+      at.pathname = `/${database}`;
+    }
+    const client = new Client({ connectionString: at.toString() });
     await client.connect();
     try {
       await client.query(text);
@@ -81,12 +105,12 @@ describeWithDatabase('connections: data sources served from sealed credentials',
       modules: { packMin: 1, packMax: 300 },
       credentials: { dir: keysDir, kids: [key.kid], activeKid: key.kid },
     };
-    runtime = new XcubeRuntime(settings, { logger: () => undefined });
+    runtime = new TestRuntime(settings, { logger: () => undefined });
     await runtime.start();
     const nodeEnv = process.env.NODE_ENV;
     process.env.NODE_ENV = 'production';
     // No driverFactory in cube.js and no CUBEJS_DB_TYPE: every data source is a connection.
-    core = new XcubeServerCore(createConfig(runtime, { modelClaim: 'wechartModel', revisionClaim: 'wechartRevision' }, {
+    options = createConfig(runtime, { modelClaim: 'wechartModel', revisionClaim: 'wechartRevision' }, {
       apiSecret: API_SECRET,
       schemaPath: path.relative(process.cwd(), modelDir),
       cacheAndQueueDriver: 'memory',
@@ -94,7 +118,8 @@ describeWithDatabase('connections: data sources served from sealed credentials',
       telemetry: false,
       logger: () => undefined,
       contextToApiScopes: async (_securityContext: any, defaults: any) => [...defaults, 'introspection'],
-    }) as any);
+    });
+    core = new XcubeServerCore(options);
     process.env.NODE_ENV = nodeEnv;
     await runtime.attach(core);
     const app = express();
@@ -109,6 +134,7 @@ describeWithDatabase('connections: data sources served from sealed credentials',
     await core?.shutdown();
     fs.rmSync(modelDir, { recursive: true, force: true });
     fs.rmSync(keysDir, { recursive: true, force: true });
+    await sql(`DROP DATABASE IF EXISTS ${workspaceDb} WITH (FORCE)`).catch(() => undefined);
     await sql(`DROP SCHEMA IF EXISTS ${schema} CASCADE; DROP SCHEMA IF EXISTS ${warehouse} CASCADE;
       DROP OWNED BY ${role}; DROP ROLE IF EXISTS ${role};`).catch(() => undefined);
   });
@@ -296,5 +322,120 @@ describeWithDatabase('connections: data sources served from sealed credentials',
       { dataSource: 'default', dbType: 'postgres' }, { dataSource: 'fa__warehouse', dbType: 'postgres' },
     ]));
     expect((await admin('delete', '/connections/fa__warehouse').expect(409)).body.problems).toEqual(['fa/sales uses it']);
+  });
+
+  describe('an overlay\'s own data sources (AC-280)', () => {
+    const preview = (overlay: string, measure = 'orders.total') => request(server).get('/cubejs-api/v1/load')
+      .query({ query: JSON.stringify({ measures: [measure] }) })
+      .set('Authorization', jwt.sign({ wechartModel: 'dev', wechartRevision: revision, xcubeOverlay: overlay }, API_SECRET));
+    // The workspace's copy of `default`: the same host, another database, the published envelope byte for byte.
+    const copy = (fields: object = {}) => ({
+      folderId: 'froot',
+      name: 'default',
+      driver: 'postgres',
+      authMethod: 'password',
+      fields: { ...target, user: role, database: workspaceDb, ...fields },
+      sealed: { password: seal('second-password') },
+    });
+    let copyVersion = 0;
+    const connectionsTo = async (database: string) => {
+      const client = new Client({ connectionString: DATABASE_URL });
+      await client.connect();
+      try {
+        const { rows: [{ n }] } = await client.query('SELECT count(*)::int AS n FROM pg_stat_activity WHERE datname = $1', [database]);
+        return n as number;
+      } finally {
+        await client.end();
+      }
+    };
+
+    beforeAll(async () => {
+      await sql(`CREATE DATABASE ${workspaceDb}`);
+      await sql(`CREATE SCHEMA ${warehouse};
+        CREATE TABLE ${warehouse}.orders (id int PRIMARY KEY, amount int);
+        INSERT INTO ${warehouse}.orders VALUES (1, 3), (2, 4);
+        GRANT USAGE ON SCHEMA ${warehouse} TO ${role};
+        GRANT SELECT ON ${warehouse}.orders TO ${role};`, workspaceDb);
+    });
+
+    test('a copy pointed at another database is previewed on it, the same SQL never answered from the other\'s cache', async () => {
+      const pushed = await admin('put', '/overlays/ws-copy', { upserts: [], deletes: [], connections: [copy()] }).expect(201);
+      expect(pushed.body.version).toBeGreaterThan(0);
+      copyVersion = pushed.body.version;
+
+      const first = await preview('ws-copy').expect(200);
+      expect(first.body.data[0]['orders.total']).toBe('7');
+      // The published model's answer, and the overlay's again: Cube caches by SQL, which is the same.
+      expect((await load().expect(200)).body.data[0]['orders.total']).toBe('42');
+      expect((await preview('ws-copy').expect(200)).body.data[0]['orders.total']).toBe('7');
+
+      const status = await admin('get', '/overlays/ws-copy').expect(200);
+      expect(status.body.connections).toEqual([expect.objectContaining({
+        folderId: 'froot', name: 'default', fullName: 'default', driver: 'postgres', secrets: ['password'],
+      })]);
+      expect(JSON.stringify(status.body)).not.toContain('"enc"');
+      // Its own orchestrator, which no model's id can name: model ids have no capitals.
+      expect(runtime.overlayOrchestratorIds()).toContain(`STANDALONE_dev_O_ws-copy_${copyVersion}`);
+    });
+
+    test('a copy aimed at another host, or with verification turned off, needs its secret again', async () => {
+      const moved = await admin('put', '/overlays/ws-copy', { connections: [copy({ host: 'elsewhere.example.com' })] }).expect(422);
+      expect(moved.body).toMatchObject({ code: 'invalid_secret' });
+      expect(moved.body.error).toContain('froot/default');
+      await admin('put', '/overlays/ws-copy', { connections: [copy({ ssl: true, sslRejectUnauthorized: false })] }).expect(422);
+      const wrong = await admin('put', '/overlays/ws-copy', { connections: [{ ...copy(), driver: 'nope' }] }).expect(400);
+      expect(wrong.body.code).toBe('invalid_connection');
+      // Refused, the overlay stays as it was.
+      expect((await preview('ws-copy').expect(200)).body.data[0]['orders.total']).toBe('7');
+    });
+
+    test('a data source only the workspace has binds the workspace\'s cubes, in its own dialect', async () => {
+      const res = await admin('put', '/overlays/ws-new', {
+        upserts: [{
+          folderId: 'froot',
+          name: 'ws_orders',
+          kind: 'cube',
+          yaml: `cubes:\n  - name: ws_orders\n    data_source: scratch\n    sql_table: ${warehouse}.orders\n    measures:\n      - name: total\n        sql: amount\n        type: sum\n`,
+        }],
+        connections: [{ ...copy(), name: 'scratch' }],
+      }).expect(201);
+      expect(res.body.items).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'ws_orders' })]));
+      expect((await preview('ws-new', 'ws_orders.total').expect(200)).body.data[0]['ws_orders.total']).toBe('7');
+      // Published, nothing names it.
+      expect((await load().expect(200)).body.data[0]['orders.total']).toBe('42');
+    });
+
+    test('an overlay brings data sources only once no older xcube, which would ignore them, serves', async () => {
+      const older = new Client({ connectionString: DATABASE_URL, application_name: 'xcube:v6:older-instance' });
+      await older.connect();
+      try {
+        const refused = await admin('put', '/overlays/ws-old', { connections: [copy()] }).expect(409);
+        expect(refused.body).toMatchObject({ code: 'older_instances', instances: ['xcube:v6:older-instance'] });
+        await admin('put', '/overlays/ws-old', {}).expect(201);
+      } finally {
+        await older.end();
+      }
+      await admin('delete', '/overlays/ws-old').expect(204);
+    });
+
+    test('dropped, an overlay\'s data sources are released with the orchestrator its previews had', async () => {
+      expect(await connectionsTo(workspaceDb)).toBeGreaterThan(0);
+      await admin('delete', '/overlays/ws-copy').expect(204);
+      await admin('delete', '/overlays/ws-new').expect(204);
+      runtime.retireNow();
+      for (let i = 0; i < 100 && await connectionsTo(workspaceDb) > 0; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      expect(await connectionsTo(workspaceDb)).toBe(0);
+      await preview('ws-copy').expect((r) => expect(r.status).toBeGreaterThanOrEqual(400));
+      // Cube asks a compiled model's dialect with the context that compiled it, maybe a preview's
+      // long gone: answered. A driver for that preview is refused, never a published one.
+      const gone = {
+        securityContext: { wechartModel: 'dev' }, xcubePin: { model: 'dev', appId: `xcube:dev:o:ws-copy:${copyVersion}:t0@x` }, dataSource: 'default',
+      };
+      await expect(options.driverFactory(gone)).resolves.toEqual({ type: 'postgres' });
+      await expect(core.resolveDriver(gone)).rejects.toThrow(/no longer compiled here/);
+      expect((await load().expect(200)).body.data[0]['orders.total']).toBe('42');
+    });
   });
 });

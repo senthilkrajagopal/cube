@@ -189,6 +189,7 @@ describeWithDatabase('permissions and keys across instances', () => {
       contentHash: 'a'.repeat(64),
       validatedRevision: null,
       validatedTree: null,
+      connections: [],
       expiresAt: new Date(Date.now() + 60000),
     };
     const { overlay: stored } = await store.putOverlay(overlay, 100);

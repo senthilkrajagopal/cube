@@ -3,6 +3,7 @@ import { FileRepository } from '@cubejs-backend/server-core';
 import crypto from 'crypto';
 import { assertDataSource, getEnv } from '@cubejs-backend/shared';
 
+import { DRIVERS, isDriverType } from './connections/drivers';
 import { XcubeRuntime, type ServingOptions } from './runtime/runtime';
 import { GATE_GROUP } from './security/marker';
 
@@ -137,6 +138,9 @@ export function createConfig(
       return {
         localPath: () => path.join(process.cwd(), schemaPath),
         dataSchemaFiles: async () => files.map(({ path: fileName, content }) => ({ fileName, content })),
+        // What the compiled model is, before the folder gate rewrites it: its
+        // marks name the dialect of an overlay's data sources.
+        xcubeFiles: served.files,
       };
     },
     extendContext: async (req: any) => {
@@ -150,9 +154,19 @@ export function createConfig(
     // orchestrator (drivers, queues, caches). Every model has its own
     // pre-aggregation schema, fixed whatever its connections, as a compiled
     // model keeps the schema it was compiled with.
+    // A preview of an overlay that brings data sources gets its own, per version
+    // of the overlay: Cube keys cached results by their SQL alone, and the
+    // overlay's data sources share the published ones' names.
     contextToOrchestratorId: async (context: any) => {
       const base = cube.contextToOrchestratorId ? await cube.contextToOrchestratorId(context) : 'STANDALONE';
       const model = runtime.modelOfContext(context);
+      const overlay = model ? runtime.overlayConnectionsOf(context) : undefined;
+      if (overlay) {
+        // Model ids have no capitals: `_O_` can't be part of one, so no model's id is an overlay's.
+        const id = `${base}_${model}_O_${overlay.id}_${overlay.version}`;
+        runtime.noteOverlayOrchestrator(overlay.key, id);
+        return id;
+      }
       return model && (await runtime.connections.of(model)).size ? `${base}_${model}` : base;
     },
     preAggregationsSchema: async (context: any) => {
@@ -170,13 +184,22 @@ export function createConfig(
     // Cube the driver itself (XcubeServerCore.resolveDriver).
     driverFactory: async (context: any) => {
       const model = runtime.modelOfContext(context);
-      const connections = model ? await runtime.connections.of(model) : undefined;
       const dataSource = context?.dataSource ?? 'default';
+      // One a preview's overlay brings. Never refused here: Cube asks this for
+      // a compiled model's dialect with the context that compiled it, which
+      // may be a preview's long gone (a compiled model's own marks come first,
+      // XcubeServerCore.createCompilerApi); the driver itself is refused.
+      const overlay = model ? runtime.overlayConnectionsOf(context, { strict: false }) : undefined;
+      const brought = overlay?.connections.get(dataSource);
+      if (brought && isDriverType(brought.driver)) {
+        return { type: DRIVERS[brought.driver].cubeType };
+      }
+      const connections = model ? await runtime.connections.of(model) : undefined;
       const type = connections ? await runtime.connections.typeOf(model!, dataSource) : undefined;
       if (type) {
         return { type };
       }
-      if (connections?.size && dataSource !== 'default') {
+      if ((connections?.size || overlay) && dataSource !== 'default') {
         // A model with connections reads its own data sources: only its default may be Cube's.
         throw new Error(`Data source "${dataSource}" of model "${model}" has no connection`);
       }
@@ -194,9 +217,16 @@ export function createConfig(
     allowNodeRequire: cube.allowNodeRequire ?? false,
     // xcube retires compiled models itself; Cube's cache must not evict them first.
     compilerCacheSize: cube.compilerCacheSize ?? 2000,
-    orchestratorOptions: async (context: any) => orchestratorDefaults(
-      typeof cube.orchestratorOptions === 'function' ? await cube.orchestratorOptions(context) : cube.orchestratorOptions,
-    ),
+    orchestratorOptions: async (context: any) => {
+      const given = orchestratorDefaults(
+        typeof cube.orchestratorOptions === 'function' ? await cube.orchestratorOptions(context) : cube.orchestratorOptions,
+      );
+      // An overlay's previews read the published rollups of what it doesn't
+      // reach, from the model's schema, and never build any there.
+      return runtime.modelOfContext(context) && runtime.overlayConnectionsOf(context)
+        ? { ...given, preAggregationsOptions: { ...given.preAggregationsOptions, externalRefresh: true } }
+        : given;
+    },
     // The SQL API's contexts obey the rules HS256 tokens do: no role, and no model that has keys.
     ...(cube.checkSqlAuth ? {
       checkSqlAuth: async (req: any, user: string | null, password: string | null) => {

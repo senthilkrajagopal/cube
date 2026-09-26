@@ -226,6 +226,19 @@ export const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    version: 7,
+    name: 'overlay connections',
+    // Additive: older code ignores the column, so an overlay holding
+    // connections is refused while such code serves (`putOverlay`).
+    minReader: 2,
+    sql: (s) => `
+      -- A workspace's own data sources, as they would land: previews of the
+      -- overlay query them in place of, or beside, the published ones.
+      -- Secrets sealed by the client, as a connection's are.
+      ALTER TABLE ${s}.overlays ADD COLUMN connections jsonb NOT NULL DEFAULT '[]'::jsonb;
+    `,
+  },
 ];
 
 /** The newest schema version this code knows. */
