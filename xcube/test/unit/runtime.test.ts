@@ -62,8 +62,24 @@ class MemoryStore implements RevisionStore {
     return [];
   }
 
-  public async putFolders(): Promise<string> {
+  public async putFolders(): Promise<{ hash: string; permissionsVersion: number; security: boolean }> {
     throw new Error('not used');
+  }
+
+  public async permissions() {
+    return null;
+  }
+
+  public async versions() {
+    return [];
+  }
+
+  public async putKeys(): Promise<any> {
+    throw new Error('not used');
+  }
+
+  public async keys() {
+    return null;
   }
 
   public async items() {

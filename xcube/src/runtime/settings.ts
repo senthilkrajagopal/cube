@@ -28,7 +28,41 @@ export interface XcubeSettings {
   maxModels: number;
   /** Module packing: groups smaller than `packMin` items are packed into modules of at most `packMax`. */
   modules: { packMin: number; packMax: number };
+  /** `DEFAULT_TOKENS` when absent. */
+  tokens?: TokenSettings;
 }
+
+/** How tokens are verified: RS256 user tokens against each model's pushed keys, service tokens against configured ones. */
+export interface TokenSettings {
+  /** The `aud` a user token names. */
+  audience: string;
+  /** The `aud` a service token names. */
+  serviceAudience: string;
+  /** When set, the `iss` a service token names. */
+  serviceIssuer?: string;
+  /** Clock skew allowed on `exp`, `iat` and `nbf`, in seconds. */
+  clockToleranceS: number;
+  /** The longest a token may live (`exp - iat`), in seconds. */
+  maxLifetimeS: number;
+  /**
+   * Tokens signed with Cube's API secret (HS256): taken for a model until it
+   * has keys (`until-keys`), or never (`off`).
+   */
+  hs256: 'until-keys' | 'off';
+  /** The service credential's public keys: a JWK set, or PEM public keys or certificates. */
+  serviceKeys: string;
+  /** A file holding them instead, re-read when it changes (a mounted Secret). */
+  serviceKeysFile?: string;
+}
+
+export const DEFAULT_TOKENS: TokenSettings = {
+  audience: 'xcube',
+  serviceAudience: 'xcube-admin',
+  clockToleranceS: 60,
+  maxLifetimeS: 3600,
+  hs256: 'until-keys',
+  serviceKeys: '',
+};
 
 function number(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
   const raw = env[name];
@@ -38,6 +72,14 @@ function number(env: NodeJS.ProcessEnv, name: string, fallback: number): number 
   const value = Number(raw);
   if (!Number.isInteger(value) || value < 0) {
     throw new Error(`${name} must be a whole number, not ${JSON.stringify(raw)}`);
+  }
+  return value;
+}
+
+function hs256(raw: string | undefined): 'until-keys' | 'off' {
+  const value = (raw || 'until-keys').toLowerCase();
+  if (value !== 'until-keys' && value !== 'off') {
+    throw new Error(`XCUBE_HS256 is until-keys or off, not ${JSON.stringify(raw)}`);
   }
   return value;
 }
@@ -88,6 +130,16 @@ export function settingsFromEnv(env: NodeJS.ProcessEnv = process.env): XcubeSett
     modules: {
       packMin: number(env, 'XCUBE_MODULE_PACK_MIN', 50),
       packMax: Math.max(1, number(env, 'XCUBE_MODULE_PACK_MAX', 300)),
+    },
+    tokens: {
+      audience: env.XCUBE_TOKEN_AUDIENCE || DEFAULT_TOKENS.audience,
+      serviceAudience: env.XCUBE_SERVICE_AUDIENCE || DEFAULT_TOKENS.serviceAudience,
+      serviceIssuer: env.XCUBE_SERVICE_ISSUER || undefined,
+      clockToleranceS: number(env, 'XCUBE_TOKEN_CLOCK_TOLERANCE_S', DEFAULT_TOKENS.clockToleranceS),
+      maxLifetimeS: Math.max(1, number(env, 'XCUBE_TOKEN_MAX_LIFETIME_S', DEFAULT_TOKENS.maxLifetimeS)),
+      hs256: hs256(env.XCUBE_HS256),
+      serviceKeys: env.XCUBE_SERVICE_KEYS || '',
+      serviceKeysFile: env.XCUBE_SERVICE_KEYS_FILE || undefined,
     },
   };
 }

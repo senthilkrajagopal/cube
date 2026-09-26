@@ -20,7 +20,42 @@ ADMIN_TOKEN=serving-check-admin-token-0123456789abcdef
 API_SECRET=serving-check-api-secret
 
 conf="$(mktemp -d)"
-trap 'docker logs "$NAME" 2>&1 | tail -20; docker rm -f "$NAME" >/dev/null 2>&1 || true; rm -rf "$conf"' EXIT
+keys="$(mktemp -d)"
+trap 'docker logs "$NAME" 2>&1 | tail -20; docker rm -f "$NAME" >/dev/null 2>&1 || true; rm -rf "$conf" "$keys"' EXIT
+
+# Slice 4's keys, on the host only: the service credential's and the model's
+# signing key. The container is given the service credential's public key.
+cat > "$keys/tokens.js" <<'JS'
+const crypto = require('crypto');
+const fs = require('fs');
+const dir = __dirname;
+const [,, what, ...args] = process.argv;
+const keyFile = (name) => `${dir}/${name}.pem`;
+if (what === 'init') {
+  for (const name of ['service', 'user']) {
+    const { privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+    fs.writeFileSync(keyFile(name), privateKey.export({ format: 'pem', type: 'pkcs8' }));
+  }
+  process.exit(0);
+}
+const jwk = (name, kid) => ({ ...crypto.createPublicKey(fs.readFileSync(keyFile(name))).export({ format: 'jwk' }), kid });
+if (what === 'jwk' || what === 'jwks') {
+  console.log(JSON.stringify(what === 'jwk' ? jwk(args[0], args[1]) : { keys: [jwk(args[0], args[1])] }));
+  process.exit(0);
+}
+const now = Math.floor(Date.now() / 1000);
+const part = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+const sign = (name, kid, payload) => {
+  const body = `${part({ alg: 'RS256', typ: 'JWT', kid })}.${part({ iat: now, exp: now + 300, ...payload })}`;
+  return `${body}.${crypto.sign('RSA-SHA256', Buffer.from(body), fs.readFileSync(keyFile(name))).toString('base64url')}`;
+};
+if (what === 'service') {
+  console.log(sign('service', 'svc', { aud: 'xcube-admin', role: 'service' }));
+} else {
+  console.log(sign('user', 'user-1', { aud: 'xcube', role: 'user', groups: args[0].split(','), wechartRevision: Number(args[1]) }));
+}
+JS
+node "$keys/tokens.js" init
 mkdir -p "$conf/model"
 echo "module.exports = require('xcube').config({ modelClaim: 'wechartModel', revisionClaim: 'wechartRevision' });" > "$conf/cube.js"
 chmod -R a+rX "$conf"
@@ -40,6 +75,7 @@ docker run -d --name "$NAME" --network "$DOCKER_NETWORK" "${publish[@]}" --user 
   -v "$conf:/cube/conf:ro" \
   -e XCUBE_DATABASE_URL="postgres://xcube:serving-check@$PG_HOST:5432/test" \
   -e XCUBE_ADMIN_TOKENS="$ADMIN_TOKEN" \
+  -e XCUBE_SERVICE_KEYS="$(node "$keys/tokens.js" jwks service svc)" \
   -e CUBEJS_DB_TYPE=postgres -e CUBEJS_DB_HOST="$PG_HOST" -e CUBEJS_DB_NAME=test \
   -e CUBEJS_DB_USER=test -e CUBEJS_DB_PASS=test \
   -e CUBEJS_API_SECRET="$API_SECRET" -e CUBEJS_DEV_MODE=false \
@@ -103,3 +139,32 @@ answer="$(curl -s -H "Authorization: $token" -H 'Content-Type: application/json'
 echo "$answer" | head -c 300; echo
 echo "$answer" | grep -q '"fsub__doubled.total":"84"'
 echo "Items check passed: a folder's cube, bound to a root cube, queried by its full name."
+
+# Slice 4: the model's keys and folder groups pushed with the service
+# credential, then RS256 user tokens through the folder gate.
+service="$(node "$keys/tokens.js" service)"
+signed() {
+  curl -s -o /tmp/xcube-admin.json -w '%{http_code}' -X "$1" \
+    -H "Authorization: Bearer $service" -H 'Content-Type: application/json' \
+    ${3:+--data "$3"} "$CUBE_URL/cubejs-api/v1/semantic/models/items$2"
+}
+status="$(signed PUT /keys "{\"version\": 1, \"keys\": [$(node "$keys/tokens.js" jwk user user-1)]}")"
+[ "$status" = 200 ] || { echo "keys answered $status"; cat /tmp/xcube-admin.json; exit 1; }
+status="$(signed PUT /folders '{"security": true, "folders": [{"id": "froot", "parentId": null, "allowedGroups": ["g_sub", "sa"]}, {"id": "fsub", "parentId": "froot", "allowedGroups": ["g_sub", "sa"]}]}')"
+[ "$status" = 200 ] || { echo "folders answered $status"; cat /tmp/xcube-admin.json; exit 1; }
+
+query() {
+  curl -s -o /tmp/xcube-query.json -w '%{http_code}' -H "Authorization: $1" -H 'Content-Type: application/json' \
+    --data '{"query": {"measures": ["fsub__doubled.total"]}}' "$CUBE_URL/cubejs-api/v1/load"
+}
+status="$(query "$(node "$keys/tokens.js" user g_sub "$revision")")"
+[ "$status" = 200 ] && grep -q '"fsub__doubled.total":"84"' /tmp/xcube-query.json || { echo "a user of g_sub got $status"; cat /tmp/xcube-query.json; exit 1; }
+status="$(query "$(node "$keys/tokens.js" user nobody "$revision")")"
+[ "$status" != 200 ] || { echo "a user of no allowed group was answered"; cat /tmp/xcube-query.json; exit 1; }
+meta="$(curl -s -H "Authorization: $(node "$keys/tokens.js" user nobody "$revision")" "$CUBE_URL/cubejs-api/v1/meta")"
+[ "$meta" = '{"cubes":[]}' ] || { echo "a user of no allowed group sees: $meta"; exit 1; }
+status="$(query "$token")"
+[ "$status" = 403 ] || { echo "an HS256 token for a model with keys got $status"; exit 1; }
+status="$(signed GET /meta)"
+[ "$status" = 200 ] && grep -q '"name":"fsub__doubled"' /tmp/xcube-admin.json || { echo "the admin field list answered $status"; exit 1; }
+echo "Security check passed: keys and folder groups pushed with the service credential; the gate admits g_sub and refuses the rest."

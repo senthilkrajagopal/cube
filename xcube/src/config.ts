@@ -3,6 +3,7 @@ import { FileRepository } from '@cubejs-backend/server-core';
 import { getEnv } from '@cubejs-backend/shared';
 
 import { XcubeRuntime, type ServingOptions } from './runtime/runtime';
+import { GATE_GROUP } from './security/marker';
 
 export interface XcubeConfigOptions {
   /** The security-context claim naming the model a request reads. Default `xcubeModel`. */
@@ -66,12 +67,20 @@ export function createConfig(
   const disk = new FileRepository(schemaPath);
 
   const contextToAppId = (context: any) => runtime.resolve(context).appId;
+  // The groups policies match: cube.js's, else a verified token's `groups`;
+  // never the folder gate's reserved group, which must match nobody.
+  const userGroups = cube.contextToGroups;
+  const contextToGroups = async (context: any) => {
+    const groups = userGroups ? await userGroups(context) : context?.securityContext?.groups;
+    return Array.isArray(groups) ? groups.filter((g: unknown) => typeof g === 'string' && g !== GATE_GROUP) : [];
+  };
   RUNTIMES.set(contextToAppId, runtime);
   const userRewrite = cube.queryRewrite;
 
   return {
     ...cube,
     contextToAppId,
+    contextToGroups,
     repositoryFactory: (context: any) => {
       const served = runtime.resolve(context);
       if (served.kind === 'disk') {
@@ -93,6 +102,13 @@ export function createConfig(
     allowNodeRequire: cube.allowNodeRequire ?? false,
     // xcube retires compiled models itself; Cube's cache must not evict them first.
     compilerCacheSize: cube.compilerCacheSize ?? 2000,
+    // The SQL API's contexts obey the rules HS256 tokens do: no role, and no model that has keys.
+    ...(cube.checkSqlAuth ? {
+      checkSqlAuth: async (req: any, user: string | null, password: string | null) => {
+        const result = await cube.checkSqlAuth(req, user, password);
+        return { ...result, securityContext: runtime.unverified(result?.securityContext) };
+      },
+    } : {}),
     ...(userRewrite ? {
       queryRewrite: async (query: any, context: any) => {
         const rewritten = await userRewrite(query, context);

@@ -123,6 +123,43 @@ export const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    version: 4,
+    name: 'permissions',
+    // Additive: code at version 2 or 3 runs on it while no model has
+    // security on; turning it on raises this migration's min_reader to 4
+    // (PgRevisionStore.putFolders), as that code wouldn't gate by folder.
+    minReader: 2,
+    sql: (s) => `
+      -- Each folder's allowed groups, as the client works them out (granted
+      -- on it, an ancestor or a descendant, plus its Super-Admin group). A
+      -- table of their own, which code before version 4 never writes: it
+      -- replaces a tree by deleting and inserting its folders.
+      CREATE TABLE ${s}.folder_groups (
+        model     text   NOT NULL REFERENCES ${s}.models (id) ON DELETE CASCADE,
+        folder_id text   NOT NULL,
+        groups    text[] NOT NULL,
+        PRIMARY KEY (model, folder_id)
+      );
+
+      -- Whether Cube gates by folder, and a counter every instance compares
+      -- to know its permissions are stale.
+      ALTER TABLE ${s}.models ADD COLUMN security boolean NOT NULL DEFAULT false;
+      ALTER TABLE ${s}.models ADD COLUMN permissions_version bigint NOT NULL DEFAULT 0;
+      ALTER TABLE ${s}.models ADD COLUMN permissions_hash char(64);
+
+      -- The public keys the model's user tokens are signed with, pushed by
+      -- the client as a whole set with a version that only goes up.
+      ALTER TABLE ${s}.models ADD COLUMN keys_version bigint;
+      ALTER TABLE ${s}.models ADD COLUMN keys_issuer text;
+      CREATE TABLE ${s}.model_keys (
+        model text  NOT NULL REFERENCES ${s}.models (id) ON DELETE CASCADE,
+        kid   text  NOT NULL,
+        jwk   jsonb NOT NULL,
+        PRIMARY KEY (model, kid)
+      );
+    `,
+  },
 ];
 
 /** The newest schema version this code knows. */

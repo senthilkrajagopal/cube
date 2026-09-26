@@ -1,5 +1,12 @@
 import type { Logger } from '../store/db';
 
+/** What a notification announces: a revision (`rev`), permissions or keys, each at its new version. */
+export interface Notice {
+  rev?: number;
+  permissions?: number;
+  keys?: number;
+}
+
 /** What the listener needs of a `pg.Client`. */
 export interface ListenClient {
   connect(): Promise<unknown>;
@@ -14,8 +21,8 @@ export interface ListenClient {
 export interface ListenerOptions {
   channel: string;
   createClient: () => ListenClient;
-  /** A model's revision may have changed. */
-  onNotify: (model: string) => void;
+  /** A model's revision, permissions or keys may have changed: what the notification says changed. */
+  onNotify: (model: string, change: Notice) => void;
   /** Connected and listening; anything announced while it was down was missed. */
   onConnect: () => void;
   onDown?: () => void;
@@ -83,9 +90,19 @@ export class RevisionListener {
         return;
       }
       try {
-        const { model } = JSON.parse(message.payload || '{}');
+        const { model, rev, permissions, keys } = JSON.parse(message.payload || '{}');
         if (typeof model === 'string') {
-          this.options.onNotify(model);
+          const notice: Notice = {};
+          if (typeof rev === 'number') {
+            notice.rev = rev;
+          }
+          if (typeof permissions === 'number') {
+            notice.permissions = permissions;
+          }
+          if (typeof keys === 'number') {
+            notice.keys = keys;
+          }
+          this.options.onNotify(model, notice);
           return;
         }
       } catch {

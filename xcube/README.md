@@ -25,9 +25,14 @@ Cube's own code is unchanged. The package:
   in a new `introspection` API scope and the admin routes;
 - serves models through Cube's public configuration hooks
   (`contextToAppId`, `repositoryFactory`, `extendContext`,
-  `scheduledRefreshContexts`), set by `require('xcube').config()`; beyond
-  them it deletes replaced models from Cube's compiler cache (a protected
-  field) and wraps the public `runScheduledRefresh` and `listen`;
+  `scheduledRefreshContexts`, `contextToGroups`), set by
+  `require('xcube').config()`; beyond them it deletes replaced models from
+  Cube's compiler cache (a protected field) and wraps the public
+  `runScheduledRefresh` and `listen`;
+- gates access policies by folder in a subclass of Cube's `CompilerApi`
+  (its protected `getApplicablePolicies`), verifies tokens before Cube's own
+  check (the gateway's protected `createCheckAuthFn`), and grants API scopes
+  by the token's role;
 - reads catalogs through each data source's own driver instance, through a
   proxy that swaps in its catalog queries (table types, materialized views,
   foreign keys with their target's schema), in a queue beside Cube's for
@@ -124,7 +129,9 @@ In both modes:
 
    `contextToAppId`, `repositoryFactory` and `schemaVersion` belong to xcube;
    `config()` refuses them. `extendContext` and `scheduledRefreshContexts`
-   are combined with xcube's. `allowNodeRequire` defaults to `false`.
+   are combined with xcube's. `contextToGroups` defaults to the security
+   context's `groups`, and never yields the folder gate's reserved group.
+   `allowNodeRequire` defaults to `false`.
 3. **Run every Cube process from this image**, API instances and the refresh
    worker alike, with `XCUBE_DATABASE_URL` set. A process with the database
    set whose `cube.js` doesn't use `config()` refuses to start.
@@ -133,7 +140,15 @@ In both modes:
 | --- | --- | --- |
 | `XCUBE_DATABASE_URL` | unset | Turns serving on. Unset, xcube serves introspection only |
 | `XCUBE_DATABASE_SCHEMA` | `xcube` | xcube's schema, and the prefix of its notification channel |
-| `XCUBE_ADMIN_TOKENS` | unset | Bearer tokens the admin routes accept, comma-separated, each at least 32 characters and none equal to `CUBEJS_API_SECRET`. Unset, the admin routes are off (the refresh worker) |
+| `XCUBE_SERVICE_KEYS` | unset | The service credential's public keys: a JWK set, or PEM public keys or certificates (whose kid is their RFC 7638 thumbprint). Private keys are refused |
+| `XCUBE_SERVICE_KEYS_FILE` | unset | A file holding them instead (a mounted Secret), re-read on each poll |
+| `XCUBE_SERVICE_AUDIENCE` | `xcube-admin` | The `aud` of service tokens |
+| `XCUBE_SERVICE_ISSUER` | unset | When set, the `iss` service tokens must carry |
+| `XCUBE_TOKEN_AUDIENCE` | `xcube` | The `aud` of user tokens |
+| `XCUBE_TOKEN_CLOCK_TOLERANCE_S` | `60` | Clock skew allowed on `exp`, `iat` and `nbf` |
+| `XCUBE_TOKEN_MAX_LIFETIME_S` | `3600` | The longest a token may live (`exp - iat`) |
+| `XCUBE_HS256` | `until-keys` | Tokens signed with `CUBEJS_API_SECRET`: taken for a model until it has keys, or `off` |
+| `XCUBE_ADMIN_TOKENS` | unset | Static bearer tokens the admin routes also accept, comma-separated, each at least 32 characters and none equal to `CUBEJS_API_SECRET`: for bootstrap and development. With neither these nor service keys, the admin routes are off (the refresh worker) |
 | `XCUBE_MIGRATE` | `true` | `false` only checks the schema is up to date |
 | `XCUBE_POLL_INTERVAL_MS` | `60000` | How often each model's current revision is re-read |
 | `XCUBE_POLL_INTERVAL_DOWN_MS` | `10000` | The same, while notifications are down |
@@ -222,13 +237,83 @@ modules it touches.
 - **Status.** `GET …/revision` lists the modules:
   `{ id, version, cubes, copies }`.
 
+### Permissions and tokens
+
+**The folder gate.** Cube itself refuses a folder's cubes and views to a token
+holding none of the folder's allowed groups, and the model's own access
+policies still apply within:
+
+- Every cube and view xcube publishes is served to Cube with one more access
+  policy, `group: xcube.folder-gate`, which matches nobody. So Cube evaluates
+  policies for all of them, and one with no policy of its own is closed to a
+  plain Cube.
+- xcube's `CompilerApi` gates each policy check by the item's folder
+  (`meta.xcube.folderId`). A context the folder doesn't admit gets no policy,
+  and Cube denies it. One it admits gets the item's own policies, or all
+  members and rows when it has none. The gate runs before Cube's policy
+  cache, from permissions held in memory, so a permission change applies at
+  once, with no compile.
+- A folder admits a context holding one of its **allowed groups**, which the
+  client works out and sends with the tree (granted on it, on an ancestor or
+  on a descendant, plus its Super-Admin group). With **security off** (the
+  default) every folder admits everyone, and only the model's own policies
+  apply.
+- A denied context doesn't see the item in `/v1/meta`. `/v1/load` refuses it
+  (Cube's `500 You requested hidden member`), and `/v1/sql` answers its SQL
+  with `1 = 0`.
+- Each item is gated by its own folder only. That is sound because a folder
+  allows every group its children do, as the client works the sets out; with
+  security on, xcube refuses groups that break it (`invalid_permissions`).
+  Otherwise Cube would list, in `/v1/meta`, a view whose cubes are closed,
+  and a cube extending a closed one would read it.
+- An authored policy naming `xcube.folder-gate` is refused at publish.
+- **Upgrading.** An xcube before schema version 4 has no gate.
+  - Security can't be turned on while one is connected (`409 older_instances`:
+    connections name their schema version).
+  - Turning it on raises the schema's floor, so none starts on it afterwards.
+  - Folder groups live in a table older code never writes.
+- A model holding a file set can't have security on, and a secured model
+  takes no file set: only published items carry their folder.
+
+**Tokens.** xcube verifies RS256 tokens itself, before Cube's own check:
+
+| Token | Signed by | Claims | Security context |
+| --- | --- | --- | --- |
+| User | A key pushed for the model (`PUT …/keys`), by `kid` | `aud: xcube`, `role: user`, `exp`, `iat`, `groups`, optionally the model and revision claims, and `iss` when the key set names one | `{ <modelClaim>, groups, <revisionClaim>?, xcubeRole: "user" }`, and nothing else of the token |
+| Service | `XCUBE_SERVICE_KEYS` | `aud: xcube-admin`, `role: service`, `exp`, `iat`, optionally the model claim | `{ <modelClaim>?, xcubeRole: "service" }` |
+
+- **Token checks.**
+  - `exp` and `iat` are required, and `exp - iat` may be at most `XCUBE_TOKEN_MAX_LIFETIME_S`.
+  - A user token is bound to the model whose key signed it. A kid that two models share needs the model named.
+  - A kid no instance knows yet makes it read the keys again, at most once a second, so a key pushed moments ago is taken.
+- **Scopes by role.**
+  - A user token never gets `jobs`, `introspection` or `graphql`.
+  - A service token gets `jobs` and `introspection` only.
+  - No context reading a model with security on gets `graphql`, whatever signed it: GraphQL's schema lists every cube.
+- **A service token naming a model** (the model claim) is for that model alone:
+  - its admin routes (`403 forbidden` for another);
+  - the jobs it posts, whose contexts must all name it.
+
+  One naming no model serves every model.
+- **HS256 tokens** signed with `CUBEJS_API_SECRET` still go to Cube's own check. They are taken for a model only until it has keys, and a token naming no model only until no model has any. `XCUBE_HS256=off` refuses them all.
+- **The SQL API.**
+  - A `checkSqlAuth` from `cube.js` is held to the HS256 rules: no role, and no model that has keys.
+  - Cube's default check gives a context naming no model. Keep the SQL port (`CUBEJS_PG_SQL_PORT`) off unless it is needed.
+- **Websockets.** Cube checks a socket's token once, when it connects. Token expiry and key changes don't close a socket already open; folder permissions still apply to each query. Keep `CUBEJS_WEB_SOCKETS` off unless it is needed.
+- **The playground secret.** `CUBEJS_PLAYGROUND_AUTH_SECRET` is ignored while xcube serves models. With it, Cube takes any security context it signs, on every route.
+- **Logs.** A refused token is logged as `sha256:<16 hex>`, never the token.
+
 ### Admin API
 
 For the client's server alone. The routes are under
 `{basePath}/v1/semantic/models/{model}` and take
-`Authorization: Bearer <one of XCUBE_ADMIN_TOKENS>`; Cube's own
-authentication and API scopes don't apply to them, and an admin token is no
-token for Cube's routes. A model id is 1 to 63 of `a-z`, `0-9`, `_` and `-`.
+`Authorization: Bearer <token>`, where the token is either:
+- the service credential: an RS256 token signed by one of
+  `XCUBE_SERVICE_KEYS`, with `aud: xcube-admin` and `role: service`;
+- or one of `XCUBE_ADMIN_TOKENS`.
+
+Cube's own authentication and API scopes don't apply to them, and a user's
+token is refused. A model id is 1 to 63 of `a-z`, `0-9`, `_` and `-`.
 Errors are `{ "error": "…", "code": "…" }`.
 
 #### `PUT …/snapshot`
@@ -292,10 +377,81 @@ valid.
 
 #### `PUT …/folders`
 
-Replaces the folder tree: `{ "folders": [{ "id": "froot", "parentId": null }, { "id": "f7k2", "parentId": "froot" }] }`.
-It changes nothing Cube serves, only how later publishes resolve names.
-`400 invalid_folders` for a bad id, a missing root, an unknown parent or a
-cycle; `409 folder_in_use` when a folder that still holds items would go.
+Replaces the folder tree, with each folder's allowed groups, and sets security:
+
+```json
+{
+  "security": true,
+  "folders": [
+    { "id": "froot", "parentId": null, "allowedGroups": ["g-sales", "g-super"] },
+    { "id": "f7k2", "parentId": "froot", "allowedGroups": ["g-sales", "g-super"] }
+  ]
+}
+```
+
+- **The tree** changes nothing Cube serves, only how later publishes resolve
+  names.
+- **`allowedGroups`** is at most 10,000 group names per folder.
+  - A folder sent without it keeps what it has.
+  - A new folder has none, and neither has a folder that moved to another parent.
+  - The same holds for the folders of an items snapshot.
+  - With security on, a folder may allow no group its parent doesn't.
+- **`security`**, left out, is unchanged; a new model starts with it off.
+- **Permissions** apply on every instance as soon as it hears of them, by
+  notification or its next poll, with no compile.
+
+It answers `{ model, hash, permissionsVersion, security }`. `permissionsVersion`
+goes up only when security or a folder's groups changed.
+
+| Status | When |
+| --- | --- |
+| `400` | `invalid_folders`: a bad id, a missing root, an unknown parent or a cycle |
+| `400` | `invalid_permissions`: with security on, a folder allows groups its parent doesn't (`problems`) |
+| `409` | `folder_in_use`: a folder that still holds items would go |
+| `409` | `mode`: security on for a model holding a file set |
+| `409` | `older_instances`: security turned on while an xcube before schema version 4 is connected (`instances`) |
+
+#### `PUT …/keys`
+
+Replaces the public keys the model's user tokens are signed with:
+
+```json
+{ "version": 7, "issuer": "https://wechart.example", "keys": [{ "kty": "RSA", "kid": "…", "n": "…", "e": "AQAB" }] }
+```
+
+- **The set is whole.** Push the next key with the current one, and drop a
+  key only after the tokens it signed have expired.
+- **`version` only goes up.**
+  - A lower one is refused (`409 stale_keys`, with the current `version`), so a
+    replica still holding an old set can't undo a newer one.
+  - The same version is taken again only as the same set (`200`,
+    `applied: false`); otherwise `409 conflict`.
+- **Each key** must be:
+  - RSA of 2048 bits or more;
+  - `alg` `RS256` or absent, `use` `sig` or absent;
+  - public members only;
+  - named by a unique `kid` that isn't the service credential's.
+
+  Otherwise `400 invalid_keys` or `service_kid`. The set holds 1 to 10 keys.
+- **`issuer`**, when given, is the `iss` every user token must carry.
+- **From the first push on**, the model takes RS256 tokens only.
+
+It answers `{ model, version, issuer, kids, applied }`.
+
+#### `GET …/keys`
+
+The stored set: `{ model, version, issuer, keys }`, public keys only. `404
+no_keys` when the model has none.
+
+#### `GET …/meta`
+
+The model's field list for the client's own reads (jobs, schedules):
+- as `/v1/meta` answers, merged across modules;
+- with `?extended=true`, as `/v1/meta?extended` answers;
+- but filtered by no one's policies, as it asks for no one.
+
+Its public members only. `403`/`503` as queries for an unknown or not yet
+loaded model.
 
 #### `POST …/changesets`
 

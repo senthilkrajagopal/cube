@@ -12,6 +12,7 @@ import { CatalogQueues } from './catalog/queue';
 import { globalRuntime, runtimeOf } from './config';
 import { XcubeApiGateway } from './gateway';
 import { DataSourceIntrospection } from './introspection';
+import { FolderGateCompilerApi } from './security/gate';
 import type { ServingCore, XcubeRuntime } from './runtime/runtime';
 
 /**
@@ -39,6 +40,24 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
     return orchestratorApi;
   }
 
+  /**
+   * Cube's compiler API, with the folder gate on its policies: each compiled
+   * model reads the permissions of the model it was compiled for, afresh on
+   * every check.
+   */
+  protected createCompilerApi(repository: any, options: Record<string, any> = {}) {
+    const runtime = this.xcube;
+    if (!runtime?.serving) {
+      return super.createCompilerApi(repository, options);
+    }
+    return new FolderGateCompilerApi(
+      repository,
+      options.dbType || this.options.dbType,
+      this.createCompilerApiOptions(options),
+      runtime.permissionsSourceFor(options.context),
+    );
+  }
+
   protected createApiGatewayInstance(
     apiSecret: string,
     getCompilerApi: (context: any) => Promise<any>,
@@ -46,6 +65,13 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
     logger: any,
     options: ApiGatewayOptions,
   ): XcubeApiGateway {
+    if (this.xcube?.serving && options.playgroundAuthSecret) {
+      // Cube takes any security context signed with it, on every route: past xcube's token checks and the folder gate.
+      this.logger('xcube: CUBEJS_PLAYGROUND_AUTH_SECRET is ignored while xcube serves models', {
+        warning: 'playground auth secret ignored',
+      });
+      options = { ...options, playgroundAuthSecret: undefined };
+    }
     return new XcubeApiGateway(
       apiSecret,
       getCompilerApi,

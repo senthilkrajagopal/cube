@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import cloneDeep from 'lodash/cloneDeep';
 
 import { config, createConfig, runtimeOf, setGlobalRuntime, XcubeRuntime, XcubeServerCore } from '../../src';
@@ -51,13 +52,32 @@ describe('config', () => {
   });
 
   test('keeps the rest of cube.js, and turns Node require off unless asked', () => {
-    const contextToGroups = () => ['g'];
-    const options = createConfig(runtime(), {}, { contextToGroups, telemetry: false });
-    expect(options.contextToGroups).toBe(contextToGroups);
+    const options = createConfig(runtime(), {}, { telemetry: false });
     expect(options.telemetry).toBe(false);
     expect(options.allowNodeRequire).toBe(false);
     expect(options.schemaVersion).toBeUndefined();
     expect(createConfig(runtime(), {}, { allowNodeRequire: true }).allowNodeRequire).toBe(true);
+  });
+
+  test('composes contextToGroups: cube.js\'s, else the token\'s groups, never the gate\'s reserved group', async () => {
+    const own = createConfig(runtime(), {}, { contextToGroups: async () => ['g', 'xcube.folder-gate', 7] });
+    expect(await own.contextToGroups({ securityContext: { groups: ['ignored'] } })).toEqual(['g']);
+    const verified = createConfig(runtime(), {});
+    expect(await verified.contextToGroups({ securityContext: { groups: ['a', 'xcube.folder-gate', { x: 1 }] } })).toEqual(['a']);
+    expect(await verified.contextToGroups({ securityContext: {} })).toEqual([]);
+    expect(await verified.contextToGroups({})).toEqual([]);
+  });
+
+  test('the SQL API\'s checkSqlAuth: no role, and no model that takes RS256 tokens only', async () => {
+    const r = runtime();
+    const key = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 }).publicKey;
+    r.verifier.setModelKeys('keyed', { version: 1, issuer: null, keys: [{ ...key.export({ format: 'jwk' }), kid: 'k' }] });
+    const options = createConfig(r, {}, {
+      checkSqlAuth: async (_req: any, user: string) => ({ password: 'p', securityContext: { xcubeModel: user, xcubeRole: 'service', groups: ['g'] } }),
+    });
+    expect(await options.checkSqlAuth({}, 'open', 'p')).toEqual({ password: 'p', securityContext: { xcubeModel: 'open', groups: ['g'] } });
+    await expect(options.checkSqlAuth({}, 'keyed', 'p')).rejects.toThrow(/model "keyed" takes RS256 tokens only/);
+    expect(createConfig(runtime(), {}, {}).checkSqlAuth).toBeUndefined();
   });
 
   test('composes extendContext, and only xcube pins a context', async () => {

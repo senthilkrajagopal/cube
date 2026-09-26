@@ -42,7 +42,13 @@ async function createGateway(
     contextToApiScopes = async (securityContext, defaultScopes) => (
       securityContext?.introspect ? [...(defaultScopes || []), 'introspection'] : (defaultScopes || [])
     ),
-  }: { modelDataSources?: string[], modelError?: Error, contextToApiScopes?: (...args: any[]) => Promise<any> } = {}
+    logger = () => undefined,
+  }: {
+    modelDataSources?: string[],
+    modelError?: Error,
+    contextToApiScopes?: (...args: any[]) => Promise<any>,
+    logger?: (type: string, params: any) => void,
+  } = {}
 ) {
   const introspection = introspectionMock();
   const orchestratorApi = { name: 'orchestratorApi' };
@@ -65,7 +71,7 @@ async function createGateway(
     API_SECRET,
     async () => compilerApi,
     async () => orchestratorApi,
-    () => undefined,
+    logger,
     {
       standalone: true,
       dataSourceStorage: {},
@@ -161,6 +167,46 @@ describe('Data source introspection API', () => {
       const res = await get(app, '/cubejs-api/v1/introspection/data-sources', 'not-a-token').expect(403);
 
       expect(res.body).toEqual({ error: 'Invalid token' });
+    });
+
+    test('logs a refused token as a fingerprint, never the token', async () => {
+      const logs: any[] = [];
+      const { app } = await createGateway({ logger: (type, params) => logs.push({ type, ...params }) });
+      const refused = generateAuthToken({ groups: ['g'] }, {}, 'another-secret');
+
+      await get(app, '/cubejs-api/v1/introspection/data-sources', refused).expect(403);
+
+      const logged = logs.find((l) => l.token !== undefined);
+      expect(logged.type).toBe('invalid signature');
+      expect(logged.token).toMatch(/^sha256:[0-9a-f]{16}$/);
+      expect(JSON.stringify(logs)).not.toContain(refused);
+    });
+
+    const scopesOf = (runtime?: any) => {
+      const apiGateway = new XcubeApiGateway(API_SECRET, async () => ({}), async () => ({}), () => undefined, {
+        standalone: true,
+        dataSourceStorage: {},
+        basePath: '/cubejs-api',
+        refreshScheduler: {},
+        contextToApiScopes: async (_securityContext: any, defaults: any) => [...defaults, 'jobs', 'introspection'],
+      }, jest.fn(), () => runtime);
+      return (securityContext: any) => (apiGateway as any).contextToApiScopesFn(securityContext, ['graphql', 'meta', 'data', 'sql']);
+    };
+
+    test('while xcube serves, grants a verified context by role; no context reading a secured model gets GraphQL', async () => {
+      const scopes = scopesOf({ serving: true, secured: (securityContext: any) => securityContext?.m === 'secured' });
+
+      expect(await scopes({ xcubeRole: 'service' })).toEqual(['jobs', 'introspection']);
+      expect(await scopes({ xcubeRole: 'user', m: 'open' })).toEqual(['meta', 'data', 'sql']);
+      // A context xcube didn't verify (Cube's own check): as cube.js grants it, less GraphQL on a secured model.
+      expect(await scopes({ m: 'secured' })).toEqual(['meta', 'data', 'sql', 'jobs', 'introspection']);
+      expect(await scopes({ m: 'open' })).toEqual(['graphql', 'meta', 'data', 'sql', 'jobs', 'introspection']);
+    });
+
+    test('without xcube serving, a role in a context is nothing', async () => {
+      const scopes = scopesOf();
+
+      expect(await scopes({ xcubeRole: 'service' })).toEqual(['graphql', 'meta', 'data', 'sql', 'jobs', 'introspection']);
     });
   });
 

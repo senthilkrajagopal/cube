@@ -35,9 +35,13 @@ import {
   type StoredModule,
 } from '../store/revisions';
 import { COMMONS, groupModules } from '../modules/graph';
+import { admits, type Permissions } from '../security/gate';
+import { withGate } from '../security/marker';
+import { KeyError, keySetOf, TokenError, tokenParts } from '../security/tokens';
+import { ROLE_KEY, TokenVerifier } from '../security/verifier';
 import { CompileLane, LaneBusyError, Priority } from './lane';
-import { RevisionListener, type ListenClient } from './listener';
-import type { XcubeSettings } from './settings';
+import { RevisionListener, type ListenClient, type Notice } from './listener';
+import { DEFAULT_TOKENS, type TokenSettings, type XcubeSettings } from './settings';
 
 /** What `config()` settles, with its defaults applied. */
 export interface ServingOptions {
@@ -304,6 +308,16 @@ async function runProbe(core: ServingCore, query: unknown, context: any): Promis
 class CorruptRevisionError extends Error {
 }
 
+/** A pushed key set that can't be taken. */
+export class KeySetError extends Error {
+  public constructor(message: string, public readonly code: 'invalid_keys' | 'service_kid') {
+    super(message);
+  }
+}
+
+/** Most keys one model's set may hold: the current key, the next, and a few being retired. */
+export const MAX_MODEL_KEYS = 10;
+
 export interface RuntimeDependencies {
   /** Defaults to Postgres at `settings.databaseUrl`. */
   store?: RevisionStore;
@@ -352,6 +366,30 @@ export class XcubeRuntime {
 
   protected readonly lane: CompileLane;
 
+  /** Each model's permissions, as last read: what the folder gate admits. */
+  protected readonly permissions = new Map<string, Permissions>();
+
+  protected readonly permissionLoads = new Map<string, Promise<void>>();
+
+  /** Models whose permissions changed again while being read. */
+  protected readonly permissionsDirty = new Set<string>();
+
+  protected readonly keyLoads = new Map<string, Promise<void>>();
+
+  protected readonly keysDirty = new Set<string>();
+
+  /** A re-read of every model's keys, for a token naming a kid not known here. */
+  protected keysReread: Promise<void> | null = null;
+
+  protected keysRereadAt = 0;
+
+  /** Files as Cube compiles them (with the folder gate's policy), per resident's files. */
+  protected readonly gatedFiles = new WeakMap<SnapshotFile[], SnapshotFile[]>();
+
+  public readonly tokens: TokenSettings;
+
+  public readonly verifier: TokenVerifier;
+
   protected started = false;
 
   protected stopped = false;
@@ -370,6 +408,12 @@ export class XcubeRuntime {
   public constructor(public readonly settings: XcubeSettings, protected readonly deps: RuntimeDependencies = {}) {
     this.store = deps.store ?? null;
     this.lane = new CompileLane({ maxWaiting: settings.compileQueue, maxWaitMs: settings.compileWaitMs });
+    this.tokens = settings.tokens ?? DEFAULT_TOKENS;
+    this.verifier = new TokenVerifier(this.tokens, {
+      modelClaim: () => this.options?.modelClaim ?? 'xcubeModel',
+      revisionClaim: () => this.options?.revisionClaim ?? 'xcubeRevision',
+      missingKid: () => this.rereadKeys(),
+    });
   }
 
   public get serving(): boolean {
@@ -412,6 +456,12 @@ export class XcubeRuntime {
     }
     this.started = true;
     const { settings } = this;
+    // Before anything else: keys that don't parse stop the process.
+    try {
+      this.verifier.loadServiceKeys();
+    } catch (e: any) {
+      throw new Error(`xcube: the service credential's keys (XCUBE_SERVICE_KEYS${this.tokens.serviceKeysFile ? '_FILE' : ''}) can't be read: ${e.message}`);
+    }
 
     if (!this.store) {
       this.pool = createPool(settings.databaseUrl, this.instanceId, (m, p) => this.log(m, p));
@@ -442,7 +492,7 @@ export class XcubeRuntime {
       this.listener = new RevisionListener({
         channel: channelOf(settings.schema),
         createClient: listenClient,
-        onNotify: (model) => this.notified(model),
+        onNotify: (model, notice) => this.notified(model, notice),
         onConnect: () => this.syncAllQuietly(),
         onDown: () => this.schedulePoll(),
         logger: (m, p) => this.log(m, p),
@@ -451,6 +501,7 @@ export class XcubeRuntime {
     }
 
     await this.readHeads();
+    await this.refreshSecurity();
     this.schedulePoll();
     this.retireTimer = setInterval(() => this.retireDue(), 30000);
     this.retireTimer.unref?.();
@@ -802,9 +853,232 @@ export class XcubeRuntime {
     return unavailable(`Model "${model}" is not loaded on this instance yet`);
   }
 
-  /** The files Cube compiles for a context, bound to one immutable revision. */
+  /**
+   * The files Cube compiles for a context, bound to one immutable revision:
+   * each published cube and view with the folder gate's policy added.
+   */
   public filesOf(served: Resident | Candidate): SnapshotFile[] {
-    return served.files;
+    let gated = this.gatedFiles.get(served.files);
+    if (!gated) {
+      gated = served.files.map(withGate);
+      this.gatedFiles.set(served.files, gated);
+    }
+    return gated;
+  }
+
+  // ---------------------------------------------------------- permissions
+
+  /** A model's permissions as this instance knows them; `undefined` until first read. */
+  public permissionsOf(model: string): Permissions | undefined {
+    return this.permissions.get(model);
+  }
+
+  /** The permissions the compiled model of `context` is gated by, read afresh on each call. */
+  public permissionsSourceFor(context: any): () => Permissions | undefined {
+    let model: string | undefined;
+    try {
+      const served = this.resolve(context);
+      model = served.kind === 'disk' ? undefined : served.model;
+    } catch {
+      model = undefined;
+    }
+    return () => (model === undefined ? undefined : this.permissions.get(model));
+  }
+
+  /** Whether a context holding `groups` may read what `folderId` holds in `model`. */
+  public admits(model: string, folderId: string, groups: Set<string>): boolean {
+    return admits(this.permissions.get(model), folderId, groups);
+  }
+
+  /** Reads a model's permissions; one read at a time, again if they changed meanwhile. */
+  public loadPermissions(model: string): Promise<void> {
+    const running = this.permissionLoads.get(model);
+    if (running) {
+      this.permissionsDirty.add(model);
+      return running;
+    }
+    const run = (async () => {
+      do {
+        this.permissionsDirty.delete(model);
+        const stored = await this.requireStore().permissions(model);
+        const known = this.permissions.get(model);
+        if (!stored) {
+          if (!known && this.permissions.size < this.settings.maxModels) {
+            // No such model yet: nothing is secured in it.
+            this.permissions.set(model, { version: 0, security: false, allowed: new Map() });
+          }
+        } else {
+          // Reads are one at a time, so the last is the newest (even when the
+          // version went back, the schema restored from a backup).
+          this.permissions.set(model, {
+            version: stored.version,
+            security: stored.security,
+            allowed: new Map(stored.folders.map((f) => [f.id, new Set(f.allowedGroups)])),
+          });
+          if (known && stored.version !== known.version) {
+            this.log('xcube: permissions changed', { model, version: stored.version, security: stored.security });
+          }
+        }
+      } while (this.permissionsDirty.has(model));
+    })().finally(() => this.permissionLoads.delete(model));
+    this.permissionLoads.set(model, run);
+    return run;
+  }
+
+  /** Reads a model's pushed keys; one read at a time, again if they changed meanwhile. */
+  public loadKeys(model: string): Promise<void> {
+    const running = this.keyLoads.get(model);
+    if (running) {
+      this.keysDirty.add(model);
+      return running;
+    }
+    const run = (async () => {
+      do {
+        this.keysDirty.delete(model);
+        const stored = await this.requireStore().keys(model);
+        const known = this.verifier.keysVersion(model);
+        // The last read is the newest, as for permissions.
+        const skipped = this.verifier.setModelKeys(model, stored);
+        if (skipped.length) {
+          this.warn('xcube: stored keys that do not parse were skipped', { model, kids: skipped });
+        }
+        if (stored && stored.version !== known) {
+          this.log('xcube: keys changed', { model, version: stored.version, keys: stored.keys.length });
+        }
+      } while (this.keysDirty.has(model));
+    })().finally(() => this.keyLoads.delete(model));
+    this.keyLoads.set(model, run);
+    return run;
+  }
+
+  /**
+   * Re-reads what changed of every model's permissions and keys: after a
+   * reconnect, on the poll, and at start. The service credential's key file
+   * too, when it has one.
+   */
+  public async refreshSecurity(): Promise<void> {
+    if (this.tokens.serviceKeysFile) {
+      try {
+        if (this.verifier.loadServiceKeys()) {
+          this.log('xcube: the service credential\'s keys changed', {});
+        }
+      } catch (e: any) {
+        this.warn('xcube: the service credential\'s key file can\'t be read; keeping the keys it had', { error: e.message });
+      }
+    }
+    const versions = await this.requireStore().versions();
+    await Promise.all(versions.map(async ({ model, permissions, keys }) => {
+      if (!MODEL_ID.test(model)) {
+        return;
+      }
+      const known = this.permissions.get(model);
+      if (!known || known.version !== permissions) {
+        await this.loadPermissions(model);
+      }
+      if (keys !== this.verifier.keysVersion(model)) {
+        await this.loadKeys(model);
+      }
+    }));
+  }
+
+  /** For a token naming a kid no key has: every model's keys again, at most once a second. */
+  protected rereadKeys(): Promise<void> {
+    if (this.keysReread) {
+      return this.keysReread;
+    }
+    if (Date.now() - this.keysRereadAt < 1000 || !this.store) {
+      return Promise.resolve();
+    }
+    this.keysRereadAt = Date.now();
+    this.keysReread = (async () => {
+      try {
+        const versions = await this.requireStore().versions();
+        await Promise.all(versions
+          .filter(({ model, keys }) => MODEL_ID.test(model) && keys !== this.verifier.keysVersion(model))
+          .map(({ model }) => this.loadKeys(model)));
+      } catch (e: any) {
+        this.warn('xcube: could not read keys', { error: e.message });
+      }
+    })().finally(() => {
+      this.keysReread = null;
+    });
+    return this.keysReread;
+  }
+
+  // ---------------------------------------------------------------- tokens
+
+  /**
+   * Cube's `checkAuth`, as xcube runs it: an RS256 token is verified against
+   * the keys pushed for its model (a user's) or configured for the service
+   * credential; any other goes to Cube's own check (`cubes`), and is taken
+   * only for a model without keys, while `XCUBE_HS256` allows it.
+   */
+  public async checkAuth(
+    req: any,
+    authorization: string | undefined,
+    cubes: (req: any, authorization?: string) => Promise<unknown>,
+  ): Promise<void> {
+    if (!authorization) {
+      throw new CubejsHandlerError(403, 'Forbidden', 'Authorization header isn\'t set');
+    }
+    let alg: unknown;
+    try {
+      ({ alg } = tokenParts(authorization).header);
+    } catch {
+      alg = undefined;
+    }
+    let securityContext: Record<string, unknown>;
+    if (alg === 'RS256') {
+      try {
+        ({ securityContext } = await this.verifier.verify(authorization));
+      } catch (e: any) {
+        if (e instanceof TokenError || e instanceof KeyError) {
+          throw new CubejsHandlerError(403, 'Forbidden', `Invalid token: ${e.message}`);
+        }
+        throw e;
+      }
+    } else {
+      await cubes(req, authorization);
+      securityContext = this.unverified(req.securityContext);
+    }
+    req.securityContext = securityContext;
+    req.authInfo = securityContext;
+  }
+
+  /**
+   * A security context xcube's verifier didn't build (Cube's own check, the
+   * SQL API's `checkSqlAuth`): without a role, and refused for a model that
+   * takes RS256 tokens only.
+   */
+  public unverified(context: Record<string, unknown> | undefined): Record<string, unknown> {
+    if (this.tokens.hs256 === 'off') {
+      throw new CubejsHandlerError(403, 'Forbidden', 'Invalid token: only RS256 tokens are taken');
+    }
+    const { [ROLE_KEY]: _role, ...rest } = context ?? {};
+    const model = this.modelOf(rest);
+    if (model !== undefined ? this.verifier.hasKeys(model) : this.verifier.anyKeys()) {
+      throw new CubejsHandlerError(403, 'Forbidden', model !== undefined
+        ? `Invalid token: model "${model}" takes RS256 tokens only`
+        : 'Invalid token: only RS256 tokens are taken');
+    }
+    return rest;
+  }
+
+  /** Whether a context reads a model with security on. */
+  public secured(securityContext: any): boolean {
+    try {
+      const model = this.modelOf(securityContext);
+      return model !== undefined && this.permissions.get(model)?.security === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** A context for xcube's own reads of a model, pinned to its active revision. */
+  public async adminContext(model: string): Promise<Record<string, any>> {
+    const securityContext = { [this.servingOptions.modelClaim]: model };
+    const pin = await this.pinFor({ securityContext });
+    return { securityContext, requestId: `xcube-admin-${crypto.randomUUID()}`, ...pin };
   }
 
   /**
@@ -1030,13 +1304,39 @@ export class XcubeRuntime {
 
   // ------------------------------------------------------------ following
 
-  protected notified(model: string) {
+  protected notified(model: string, notice: Notice = {}) {
+    if (notice.permissions !== undefined || notice.keys !== undefined) {
+      if (!MODEL_ID.test(model)) {
+        this.warn('xcube: ignored a notification for an invalid model id', {});
+        return;
+      }
+      if (notice.permissions !== undefined && notice.permissions !== this.permissions.get(model)?.version) {
+        this.persistently('permissions', model, () => this.loadPermissions(model));
+      }
+      if (notice.keys !== undefined && notice.keys !== this.verifier.keysVersion(model)) {
+        this.persistently('keys', model, () => this.loadKeys(model));
+      }
+      return;
+    }
     if (!this.admit(model)) {
       this.warn('xcube: ignored a notification for an invalid model id', {});
       return;
     }
     this.absent.delete(model);
     this.sync(model).catch((e) => this.warn('xcube: sync failed', { model, error: e.message }));
+  }
+
+  /**
+   * Runs a read a notification asked for, again after a failure (1, 2, 4, 8
+   * and 16 s later): a revocation shouldn't wait for the poll.
+   */
+  protected persistently(what: string, model: string, read: () => Promise<void>, attempt = 0) {
+    read().catch((e) => {
+      this.warn(`xcube: could not read ${what}`, { model, error: e.message, attempt });
+      if (attempt < 4 && !this.stopped) {
+        setTimeout(() => this.persistently(what, model, read, attempt + 1), 1000 * 2 ** attempt).unref?.();
+      }
+    });
   }
 
   /**
@@ -1090,6 +1390,7 @@ export class XcubeRuntime {
 
   /** Re-reads every model's current revision, and follows each that changed. */
   public async syncAll(fromPoll = false): Promise<void> {
+    await this.refreshSecurity().catch((e) => this.warn('xcube: could not read permissions and keys', { error: e.message }));
     const heads = await this.requireStore().heads();
     const seen = new Set<string>();
     const changed: Promise<void>[] = [];
@@ -1190,6 +1491,10 @@ export class XcubeRuntime {
     this.absent.delete(model);
     state.target = head;
     state.vanished = false;
+    if (!this.permissions.has(model)) {
+      // Never served before its permissions are known: the gate would refuse everything.
+      await this.loadPermissions(model);
+    }
     if (!this.core) {
       return;
     }
@@ -1527,7 +1832,7 @@ export class XcubeRuntime {
    * exactly as it would serve it. It is reachable only through the check,
    * and dropped from Cube's compiler cache when the check ends.
    */
-  protected validate(
+  protected async validate(
     model: string,
     files: SnapshotFile[],
     priority: Priority,
@@ -1536,7 +1841,12 @@ export class XcubeRuntime {
   ): Promise<ValidationResult> {
     const core = this.requireCore();
     const { modelClaim } = this.servingOptions;
-    const probeContext = { ...securityContext, [modelClaim]: model };
+    // Probes ask as the context given would, through the folder gate; only xcube's verifier sets a role.
+    const { [ROLE_KEY]: _role, ...asked } = securityContext;
+    const probeContext = { ...asked, [modelClaim]: model };
+    if (!this.permissions.has(model)) {
+      await this.loadPermissions(model);
+    }
 
     return validateSnapshot({
       files,
@@ -1703,12 +2013,47 @@ export class XcubeRuntime {
     });
   }
 
-  public async putFolders(model: string, folders: Folder[]): Promise<{ hash: string }> {
+  public async putFolders(model: string, folders: Folder[], security?: boolean) {
     const problems = FolderTree.check(folders);
     if (problems.length) {
       throw new FolderTreeError(problems);
     }
-    return { hash: await this.requireStore().putFolders(model, folders) };
+    const result = await this.requireStore().putFolders(model, folders, security);
+    // This instance answers with them in force; the others follow the notification.
+    await this.loadPermissions(model);
+    return result;
+  }
+
+  /**
+   * Stores a model's key set, when its version is newer than the stored
+   * one's. Each key is checked: RSA of 2048 bits or more, for RS256, public
+   * members only, and a kid that isn't the service credential's.
+   */
+  public async putKeys(model: string, set: { version: number; issuer?: string | null; keys: unknown[] }) {
+    if (!set.keys.length || set.keys.length > MAX_MODEL_KEYS) {
+      throw new KeySetError(`A key set holds 1 to ${MAX_MODEL_KEYS} keys`, 'invalid_keys');
+    }
+    let checked;
+    try {
+      checked = keySetOf(set.keys);
+    } catch (e: any) {
+      throw new KeySetError(e.message, 'invalid_keys');
+    }
+    const clash = checked.find(({ kid }) => this.verifier.isServiceKid(kid));
+    if (clash) {
+      throw new KeySetError(`Key "${clash.kid}" is the service credential's; a model's keys sign user tokens only`, 'service_kid');
+    }
+    const keys = checked.map(({ kid, key }) => {
+      const { n, e } = key.export({ format: 'jwk' }) as { n: string; e: string };
+      return { kty: 'RSA', kid, n, e, alg: 'RS256', use: 'sig' };
+    });
+    const result = await this.requireStore().putKeys(model, { version: set.version, issuer: set.issuer ?? null, keys });
+    await this.loadKeys(model);
+    return result;
+  }
+
+  public async keysOf(model: string) {
+    return this.requireStore().keys(model);
   }
 
   /**

@@ -1,6 +1,7 @@
 import yaml from 'js-yaml';
 
 import { JINJA_SYNTAX } from '../model/snapshot';
+import { GATE_GROUP, namesGateGroup } from '../security/marker';
 
 /** A folder id: `f` then letters and digits, as the client encodes its own ids. The root is `froot`. */
 export const FOLDER_ID = /^f[a-z0-9]{1,40}$/;
@@ -25,6 +26,8 @@ const PYTHON_KEYWORDS = new Set([
 export interface Folder {
   id: string;
   parentId: string | null;
+  /** The groups whose tokens may read what it holds; absent: as stored (none, for a new folder). */
+  allowedGroups?: string[];
 }
 
 export type ItemKind = 'cube' | 'view';
@@ -210,6 +213,9 @@ export function parseItem(item: AuthoredItem): { def?: ItemDefinition; errors: I
   }
   if (doc.name !== item.name) {
     return fail(`The ${item.kind} is named "${doc.name}", but the item is "${item.name}"`);
+  }
+  if (namesGateGroup(doc)) {
+    return fail(`Access policies may not name the group ${GATE_GROUP}: xcube keeps it for the folder gate`);
   }
 
   const members = new Set<string>([

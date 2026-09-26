@@ -1,5 +1,7 @@
 import { Client, Pool, type ClientConfig, type PoolClient } from 'pg';
 
+import { SCHEMA_VERSION } from './migrations';
+
 export type Logger = (message: string, params?: Record<string, unknown>) => void;
 
 /** A schema name as an SQL identifier: lower-case letters, digits and `_`. */
@@ -12,11 +14,20 @@ export function assertSchemaName(schema: string): string {
   return schema;
 }
 
+/**
+ * How xcube's connections name themselves: with the schema version the code
+ * knows, so that one instance can tell older ones are still connected
+ * (`PgRevisionStore.olderInstances`). Before version 4 there was none.
+ */
+export function applicationName(kind: 'xcube' | 'xcube-listen', instanceId: string): string {
+  return `${kind}:v${SCHEMA_VERSION}:${instanceId}`;
+}
+
 /** Settings every xcube connection shares. The warehouse's `CUBEJS_DB_*` is never read. */
-export function connectionConfig(connectionString: string, applicationName: string): ClientConfig {
+export function connectionConfig(connectionString: string, name: string): ClientConfig {
   return {
     connectionString,
-    application_name: applicationName.slice(0, 63),
+    application_name: name.slice(0, 63),
     keepAlive: true,
     keepAliveInitialDelayMillis: 10000,
     connectionTimeoutMillis: 10000,
@@ -26,7 +37,7 @@ export function connectionConfig(connectionString: string, applicationName: stri
 
 export function createPool(connectionString: string, instanceId: string, logger: Logger): Pool {
   const pool = new Pool({
-    ...connectionConfig(connectionString, `xcube:${instanceId}`),
+    ...connectionConfig(connectionString, applicationName('xcube', instanceId)),
     max: 4,
     idleTimeoutMillis: 30000,
   });
@@ -36,7 +47,7 @@ export function createPool(connectionString: string, instanceId: string, logger:
 }
 
 export function createListenClient(connectionString: string, instanceId: string): Client {
-  return new Client(connectionConfig(connectionString, `xcube-listen:${instanceId}`));
+  return new Client(connectionConfig(connectionString, applicationName('xcube-listen', instanceId)));
 }
 
 export async function inTransaction<T>(pool: Pool, fn: (client: PoolClient) => Promise<T>): Promise<T> {

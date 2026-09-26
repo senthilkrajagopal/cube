@@ -6,7 +6,7 @@ import { CubejsHandlerError } from '@cubejs-backend/api-gateway';
 import { initAdminRoutes } from '../../src/admin/routes';
 import { LaneBusyError } from '../../src/runtime/lane';
 import { SnapshotError } from '../../src/model/snapshot';
-import { settingsFromEnv } from '../../src/runtime/settings';
+import { DEFAULT_TOKENS, settingsFromEnv } from '../../src/runtime/settings';
 
 const TOKEN = 'admin-token-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const OLD_TOKEN = 'admin-token-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
@@ -15,7 +15,7 @@ const head = { model: 'dev', generation: 'g', revision: 4, contentHash: 'c'.repe
 function app(runtime: any, tokens = [TOKEN, OLD_TOKEN]) {
   const a = express();
   const logs: any[] = [];
-  initAdminRoutes(a, '/cubejs-api', { settings: { adminTokens: tokens }, ...runtime }, (m, p) => logs.push([m, p]));
+  initAdminRoutes(a, '/cubejs-api', { settings: { adminTokens: tokens }, tokens: DEFAULT_TOKENS, ...runtime }, (m, p) => logs.push([m, p]));
   return { app: a, logs };
 }
 

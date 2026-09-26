@@ -18,6 +18,14 @@ import {
   RequestContext,
   UserError,
 } from '@cubejs-backend/api-gateway';
+import {
+  transformCube,
+  transformDimension,
+  transformJoins,
+  transformMeasure,
+  transformPreAggregations,
+  transformSegment,
+} from '@cubejs-backend/api-gateway/dist/src/helpers/transform-meta-extended';
 
 import {
   dataSourceColumnsRequestSchema,
@@ -33,6 +41,7 @@ import {
 import type { DataSourceDescription, DataSourceIntrospectionApi } from './types';
 import { initAdminRoutes } from './admin/routes';
 import { MODULE_KEY, type XcubeRuntime } from './runtime/runtime';
+import { ROLE_KEY } from './security/verifier';
 
 /** A UUID derived from text, for the compiler id of a merged meta (the SQL API wants a UUID). */
 function uuidOf(text: string): string {
@@ -41,8 +50,34 @@ function uuidOf(text: string): string {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-${variant}${h.slice(17, 20)}-${h.slice(20, 32)}`;
 }
 
+/**
+ * The cubes of a meta config with their public members, dropping those left
+ * with none: what `/v1/meta` shows before any policy (ApiGateway's private
+ * `filterVisibleItemsInMeta`, outside dev mode).
+ */
+function publicMembersOf(cubes: any[]): any[] {
+  const visible = (item: any) => item.isVisible;
+  return cubes
+    .map(({ config }) => ({
+      ...config,
+      measures: config.measures?.filter(visible),
+      dimensions: config.dimensions?.filter(visible),
+      segments: config.segments?.filter(visible),
+    }))
+    .filter((config) => config.measures?.length || config.dimensions?.length || config.segments?.length);
+}
+
 /** The API scope the introspection routes are in. */
 export const INTROSPECTION_SCOPE = 'introspection';
+
+/** All a service token may do on Cube's API: build pre-aggregations and browse data sources. */
+export const SERVICE_SCOPES = ['jobs', INTROSPECTION_SCOPE];
+
+/**
+ * What a user token may never do: jobs and introspection are the service
+ * credential's, and GraphQL's schema lists every cube, gated or not.
+ */
+export const NOT_FOR_USERS = ['jobs', INTROSPECTION_SCOPE, 'graphql'];
 
 /**
  * The introspection of one data source, for one request, from the
@@ -86,14 +121,44 @@ export class XcubeApiGateway extends ApiGateway {
     this.initIntrospectionRoutes(app);
     const runtime = this.xcubeRuntime();
     if (runtime) {
-      initAdminRoutes(app, this.basePath, runtime, (type, params) => this.log({ type, ...params }));
+      initAdminRoutes(app, this.basePath, runtime, (type, params) => this.log({ type, ...params }), {
+        meta: (model, extended) => this.ownMeta(model, extended),
+      });
       // Before Cube's jobs route: each job's context names the module its pre-aggregations are in.
-      app.post(`${this.basePath}/v1/pre-aggregations/jobs`, (req: ExpressRequest, _res: ExpressResponse, next: NextFunction) => {
+      app.post(`${this.basePath}/v1/pre-aggregations/jobs`, (req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
+        const outside = this.jobsOutsideModel(runtime, req);
+        if (outside) {
+          res.status(403).json({ error: outside });
+          return;
+        }
         this.fanOutJobs(runtime, req.body);
         next();
       });
     }
     super.initApp(app);
+  }
+
+  /**
+   * A service token naming a model builds only that model's pre-aggregations:
+   * why, when a jobs `post` names contexts of another. Cube's own check
+   * verifies the token after this; one that doesn't verify here is left to it.
+   */
+  protected jobsOutsideModel(runtime: XcubeRuntime, req: ExpressRequest): string | undefined {
+    const contexts = req.body?.action === 'post' ? req.body?.selector?.contexts : undefined;
+    const token = this.extractAuthorizationHeaderWithSchema(req as Request);
+    if (!runtime.serving || !Array.isArray(contexts) || !token) {
+      return undefined;
+    }
+    let model: string | undefined;
+    try {
+      ({ model } = runtime.verifier.verifyServiceToken(token));
+    } catch {
+      return undefined;
+    }
+    const { modelClaim } = runtime.servingOptions;
+    return model !== undefined && contexts.some((context: any) => context?.securityContext?.[modelClaim] !== model)
+      ? `This service token is for model "${model}" and builds only its pre-aggregations`
+      : undefined;
   }
 
   /**
@@ -220,31 +285,122 @@ export class XcubeApiGateway extends ApiGateway {
    * Cube's, and `introspection` besides: upstream refuses a scope it doesn't
    * know, so it is taken out of what `contextToApiScopes` grants before
    * Cube checks the rest, and put back after.
+   *
+   * A context xcube's verifier built is granted by its role: the service
+   * credential jobs and introspection alone, a user never those or GraphQL.
    */
   protected createContextToApiScopesFn(options: ApiGatewayOptions): ContextToApiScopesFn {
     const { contextToApiScopes } = options;
-    if (!contextToApiScopes) {
-      return super.createContextToApiScopesFn(options);
-    }
+    const cubes: ContextToApiScopesFn = contextToApiScopes
+      ? async (securityContext, defaultApiScopes) => {
+        let granted = false;
+        const upstream = super.createContextToApiScopesFn({
+          ...options,
+          contextToApiScopes: async (context, defaults) => {
+            const scopes: any = await contextToApiScopes(context, defaults);
+            if (!Array.isArray(scopes) || !scopes.includes(INTROSPECTION_SCOPE as any)) {
+              return scopes;
+            }
+
+            granted = true;
+            return scopes.filter(scope => scope !== INTROSPECTION_SCOPE as any);
+          },
+        });
+
+        const scopes = await upstream(securityContext, defaultApiScopes);
+        return granted ? [...scopes, INTROSPECTION_SCOPE as any] : scopes;
+      }
+      : super.createContextToApiScopesFn(options);
 
     return async (securityContext, defaultApiScopes) => {
-      let granted = false;
-      const upstream = super.createContextToApiScopesFn({
-        ...options,
-        contextToApiScopes: async (context, defaults) => {
-          const scopes: any = await contextToApiScopes(context, defaults);
-          if (!Array.isArray(scopes) || !scopes.includes(INTROSPECTION_SCOPE as any)) {
-            return scopes;
-          }
-
-          granted = true;
-          return scopes.filter(scope => scope !== INTROSPECTION_SCOPE as any);
-        },
-      });
-
-      const scopes = await upstream(securityContext, defaultApiScopes);
-      return granted ? [...scopes, INTROSPECTION_SCOPE as any] : scopes;
+      const runtime = this.xcubeRuntime?.();
+      // Only xcube's verifier sets a role, and only while xcube serves models.
+      const role = runtime?.serving ? securityContext?.[ROLE_KEY] : undefined;
+      if (role === 'service') {
+        return SERVICE_SCOPES as any;
+      }
+      const scopes = await cubes(securityContext, defaultApiScopes);
+      if (role === 'user') {
+        return scopes.filter((scope) => !NOT_FOR_USERS.includes(scope));
+      }
+      // Whatever signed it, GraphQL's schema would list a secured model's closed cubes.
+      return runtime?.serving && runtime.secured(securityContext) ? scopes.filter((scope) => scope !== 'graphql') : scopes;
     };
+  }
+
+  /**
+   * Cube's own check, behind xcube's when xcube serves models: RS256 tokens
+   * are verified by xcube, others go to Cube's (read per request, as Cube
+   * builds this before the runtime is set on the gateway).
+   */
+  protected createCheckAuthFn(options: ApiGatewayOptions) {
+    const cubes = super.createCheckAuthFn(options);
+    return async (req: any, authorization?: string) => {
+      const runtime = this.xcubeRuntime?.();
+      if (!runtime?.serving) {
+        return cubes(req, authorization);
+      }
+      await runtime.checkAuth(req, authorization, cubes);
+      return { securityContext: req.securityContext };
+    };
+  }
+
+  /**
+   * Cube's log, but a token it refused is logged as a fingerprint: a
+   * token carries groups and is good until it expires.
+   */
+  public log(event: { type: string, [key: string]: any }, context?: Partial<RequestContext>) {
+    if (typeof event?.token === 'string' && event.token) {
+      const fingerprint = crypto.createHash('sha256').update(event.token, 'utf8').digest('hex').slice(0, 16);
+      return super.log({ ...event, token: `sha256:${fingerprint}` }, context);
+    }
+    return super.log(event, context);
+  }
+
+  /**
+   * A model's field list for wechart's own reads (Jobs, Schedules): its
+   * active revision, merged across modules as `/v1/meta` is, but not
+   * filtered by any group's policies, as it asks for no one. Behind the
+   * admin routes' authentication; Cube's own routes have no such bypass.
+   */
+  public async ownMeta(model: string, extended: boolean): Promise<{ status: number; body: any }> {
+    const runtime = this.xcubeRuntime()!;
+    const context: any = await runtime.adminContext(model);
+    const modules = runtime.metaModules(context) ?? ['all'];
+    let answer: { status: number; body: any } = { status: 500, body: null };
+    await this.mergedMeta(modules, context, (body, options) => {
+      answer = { status: options?.status ?? 200, body };
+    }, async (one, res) => {
+      const compilerApi = await this.getCompilerApi(one);
+      const metaConfig = await compilerApi.metaConfig(one, {
+        requestId: one.requestId,
+        includeCompilerId: !extended,
+        includeViewGroups: !extended,
+        skipVisibilityPatch: true,
+      });
+      const configs = extended ? metaConfig : metaConfig.cubes;
+      const visible = publicMembersOf(configs);
+      if (!extended) {
+        res({
+          cubes: visible,
+          ...(metaConfig.viewGroups?.length ? { viewGroups: metaConfig.viewGroups } : {}),
+          compilerId: metaConfig.compilerId,
+        });
+        return;
+      }
+      const { cubeDefinitions } = (await compilerApi.getCompilers({ requestId: one.requestId })).metaTransformer.cubeEvaluator;
+      res({
+        cubes: visible.map((cube: any) => ({
+          ...transformCube(cube, cubeDefinitions),
+          measures: cube.measures?.map((measure: any) => ({ ...transformMeasure(measure, cubeDefinitions) })),
+          dimensions: cube.dimensions?.map((dimension: any) => ({ ...transformDimension(dimension, cubeDefinitions) })),
+          segments: cube.segments?.map((segment: any) => ({ ...transformSegment(segment, cubeDefinitions) })),
+          joins: transformJoins(cubeDefinitions[cube.name]?.joins),
+          preAggregations: transformPreAggregations(cubeDefinitions[cube.name]?.preAggregations),
+        })),
+      });
+    });
+    return answer;
   }
 
   protected initIntrospectionRoutes(app: ExpressApplication) {

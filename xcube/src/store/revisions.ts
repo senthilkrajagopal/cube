@@ -71,6 +71,53 @@ export type ImportResult =
   | { outcome: 'created' | 'unchanged'; head: ModelHead }
   | { outcome: 'conflict' | 'mode'; current: ModelHead | null };
 
+/** A model's permissions as stored. */
+export interface StoredPermissions {
+  version: number;
+  security: boolean;
+  folders: { id: string; allowedGroups: string[] }[];
+}
+
+/** The public keys a model's user tokens are signed with, pushed as a whole set. */
+export interface StoredKeySet {
+  /** Only goes up: a set with a lower version never replaces a newer one. */
+  version: number;
+  issuer: string | null;
+  keys: Record<string, unknown>[];
+}
+
+export type PutKeysResult =
+  | { outcome: 'replaced' | 'unchanged'; current: StoredKeySet }
+  | { outcome: 'stale' | 'conflict'; current: StoredKeySet };
+
+/** What each model's permissions and keys are at, for an instance to tell it is behind. */
+export interface ModelVersions {
+  model: string;
+  permissions: number;
+  keys: number | null;
+}
+
+/** Folder groups the gate can't be sound with: a child allowing a group its parent doesn't. */
+export class PermissionsError extends Error {
+  public constructor(public readonly problems: string[]) {
+    super('Each folder\'s allowed groups must include all of its children\'s');
+  }
+}
+
+/** Security can't be turned on while an xcube without the gate still serves the schema. */
+export class OlderInstancesError extends Error {
+  public constructor(public readonly instances: string[]) {
+    super('xcube instances older than schema version 4 are connected; they serve without the folder gate. Turn security on once every instance runs this version');
+  }
+}
+
+/** Security can't be on for a model that holds a file set: only published items carry their folder. */
+export class SecurityModeError extends Error {
+  public constructor(model: string) {
+    super(`Model "${model}" holds a file set; security needs items, as only items carry their folder`);
+  }
+}
+
 /** A folder that still holds items can't leave the tree. */
 export class FolderInUseError extends Error {
   public constructor(public readonly folders: string[]) {
@@ -96,8 +143,19 @@ export interface RevisionStore {
   import(request: ImportRequest): Promise<ImportResult>;
   importItems(request: ItemsImportRequest): Promise<ImportResult>;
   folders(model: string): Promise<Folder[]>;
-  /** Replaces the folder tree; answers its hash. */
-  putFolders(model: string, folders: Folder[]): Promise<string>;
+  /**
+   * Replaces the folder tree, setting the allowed groups of the folders
+   * that carry them, and security when given.
+   */
+  putFolders(model: string, folders: Folder[], security?: boolean): Promise<{
+    hash: string;
+    permissionsVersion: number;
+    security: boolean;
+  }>;
+  permissions(model: string): Promise<StoredPermissions | null>;
+  versions(): Promise<ModelVersions[]>;
+  putKeys(model: string, set: StoredKeySet): Promise<PutKeysResult>;
+  keys(model: string): Promise<StoredKeySet | null>;
   /** A revision's items, with their authored and resolved YAML. */
   items(model: string, revision: number): Promise<PublishedItem[]>;
   /** A revision's modules; empty when it is served whole. */
@@ -108,6 +166,20 @@ export interface PgRevisionStoreOptions {
   schema: string;
   /** Revisions kept per model, the current one included. */
   keepRevisions: number;
+}
+
+function sortedGroups(groups: string[]): string[] {
+  return [...new Set(groups)].sort();
+}
+
+/** A key set's identity, whatever order its keys or their members come in (jsonb reorders members). */
+function keySetId(set: StoredKeySet): string {
+  const keys = set.keys.map((k) => [k.kid, k.kty, k.n, k.e].join('|')).sort();
+  return JSON.stringify([set.issuer, keys]);
+}
+
+function versionOf(value: unknown): number {
+  return Number(value);
 }
 
 /** The NOTIFY channel each committed import announces itself on. */
@@ -218,14 +290,193 @@ export class PgRevisionStore implements RevisionStore {
     return rows.map((row) => ({ id: row.id, parentId: row.parent_id }));
   }
 
-  public async putFolders(model: string, folders: Folder[]): Promise<string> {
+  public async putFolders(model: string, folders: Folder[], security?: boolean) {
+    const { s } = this;
     return inTransaction(this.pool, async (client) => {
       await client.query("SET LOCAL lock_timeout = '10s'");
-      await client.query(`INSERT INTO ${this.s}.models (id) VALUES ($1) ON CONFLICT (id) DO NOTHING`, [model]);
-      await client.query(`SELECT 1 FROM ${this.s}.models WHERE id = $1 FOR UPDATE`, [model]);
+      await client.query(`INSERT INTO ${s}.models (id) VALUES ($1) ON CONFLICT (id) DO NOTHING`, [model]);
+      const { rows: [locked] } = await client.query(
+        `SELECT mode, current_rev, security FROM ${s}.models WHERE id = $1 FOR UPDATE`,
+        [model]
+      );
+      if (security === true && locked.mode === 'files' && locked.current_rev !== null) {
+        throw new SecurityModeError(model);
+      }
+      if (security === true && !locked.security) {
+        const older = await this.olderInstances(client);
+        if (older.length) {
+          throw new OlderInstancesError(older);
+        }
+      }
       await this.replaceFolders(client, model, folders);
-      return folderTreeHash(folders);
+      if (security !== undefined && security !== locked.security) {
+        await client.query(`UPDATE ${s}.models SET security = $2, updated_at = now() WHERE id = $1`, [model, security]);
+      }
+      if (security === true) {
+        // Code before version 4 serves the model without the gate: from now on it may not run on this schema.
+        await client.query(`UPDATE ${s}.schema_migrations SET min_reader = GREATEST(min_reader, 4) WHERE version = 4`);
+      }
+      return {
+        hash: folderTreeHash(folders),
+        permissionsVersion: await this.touchPermissions(client, model),
+        security: security ?? locked.security,
+      };
     });
+  }
+
+  /**
+   * The xcube connections to this database from code before schema version
+   * 4, which named them without a version (`db.ts` `applicationName`).
+   */
+  protected async olderInstances(client: PoolClient): Promise<string[]> {
+    const { rows } = await client.query(
+      `SELECT DISTINCT application_name FROM pg_stat_activity
+        WHERE datname = current_database() AND pid <> pg_backend_pid()
+          AND application_name ~ '^xcube(-listen)?:'
+          AND (application_name !~ '^xcube(-listen)?:v[0-9]+:'
+               OR substring(application_name from '^xcube(?:-listen)?:v([0-9]+):')::int < 4)
+        ORDER BY 1`
+    );
+    return rows.map((row) => row.application_name);
+  }
+
+  /** Each folder of the tree with its groups (none, for a folder without a row). */
+  protected async groupsIn(client: Pick<PoolClient, 'query'>, model: string): Promise<{ id: string; parentId: string | null; groups: string[] }[]> {
+    const { rows } = await client.query(
+      `SELECT f.id, f.parent_id, coalesce(g.groups, '{}') AS groups
+         FROM ${this.s}.folders f
+         LEFT JOIN ${this.s}.folder_groups g ON g.model = f.model AND g.folder_id = f.id
+        WHERE f.model = $1
+        ORDER BY f.id COLLATE "C"`,
+      [model]
+    );
+    return rows.map((r) => ({ id: r.id, parentId: r.parent_id, groups: sortedGroups(r.groups) }));
+  }
+
+  /**
+   * Under the model's row lock: checks the groups, with security on, and
+   * bumps the permissions version when security or any folder's groups
+   * changed, and announces it.
+   */
+  protected async touchPermissions(client: PoolClient, model: string): Promise<number> {
+    const { s } = this;
+    const { rows: [row] } = await client.query(
+      `SELECT security, permissions_version, permissions_hash FROM ${s}.models WHERE id = $1`,
+      [model]
+    );
+    const folders = await this.groupsIn(client, model);
+    if (row.security) {
+      // The gate checks each item by its own folder only. That is sound because a
+      // folder allows every group its children do, as the client works them out.
+      const byId = new Map(folders.map((f) => [f.id, new Set(f.groups)]));
+      const problems = folders.flatMap((f) => {
+        const parent = f.parentId === null ? undefined : byId.get(f.parentId);
+        const missing = parent ? f.groups.filter((g) => !parent.has(g)) : [];
+        return missing.length ? [`${f.id} allows ${missing.slice(0, 5).join(', ')}, which its parent ${f.parentId} doesn't`] : [];
+      });
+      if (problems.length) {
+        throw new PermissionsError(problems);
+      }
+    }
+    const hash = crypto.createHash('sha256')
+      .update(JSON.stringify([row.security, folders.map((f) => [f.id, f.groups])]), 'utf8')
+      .digest('hex');
+    if (hash === row.permissions_hash) {
+      return versionOf(row.permissions_version);
+    }
+    const { rows: [bumped] } = await client.query(
+      `UPDATE ${s}.models SET permissions_hash = $2, permissions_version = permissions_version + 1
+        WHERE id = $1 RETURNING permissions_version`,
+      [model, hash]
+    );
+    const version = versionOf(bumped.permissions_version);
+    await client.query('SELECT pg_notify($1, $2)', [channelOf(s), JSON.stringify({ model, permissions: version })]);
+    return version;
+  }
+
+  public async permissions(model: string): Promise<StoredPermissions | null> {
+    const { rows: [row] } = await this.pool.query(
+      `SELECT security, permissions_version FROM ${this.s}.models WHERE id = $1`,
+      [model]
+    );
+    if (!row) {
+      return null;
+    }
+    return {
+      version: versionOf(row.permissions_version),
+      security: row.security,
+      folders: (await this.groupsIn(this.pool, model)).map((f) => ({ id: f.id, allowedGroups: f.groups })),
+    };
+  }
+
+  public async versions(): Promise<ModelVersions[]> {
+    const { rows } = await this.pool.query(`SELECT id, permissions_version, keys_version FROM ${this.s}.models`);
+    return rows.map((row) => ({
+      model: row.id,
+      permissions: versionOf(row.permissions_version),
+      keys: row.keys_version === null ? null : versionOf(row.keys_version),
+    }));
+  }
+
+  public async keys(model: string): Promise<StoredKeySet | null> {
+    const { rows: [row] } = await this.pool.query(
+      `SELECT keys_version, keys_issuer FROM ${this.s}.models WHERE id = $1`,
+      [model]
+    );
+    if (!row || row.keys_version === null) {
+      return null;
+    }
+    const { rows } = await this.pool.query(
+      `SELECT jwk FROM ${this.s}.model_keys WHERE model = $1 ORDER BY kid COLLATE "C"`,
+      [model]
+    );
+    return { version: versionOf(row.keys_version), issuer: row.keys_issuer, keys: rows.map((r) => r.jwk) };
+  }
+
+  /**
+   * Replaces the model's key set when `set.version` is newer than the one
+   * stored; the same version again is taken only as the same set.
+   */
+  public async putKeys(model: string, set: StoredKeySet): Promise<PutKeysResult> {
+    const { s } = this;
+    return inTransaction(this.pool, async (client) => {
+      await client.query("SET LOCAL lock_timeout = '10s'");
+      await client.query(`INSERT INTO ${s}.models (id) VALUES ($1) ON CONFLICT (id) DO NOTHING`, [model]);
+      await client.query(`SELECT 1 FROM ${s}.models WHERE id = $1 FOR UPDATE`, [model]);
+      const stored = await this.keysIn(client, model);
+      if (stored && set.version <= stored.version) {
+        if (set.version < stored.version) {
+          return { outcome: 'stale', current: stored };
+        }
+        return { outcome: keySetId(set) === keySetId(stored) ? 'unchanged' : 'conflict', current: stored };
+      }
+      await client.query(`DELETE FROM ${s}.model_keys WHERE model = $1`, [model]);
+      await client.query(
+        `INSERT INTO ${s}.model_keys (model, kid, jwk) SELECT $1, k, j::jsonb FROM unnest($2::text[], $3::text[]) AS u(k, j)`,
+        [model, set.keys.map((k) => k.kid), set.keys.map((k) => JSON.stringify(k))]
+      );
+      await client.query(
+        `UPDATE ${s}.models SET keys_version = $2, keys_issuer = $3, updated_at = now() WHERE id = $1`,
+        [model, set.version, set.issuer]
+      );
+      await client.query('SELECT pg_notify($1, $2)', [channelOf(s), JSON.stringify({ model, keys: set.version })]);
+      return { outcome: 'replaced', current: (await this.keysIn(client, model))! };
+    });
+  }
+
+  protected async keysIn(client: PoolClient, model: string): Promise<StoredKeySet | null> {
+    const { rows: [row] } = await client.query(
+      `SELECT keys_version, keys_issuer FROM ${this.s}.models WHERE id = $1`,
+      [model]
+    );
+    if (!row || row.keys_version === null) {
+      return null;
+    }
+    const { rows } = await client.query(
+      `SELECT jwk FROM ${this.s}.model_keys WHERE model = $1 ORDER BY kid COLLATE "C"`,
+      [model]
+    );
+    return { version: versionOf(row.keys_version), issuer: row.keys_issuer, keys: rows.map((r) => r.jwk) };
   }
 
   /** Under the model's row lock: refuses to drop a folder the current revision still has items in. */
@@ -248,11 +499,33 @@ export class PgRevisionStore implements RevisionStore {
     if (orphaned.length) {
       throw new FolderInUseError(orphaned);
     }
-    await client.query(`DELETE FROM ${s}.folders WHERE model = $1`, [model]);
+    const { rows: before } = await client.query(`SELECT id, parent_id FROM ${s}.folders WHERE model = $1`, [model]);
+    const parentBefore = new Map(before.map((row) => [row.id, row.parent_id]));
+    await client.query(`DELETE FROM ${s}.folders WHERE model = $1 AND NOT (id = ANY($2::text[]))`, [model, [...ids]]);
     if (folders.length) {
       await client.query(
-        `INSERT INTO ${s}.folders (model, id, parent_id) SELECT $1, * FROM unnest($2::text[], $3::text[])`,
+        `INSERT INTO ${s}.folders (model, id, parent_id) SELECT $1, * FROM unnest($2::text[], $3::text[])
+         ON CONFLICT (model, id) DO UPDATE SET parent_id = EXCLUDED.parent_id`,
         [model, folders.map((f) => f.id), folders.map((f) => f.parentId)]
+      );
+    }
+    // Groups where given. A folder sent without them keeps its own, unless it
+    // moved: what its old place allowed is no guide to its new one.
+    const moved = folders
+      .filter((f) => f.allowedGroups === undefined && parentBefore.has(f.id) && parentBefore.get(f.id) !== f.parentId)
+      .map((f) => f.id);
+    await client.query(
+      `DELETE FROM ${s}.folder_groups WHERE model = $1 AND (NOT (folder_id = ANY($2::text[])) OR folder_id = ANY($3::text[]))`,
+      [model, [...ids], moved]
+    );
+    const grouped = folders.filter((f) => f.allowedGroups !== undefined);
+    if (grouped.length) {
+      await client.query(
+        `INSERT INTO ${s}.folder_groups (model, folder_id, groups)
+         SELECT $1, u.id, ARRAY(SELECT jsonb_array_elements_text(u.groups::jsonb))
+           FROM unnest($2::text[], $3::text[]) AS u(id, groups)
+         ON CONFLICT (model, folder_id) DO UPDATE SET groups = EXCLUDED.groups`,
+        [model, grouped.map((f) => f.id), grouped.map((f) => JSON.stringify(sortedGroups(f.allowedGroups!)))]
       );
     }
   }
@@ -342,7 +615,7 @@ export class PgRevisionStore implements RevisionStore {
       // against the joined row as it was, which would miss a revision the
       // holder just added.
       const { rows: [locked] } = await client.query(
-        `SELECT id, generation, current_rev, mode FROM ${s}.models WHERE id = $1 FOR UPDATE`,
+        `SELECT id, generation, current_rev, mode, security FROM ${s}.models WHERE id = $1 FOR UPDATE`,
         [model]
       );
       let current: ModelHead | null = null;
@@ -354,7 +627,7 @@ export class PgRevisionStore implements RevisionStore {
         current = this.headOf({ ...locked, ...revision });
       }
 
-      if (mode === 'files' && current?.mode === 'items') {
+      if (mode === 'files' && (current?.mode === 'items' || locked.security)) {
         return { outcome: 'mode', current };
       }
       // Items are the same when both what the client wrote and what Cube
@@ -367,6 +640,7 @@ export class PgRevisionStore implements RevisionStore {
       }
       if (folders) {
         await this.replaceFolders(client, model, folders, items);
+        await this.touchPermissions(client, model);
       }
       if (same) {
         return { outcome: 'unchanged', head: current! };

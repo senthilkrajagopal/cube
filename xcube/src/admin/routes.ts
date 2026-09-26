@@ -11,8 +11,13 @@ import { getEnv } from '@cubejs-backend/shared';
 import { CubejsHandlerError } from '@cubejs-backend/api-gateway';
 
 import { LaneBusyError } from '../runtime/lane';
-import { FolderTreeError, type ItemsOutcome, type XcubeRuntime } from '../runtime/runtime';
-import { FolderInUseError } from '../store/revisions';
+import { FolderTreeError, KeySetError, MAX_MODEL_KEYS, type ItemsOutcome, type XcubeRuntime } from '../runtime/runtime';
+import {
+  FolderInUseError,
+  OlderInstancesError,
+  PermissionsError,
+  SecurityModeError,
+} from '../store/revisions';
 import { MODEL_ID, SnapshotError } from '../model/snapshot';
 import { adminAuth } from './auth';
 
@@ -57,9 +62,13 @@ const dryRunSchema = Joi.object({
   })).default([]),
 });
 
+/** A group name as the client's identity provider sends it. */
+const group = Joi.string().min(1).max(256);
+
 const folderSchema = Joi.object({
   id: Joi.string().max(64).required(),
   parentId: Joi.string().max(64).allow(null).required(),
+  allowedGroups: Joi.array().max(10000).items(group),
 });
 
 const itemSchema = Joi.object({
@@ -76,6 +85,21 @@ const itemRefSchema = Joi.object({
 
 const foldersSchema = Joi.object({
   folders: Joi.array().max(100000).items(folderSchema).required(),
+  security: Joi.boolean(),
+});
+
+const keysSchema = Joi.object({
+  version: Joi.number()
+    .integer()
+    .min(1)
+    .max(Number.MAX_SAFE_INTEGER)
+    .required(),
+  issuer: Joi.string().min(1).max(256).allow(null),
+  keys: Joi.array()
+    .min(1)
+    .max(MAX_MODEL_KEYS)
+    .items(Joi.object().unknown(true))
+    .required(),
 });
 
 const itemsSnapshotSchema = Joi.object({
@@ -189,19 +213,26 @@ type Handler = (req: Request, res: Response) => Promise<void>;
  * They have their own authentication; Cube's `checkAuth` and API scopes
  * don't apply.
  */
+export interface AdminReads {
+  /** A model's field list, unfiltered, merged across modules (`extended`: as `/v1/meta?extended`). */
+  meta(model: string, extended: boolean): Promise<{ status: number; body: any }>;
+}
+
 export function initAdminRoutes(
   app: ExpressApplication,
   basePath: string,
   runtime: XcubeRuntime,
   logger: (message: string, params?: Record<string, unknown>) => void,
+  reads?: AdminReads,
 ) {
   const { adminTokens } = runtime.settings;
-  if (!adminTokens.length) {
-    logger('xcube: admin routes are off, as XCUBE_ADMIN_TOKENS is unset', {});
+  const { serviceKeys, serviceKeysFile } = runtime.tokens;
+  if (!adminTokens.length && !serviceKeys && !serviceKeysFile) {
+    logger('xcube: admin routes are off, as neither XCUBE_SERVICE_KEYS nor XCUBE_ADMIN_TOKENS is set', {});
     return;
   }
 
-  const auth = adminAuth(adminTokens);
+  const auth = adminAuth(adminTokens, runtime.verifier);
   const json = bodyParser.json({ limit: getEnv('maxRequestSize') });
   const base = `${basePath}/v1/semantic/models/:model`;
 
@@ -219,6 +250,18 @@ export function initAdminRoutes(
       } else if (e instanceof FolderTreeError) {
         status = 400;
         body = { error: 'The folder tree can\'t be taken as it is', code: 'invalid_folders', problems: e.problems };
+      } else if (e instanceof KeySetError) {
+        status = 400;
+        body = { error: e.message, code: e.code };
+      } else if (e instanceof PermissionsError) {
+        status = 400;
+        body = { error: e.message, code: 'invalid_permissions', problems: e.problems };
+      } else if (e instanceof OlderInstancesError) {
+        status = 409;
+        body = { error: e.message, code: 'older_instances', instances: e.instances };
+      } else if (e instanceof SecurityModeError) {
+        status = 409;
+        body = { error: e.message, code: 'mode' };
       } else if (e instanceof FolderInUseError) {
         status = 409;
         body = { error: e.message, code: 'folder_in_use', folders: e.folders };
@@ -330,9 +373,55 @@ export function initAdminRoutes(
   app.put(`${base}/folders`, auth, json, handle('folders', async (req, res) => {
     const model = modelOf(req);
     const body = valid<any>(foldersSchema, req.body);
-    const result = await runtime.putFolders(model, body.folders);
-    logger('xcube: replaced the folder tree', { model, folders: body.folders.length });
+    const result = await runtime.putFolders(model, body.folders, body.security);
+    logger('xcube: replaced the folder tree', {
+      model,
+      folders: body.folders.length,
+      withGroups: body.folders.filter((f: any) => f.allowedGroups !== undefined).length,
+      security: result.security,
+      permissionsVersion: result.permissionsVersion,
+    });
     res.json({ model, ...result });
+  }));
+
+  app.put(`${base}/keys`, auth, json, handle('keys', async (req, res) => {
+    const model = modelOf(req);
+    const body = valid<any>(keysSchema, req.body);
+    const result = await runtime.putKeys(model, body);
+    const { current } = result;
+    const answer = {
+      model, version: current.version, issuer: current.issuer, kids: current.keys.map((k) => k.kid),
+    };
+    logger('xcube: key set pushed', { model, version: body.version, outcome: result.outcome, kids: answer.kids });
+    switch (result.outcome) {
+      case 'stale':
+        throw new AdminError(409, 'stale_keys', `Model "${model}" already has key set version ${current.version}; a set must have a higher version`, answer);
+      case 'conflict':
+        throw new AdminError(409, 'conflict', `Key set version ${current.version} of model "${model}" holds other keys`, answer);
+      default:
+        res.json({ ...answer, applied: result.outcome === 'replaced' });
+    }
+  }));
+
+  app.get(`${base}/keys`, auth, handle('keys', async (req, res) => {
+    const model = modelOf(req);
+    const set = await runtime.keysOf(model);
+    if (!set) {
+      throw new AdminError(404, 'no_keys', `Model "${model}" has no keys; it takes HS256 tokens while XCUBE_HS256 allows them`);
+    }
+    res.json({ model, ...set });
+  }));
+
+  app.get(`${base}/meta`, auth, handle('meta', async (req, res) => {
+    const model = modelOf(req);
+    if (!reads) {
+      throw new AdminError(404, 'not_found', 'Not served here');
+    }
+    if (req.query.extended !== undefined && req.query.extended !== 'true' && req.query.extended !== 'false') {
+      throw new AdminError(400, 'bad_request', 'extended is true or false');
+    }
+    const { status, body } = await reads.meta(model, req.query.extended === 'true');
+    res.status(status).json(body);
   }));
 
   app.post(`${base}/changesets`, auth, json, handle('changesets', async (req, res) => {
