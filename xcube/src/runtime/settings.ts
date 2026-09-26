@@ -26,6 +26,8 @@ export interface XcubeSettings {
   adminTokens: string[];
   /** Most models one process keeps state for; a model beyond it is refused. */
   maxModels: number;
+  /** Module packing: groups smaller than `packMin` items are packed into modules of at most `packMax`. */
+  modules: { packMin: number; packMax: number };
 }
 
 function number(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
@@ -83,5 +85,9 @@ export function settingsFromEnv(env: NodeJS.ProcessEnv = process.env): XcubeSett
     catchUpMs: number(env, 'XCUBE_CATCH_UP_MS', 10000),
     adminTokens,
     maxModels: number(env, 'XCUBE_MAX_MODELS', 1000),
+    modules: {
+      packMin: number(env, 'XCUBE_MODULE_PACK_MIN', 50),
+      packMax: Math.max(1, number(env, 'XCUBE_MODULE_PACK_MAX', 300)),
+    },
   };
 }

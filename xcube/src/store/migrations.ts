@@ -102,6 +102,27 @@ export const MIGRATIONS: Migration[] = [
       CREATE INDEX revision_items_hash_idx ON ${s}.revision_items (model, authored_hash);
     `,
   },
+  {
+    version: 3,
+    name: 'modules',
+    // Additive: code at version 2 serves an items revision whole, as it did.
+    minReader: 2,
+    sql: (s) => `
+      -- The modules an items revision compiles in: the items each owns, and
+      -- the shared cubes it carries copies of; its version is the hash of
+      -- its files, so an unchanged module keeps its compiled model.
+      CREATE TABLE ${s}.revision_modules (
+        model     text     NOT NULL,
+        rev       integer  NOT NULL,
+        module_id text     NOT NULL,
+        version   char(64) NOT NULL CHECK (version ~ '^[0-9a-f]{64}$'),
+        members   jsonb    NOT NULL,
+        copies    jsonb    NOT NULL DEFAULT '[]'::jsonb,
+        PRIMARY KEY (model, rev, module_id),
+        FOREIGN KEY (model, rev) REFERENCES ${s}.revisions (model, rev) ON DELETE CASCADE
+      );
+    `,
+  },
 ];
 
 /** The newest schema version this code knows. */

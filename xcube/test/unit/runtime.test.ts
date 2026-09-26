@@ -69,6 +69,10 @@ class MemoryStore implements RevisionStore {
   public async items() {
     return [];
   }
+
+  public async modules() {
+    return [];
+  }
 }
 
 /** A core whose compiles finish when a test says, or fail for content it is told to fail. */
@@ -125,6 +129,7 @@ const settings = (extra: Partial<XcubeSettings> = {}): XcubeSettings => ({
   catchUpMs: 200,
   adminTokens: [],
   maxModels: 100,
+  modules: { packMin: 50, packMax: 300 },
   ...extra,
 });
 
@@ -257,7 +262,7 @@ describe('XcubeRuntime', () => {
       const v1 = s.store.put('dev', files('v1'));
       await runtime.start();
       await runtime.attach(s.core);
-      const background = runtime.residentOf(ctx({ wechartModel: 'dev' }))!;
+      const background = runtime.revisionOfContext(ctx({ wechartModel: 'dev' }))!;
       runtime.hold(background);
 
       s.store.put('dev', files('v2'));
@@ -403,7 +408,7 @@ describe('XcubeRuntime', () => {
     await Promise.all([first, second]);
 
     expect(runtime.resolve(ctx({ wechartModel: 'dev' })).appId).toBe(appIdOf(v3));
-    expect((runtime as any).residents.get(appIdOf(v2)).state).toBe('retiring');
+    expect((runtime as any).served.get(appIdOf(v2)).state).toBe('retiring');
   });
 
   test('at start, an earlier revision served as a fallback never replaces a newer one that arrives meanwhile', async () => {

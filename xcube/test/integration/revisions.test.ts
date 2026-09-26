@@ -109,6 +109,7 @@ describeWithDatabase('xcube revisions, two Cube instances', () => {
     catchUpMs: 10000,
     adminTokens: [ADMIN_TOKEN],
     maxModels: 100,
+    modules: { packMin: 50, packMax: 300 },
   };
 
   async function instance(name: string): Promise<Instance> {

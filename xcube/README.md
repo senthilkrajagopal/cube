@@ -142,6 +142,8 @@ In both modes:
 | `XCUBE_MAX_SNAPSHOT_BYTES` | `33554432` | The most content one snapshot may hold (also bounded by `CUBEJS_MAX_REQUEST_SIZE`) |
 | `XCUBE_FILE_TYPES` | `yaml` | `yaml` takes plain YAML only; `all` also takes JavaScript, Jinja and Python, which Cube runs as code in its own process, so that whoever may import may run code in Cube |
 | `XCUBE_MAX_MODELS` | `1000` | The most models one process follows |
+| `XCUBE_MODULE_PACK_MIN` | `50` | Groups smaller than this are packed together into modules |
+| `XCUBE_MODULE_PACK_MAX` | `300` | The most items a packed module holds |
 | `XCUBE_COMPILE_QUEUE` | `4` | Imports and checks that may wait to compile; more answer `503` |
 | `XCUBE_COMPILE_WAIT_MS` | `120000` | How long one may wait |
 | `XCUBE_CATCH_UP_MS` | `10000` | How long a request naming a newer revision waits for it |
@@ -171,6 +173,54 @@ In both modes:
   titles and SQL as they were.
 - **Expressions** are read with Cube's own lexer, so names in string
   literals, lambda parameters and keyword arguments are never rewritten.
+
+### Modules
+
+An items model compiles in **modules**, so a change recompiles only the
+modules it touches.
+
+- **Grouping.**
+  - Items that refer to each other (the bindings above) share a module, so
+    a module holds everything its items use.
+  - A cube used by items in two or more *zones* (the first folder under the
+    root on their paths) is **shared**. It groups nothing: every module
+    using it compiles a copy of it and of what it references. The shared
+    cubes also form the `commons` module.
+  - Groups under `XCUBE_MODULE_PACK_MIN` items (50) are packed into modules
+    of at most `XCUBE_MODULE_PACK_MAX` (300), same zone first.
+- **Versions.**
+  - A module's version is the hash of its files. A module that didn't
+    change keeps its compiled model from one revision to the next, and
+    publishes compile and validate only the modules that changed.
+  - A module keeps its id across revisions: the new group that overlaps it
+    most takes it.
+- **Routing.** Clients send the same requests as before.
+  - `/v1/load`, `/v1/sql`, `/v1/dry-run` and `/v1/subscribe` are answered
+    from the module holding every cube the query names: the first cube's
+    owner, else `commons`, else the smallest.
+  - A query no one module holds (two facts joined through a shared cube) is
+    answered from a union of the modules owning its cubes. The union is
+    compiled in the compile lane on first use (a full lane answers `503`),
+    kept with the revision, and retired when idle; a revision keeps at most
+    16. Modules sharing no cube get no union: Cube answers that their cubes
+    don't join.
+  - `/v1/meta` and `?extended` are each module's own answer, merged. Cube
+    computes visibility per cube, so the result is what one model would
+    answer.
+  - The jobs API builds each selector context in every module holding the
+    pre-aggregations it names; the module travels in the jobs' security
+    context.
+  - The refresh worker runs one context per module.
+  - Requests that name no query (the SQL API, GraphQL) are answered from
+    the whole model, compiled on first use.
+- **`queryRewrite`** in cube.js runs in the query's module, so it may add
+  only cubes the query already reaches; anything else is refused with a
+  message. Access policies are the way to add filters on other members.
+- **Cube's compiler cache** holds 2,000 compiled models by default under
+  xcube (`compilerCacheSize`), since modules, unions and replaced revisions
+  in their grace period all count; xcube retires them itself.
+- **Status.** `GET …/revision` lists the modules:
+  `{ id, version, cubes, copies }`.
 
 ### Admin API
 

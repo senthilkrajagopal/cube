@@ -100,6 +100,7 @@ describeWithDatabase('xcube items and changesets', () => {
     catchUpMs: 10000,
     adminTokens: [ADMIN_TOKEN],
     maxModels: 100,
+    modules: { packMin: 50, packMax: 300 },
   };
 
   beforeAll(async () => {

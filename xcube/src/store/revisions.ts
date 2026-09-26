@@ -38,6 +38,15 @@ export interface ModelStatus {
   current: (RevisionInfo & { itemsHash: string | null }) | null;
 }
 
+/** A module of a stored revision. */
+export interface StoredModule {
+  id: string;
+  /** SHA-256 of its files: an unchanged module keeps its compiled model. */
+  version: string;
+  members: string[];
+  copies: string[];
+}
+
 export interface ItemsImportRequest {
   model: string;
   baseRevision: number | null;
@@ -46,6 +55,7 @@ export interface ItemsImportRequest {
   source: Record<string, unknown>;
   /** Replaces the folder tree in the same transaction (a snapshot). */
   folders?: Folder[];
+  modules?: StoredModule[];
 }
 
 export interface ImportRequest {
@@ -90,6 +100,8 @@ export interface RevisionStore {
   putFolders(model: string, folders: Folder[]): Promise<string>;
   /** A revision's items, with their authored and resolved YAML. */
   items(model: string, revision: number): Promise<PublishedItem[]>;
+  /** A revision's modules; empty when it is served whole. */
+  modules(model: string, revision: number): Promise<StoredModule[]>;
 }
 
 export interface PgRevisionStoreOptions {
@@ -268,6 +280,15 @@ export class PgRevisionStore implements RevisionStore {
     }));
   }
 
+  public async modules(model: string, revision: number): Promise<StoredModule[]> {
+    const { rows } = await this.pool.query(
+      `SELECT module_id, version, members, copies FROM ${this.s}.revision_modules
+        WHERE model = $1 AND rev = $2 ORDER BY module_id`,
+      [model, revision]
+    );
+    return rows.map((row) => ({ id: row.module_id, version: row.version, members: row.members, copies: row.copies }));
+  }
+
   /**
    * Stores the files as the model's new current revision, and announces it.
    * Imports of one model are serialized by a lock on its row, on every
@@ -295,6 +316,7 @@ export class PgRevisionStore implements RevisionStore {
       items: request.items,
       itemsHash: request.itemsHash,
       folders: request.folders,
+      modules: request.modules,
     });
   }
 
@@ -307,8 +329,9 @@ export class PgRevisionStore implements RevisionStore {
     items?: PublishedItem[];
     itemsHash?: string;
     folders?: Folder[];
+    modules?: StoredModule[];
   }): Promise<ImportResult> {
-    const { model, baseRevision, files, source, mode, items, itemsHash, folders } = request;
+    const { model, baseRevision, files, source, mode, items, itemsHash, folders, modules } = request;
     const hash = contentHash(files);
     const { s } = this;
 
@@ -402,6 +425,20 @@ export class PgRevisionStore implements RevisionStore {
             items.map((i) => i.fullName),
             hashes.slice(files.length),
             items.map((i) => JSON.stringify(i.bindings)),
+          ]
+        );
+      }
+      if (modules?.length) {
+        await client.query(
+          `INSERT INTO ${s}.revision_modules (model, rev, module_id, version, members, copies)
+           SELECT $1, $2, i, v, m::jsonb, c::jsonb FROM unnest($3::text[], $4::text[], $5::text[], $6::text[]) AS u(i, v, m, c)`,
+          [
+            model,
+            revision,
+            modules.map((m) => m.id),
+            modules.map((m) => m.version),
+            modules.map((m) => JSON.stringify(m.members)),
+            modules.map((m) => JSON.stringify(m.copies)),
           ]
         );
       }

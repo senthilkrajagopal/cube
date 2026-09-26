@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import bodyParser from 'body-parser';
 import type {
   Application as ExpressApplication,
@@ -31,7 +32,14 @@ import {
 } from './requests';
 import type { DataSourceDescription, DataSourceIntrospectionApi } from './types';
 import { initAdminRoutes } from './admin/routes';
-import type { XcubeRuntime } from './runtime/runtime';
+import { MODULE_KEY, type XcubeRuntime } from './runtime/runtime';
+
+/** A UUID derived from text, for the compiler id of a merged meta (the SQL API wants a UUID). */
+function uuidOf(text: string): string {
+  const h = crypto.createHash('sha256').update(text, 'utf8').digest('hex');
+  const variant = '89ab'[parseInt(h[16], 16) % 4];
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-${variant}${h.slice(17, 20)}-${h.slice(20, 32)}`;
+}
 
 /** The API scope the introspection routes are in. */
 export const INTROSPECTION_SCOPE = 'introspection';
@@ -79,8 +87,133 @@ export class XcubeApiGateway extends ApiGateway {
     const runtime = this.xcubeRuntime();
     if (runtime) {
       initAdminRoutes(app, this.basePath, runtime, (type, params) => this.log({ type, ...params }));
+      // Before Cube's jobs route: each job's context names the module its pre-aggregations are in.
+      app.post(`${this.basePath}/v1/pre-aggregations/jobs`, (req: ExpressRequest, _res: ExpressResponse, next: NextFunction) => {
+        this.fanOutJobs(runtime, req.body);
+        next();
+      });
     }
     super.initApp(app);
+  }
+
+  /**
+   * A jobs `post` builds pre-aggregations for each context of its selector;
+   * a model served in modules gets one context per module that holds them,
+   * the module named in the security context, where jobs keep it.
+   */
+  protected fanOutJobs(runtime: XcubeRuntime, body: any) {
+    const selector = body?.action === 'post' ? body.selector : undefined;
+    if (!runtime.serving || !selector || !Array.isArray(selector.contexts)) {
+      return;
+    }
+    selector.contexts = selector.contexts.flatMap((context: any) => {
+      const modules = runtime.jobModules(context?.securityContext, selector);
+      return modules
+        ? modules.map((id) => ({ ...context, securityContext: { ...context.securityContext, [MODULE_KEY]: id } }))
+        : [context];
+    });
+  }
+
+  /** `/v1/meta` of a model served in modules: every module's own answer, merged. */
+  public async meta(args: Parameters<ApiGateway['meta']>[0]) {
+    const modules = this.xcubeRuntime()?.metaModules(args.context);
+    if (!modules) {
+      return super.meta(args);
+    }
+    return this.mergedMeta(modules, args.context, args.res, (context, res) => super.meta({ ...args, context, res }));
+  }
+
+  public async metaExtended(args: Parameters<ApiGateway['metaExtended']>[0]) {
+    const modules = this.xcubeRuntime()?.metaModules(args.context);
+    if (!modules) {
+      return super.metaExtended(args);
+    }
+    return this.mergedMeta(modules, args.context, args.res, (context, res) => super.metaExtended({ ...args, context, res }));
+  }
+
+  /**
+   * Asks each module, as Cube answers it (visibility is per cube, so the
+   * union is what one model would answer), and merges: each cube and view
+   * group once, join-graph components renumbered across modules, and a
+   * compiler id derived from the modules'.
+   */
+  protected async mergedMeta(
+    modules: string[],
+    context: any,
+    res: (body: any, options?: any) => any,
+    ask: (context: any, res: (body: any, options?: any) => void) => Promise<void>,
+  ) {
+    const answers: any[] = [];
+    for (const id of modules) {
+      let body: any;
+      let status = 200;
+      await ask({ ...context, [MODULE_KEY]: id }, (b, options) => {
+        body = b;
+        status = options?.status ?? 200;
+      });
+      if (status !== 200) {
+        return res(body, { status });
+      }
+      answers.push(body);
+    }
+
+    // A cube's join-graph component in every module holding it is one
+    // component: joined through shared cubes, as one model's would be.
+    const parent = new Map<string, string>();
+    const find = (x: string): string => {
+      let root = x;
+      while (parent.get(root) !== root) {
+        root = parent.get(root)!;
+      }
+      return root;
+    };
+    const nodesOf = new Map<string, string[]>();
+    answers.forEach((answer, i) => (answer?.cubes ?? []).forEach((cube: any) => {
+      if (typeof cube.connectedComponent === 'number') {
+        const node = `${i}:${cube.connectedComponent}`;
+        if (!parent.has(node)) {
+          parent.set(node, node);
+        }
+        nodesOf.set(cube.name, [...(nodesOf.get(cube.name) ?? []), node]);
+      }
+    }));
+    nodesOf.forEach((nodes) => nodes.slice(1).forEach((node) => {
+      const a = find(nodes[0]);
+      const b = find(node);
+      if (a !== b) {
+        parent.set(b, a);
+      }
+    }));
+
+    const cubes: any[] = [];
+    const seen = new Set<string>();
+    const numbers = new Map<string, number>();
+    for (const answer of answers) {
+      const fresh = (answer?.cubes ?? []).filter((cube: any) => !seen.has(cube.name));
+      for (const cube of fresh) {
+        seen.add(cube.name);
+        const nodes = nodesOf.get(cube.name);
+        if (nodes) {
+          const root = find(nodes[0]);
+          if (!numbers.has(root)) {
+            numbers.set(root, numbers.size + 1);
+          }
+          cubes.push({ ...cube, connectedComponent: numbers.get(root) });
+        } else {
+          cubes.push(cube);
+        }
+      }
+    }
+    const merged: any = { cubes };
+    const groups = new Map<string, any>();
+    answers.forEach((a) => (a?.viewGroups ?? []).forEach((g: any) => groups.set(g.name, groups.get(g.name) ?? g)));
+    if (groups.size) {
+      merged.viewGroups = [...groups.values()];
+    }
+    if (answers.some((a) => a?.compilerId)) {
+      merged.compilerId = uuidOf(answers.map((a) => a?.compilerId ?? '').join(','));
+    }
+    return res(merged);
   }
 
   /**
@@ -242,13 +375,19 @@ export class XcubeApiGateway extends ApiGateway {
    * so a broken model doesn't stop anyone browsing tables to fix it.
    */
   protected async dataSourceDescriptions(context: RequestContext): Promise<DataSourceDescription[]> {
-    const compilerApi = await this.getCompilerApi(context);
+    // A model served in modules is asked module by module, never compiled whole.
+    const modules = this.xcubeRuntime()?.metaModules(context);
+    const contexts = modules ? modules.map((id) => ({ ...context, [MODULE_KEY]: id })) : [context];
+    const compilerApi = await this.getCompilerApi(contexts[0] as RequestContext);
     const declared = getEnv('dataSources');
     const names = new Set<string>(declared.length ? declared : ['default']);
 
     try {
-      const { dataSources } = await compilerApi.dataSources(await this.getAdapterApi(context));
-      dataSources.forEach(({ dataSource }) => names.add(dataSource));
+      for (const one of contexts) {
+        const { dataSources } = await (await this.getCompilerApi(one as RequestContext))
+          .dataSources(await this.getAdapterApi(one as RequestContext));
+        dataSources.forEach(({ dataSource }) => names.add(dataSource));
+      }
     } catch (e: any) {
       this.log({
         type: 'Data sources of the data model skipped',

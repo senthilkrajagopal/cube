@@ -17,6 +17,7 @@ const settings: XcubeSettings = {
   catchUpMs: 1000,
   adminTokens: [],
   maxModels: 100,
+  modules: { packMin: 50, packMax: 300 },
 };
 
 const runtime = () => new XcubeRuntime(settings, { listenClient: null, logger: () => undefined });

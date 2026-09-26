@@ -87,17 +87,17 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
     this.compilerCache.delete(appId);
   }
 
-  /** A refresh run keeps the one compiled model it started with, so that revision stays compiled until it ends. */
+  /** A refresh run keeps the compiled model it started with, so its revision stays compiled until it ends. */
   public async runScheduledRefresh(context: any, queryingOptions?: any) {
-    const resident = context && this.xcube?.serving ? this.xcube.residentOf(context) : undefined;
-    if (!resident) {
+    const revision = context && this.xcube?.serving ? this.xcube.revisionOfContext(context) : undefined;
+    if (!revision) {
       return super.runScheduledRefresh(context, queryingOptions);
     }
-    this.xcube!.hold(resident);
+    this.xcube!.hold(revision);
     try {
       return await super.runScheduledRefresh(context, queryingOptions);
     } finally {
-      this.xcube!.release(resident);
+      this.xcube!.release(revision);
     }
   }
 }

@@ -32,8 +32,10 @@ import {
   type ModelHead,
   type ModelStatus,
   type RevisionStore,
+  type StoredModule,
 } from '../store/revisions';
-import { CompileLane, Priority } from './lane';
+import { COMMONS, groupModules } from '../modules/graph';
+import { CompileLane, LaneBusyError, Priority } from './lane';
 import { RevisionListener, type ListenClient } from './listener';
 import type { XcubeSettings } from './settings';
 
@@ -57,15 +59,61 @@ export interface ServingCore {
   logger: (message: string, params?: any) => void;
 }
 
-/** One revision of a model, compiled or being compiled. */
+/** One compiled model: a module of a revision, or a revision served whole. */
 export interface Resident {
   kind: 'revision';
   appId: string;
   model: string;
   generation: string;
+  /** The revision it was first built for; an unchanged module is shared with later ones. */
+  revision: number;
+  moduleId: string;
+  files: SnapshotFile[];
+  compiled: boolean;
+  /** For unions and the whole model: when a request last used it, for idle retirement. */
+  lastUsed?: number;
+}
+
+/** A module of a revision, as stored. */
+export type ModuleData = StoredModule;
+
+/** A revision's files, and the modules it compiles in (none: served whole). */
+export interface RevisionData {
+  files: SnapshotFile[];
+  modules: ModuleData[];
+}
+
+/**
+ * A revision as this process serves it: one compiled model per module, and
+ * where each cube and view is. A revision without modules is one module,
+ * `all`, that every context is served.
+ */
+/** Where each cube and view is, by module: what choosing a query's module needs. */
+export interface ModuleIndex {
+  single: boolean;
+  holders: Map<string, Set<string>>;
+  owner: Map<string, string>;
+  modules: Map<string, { files: SnapshotFile[] }>;
+}
+
+export interface ServedRevision {
+  /** `appIdOf(head)`: what requests are pinned to. */
+  key: string;
+  model: string;
+  generation: string;
   revision: number;
   contentHash: string;
-  files: SnapshotFile[];
+  data: RevisionData;
+  modules: Map<string, Resident>;
+  /** Cube or view → the modules holding it (owned or copied). */
+  holders: Map<string, Set<string>>;
+  /** Cube or view → the module owning it. */
+  owner: Map<string, string>;
+  single: boolean;
+  /** The whole model, compiled only for a context no module or union serves. */
+  whole?: Resident;
+  /** Unions of modules, compiled on first use for a query spanning them. */
+  unions: Map<string, Resident>;
   state: 'activating' | 'active' | 'retiring';
   retireAfter?: number;
   /** Scheduled refresh runs using it; it is never retired while any do. */
@@ -101,7 +149,7 @@ interface ModelState {
   /** The current revision, as last read from the database. */
   target?: ModelHead;
   /** The revision new requests are served. */
-  active?: Resident;
+  active?: ServedRevision;
   failed?: { appId: string; revision: number; error: string; attempts: number; retryAt: number };
   syncing?: Promise<void>;
   dirty: boolean;
@@ -154,6 +202,68 @@ export interface InstanceModelStatus {
 
 export function appIdOf(head: ModelHead): string {
   return `xcube:${head.model}:${head.revision}:${head.contentHash.slice(0, 12)}`;
+}
+
+/** The context key naming the module a request is served from. */
+export const MODULE_KEY = 'xcubeModule';
+
+/** A module key naming a union of modules: `u:<id>+<id>…`. */
+export const UNION_PREFIX = 'u:';
+
+/** The most unions one revision keeps compiled; the least recently used goes first. */
+export const MAX_UNIONS = 16;
+
+/** The cubes and views a Cube REST query names: the first segment of each member. */
+export function cubesOfQuery(query: unknown): Set<string> {
+  const cubes = new Set<string>();
+  const member = (m: unknown) => {
+    if (typeof m === 'string') {
+      cubes.add(m.split('.')[0]);
+    } else if (m && typeof m === 'object' && typeof (m as any).cubeName === 'string') {
+      cubes.add((m as any).cubeName);
+    }
+  };
+  const filter = (f: any) => {
+    if (!f || typeof f !== 'object') {
+      return;
+    }
+    member(f.member ?? f.dimension);
+    (f.and ?? []).forEach(filter);
+    (f.or ?? []).forEach(filter);
+  };
+  const one = (q: any) => {
+    if (!q || typeof q !== 'object') {
+      return;
+    }
+    (Array.isArray(q.measures) ? q.measures : []).forEach(member);
+    (Array.isArray(q.dimensions) ? q.dimensions : []).forEach(member);
+    (Array.isArray(q.segments) ? q.segments : []).forEach(member);
+    (Array.isArray(q.timeDimensions) ? q.timeDimensions : []).forEach((t: any) => member(t?.dimension));
+    (Array.isArray(q.filters) ? q.filters : []).forEach(filter);
+    (Array.isArray(q.joinHints) ? q.joinHints : []).forEach((hint: unknown) => {
+      (Array.isArray(hint) ? hint : [hint]).forEach((c) => typeof c === 'string' && cubes.add(c));
+    });
+    if (Array.isArray(q.order)) {
+      q.order.forEach((o: any) => member(Array.isArray(o) ? o[0] : o?.id));
+    } else if (q.order && typeof q.order === 'object') {
+      Object.keys(q.order).forEach(member);
+    }
+  };
+  (Array.isArray(query) ? query : [query]).forEach(one);
+  return cubes;
+}
+
+/** A request's query, wherever Cube's routes carry it. */
+function queryOf(req: any): unknown {
+  const raw = req?.query?.query ?? req?.body?.query ?? req?.params?.query;
+  if (typeof raw === 'string') {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return undefined;
+    }
+  }
+  return raw;
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -223,12 +333,16 @@ export class XcubeRuntime {
 
   protected readonly models = new Map<string, ModelState>();
 
+  /** Compiled models by app id, shared by the revisions that use them. */
   protected readonly residents = new Map<string, Resident>();
+
+  /** Revisions being activated, active, or replaced but in their grace period. */
+  protected readonly served = new Map<string, ServedRevision>();
 
   protected readonly candidates = new Map<string, Candidate>();
 
-  /** Files of revisions compiled into a core since detached, for the next core. */
-  protected readonly detachedFiles = new Map<string, SnapshotFile[]>();
+  /** What revisions a core served before it was replaced, for the next core. */
+  protected readonly detached = new Map<string, RevisionData>();
 
   /** Models the database was found not to have, until when. */
   protected readonly absent = new Map<string, number>();
@@ -373,7 +487,7 @@ export class XcubeRuntime {
       }
     }
     // What a previous core compiled is either compiled again now, or not needed.
-    this.detachedFiles.clear();
+    this.detached.clear();
     this.readyResolve();
   }
 
@@ -383,9 +497,10 @@ export class XcubeRuntime {
       return;
     }
     this.core = null;
-    for (const resident of this.residents.values()) {
-      this.detachedFiles.set(resident.appId, resident.files);
+    for (const revision of this.served.values()) {
+      this.detached.set(revision.key, revision.data);
     }
+    this.served.clear();
     this.residents.clear();
     for (const state of this.models.values()) {
       state.active = undefined;
@@ -462,7 +577,7 @@ export class XcubeRuntime {
 
   protected resolveUncached(context: any): Served {
     if (context?.xcubeActivate !== undefined) {
-      // Compiling a revision: that revision, or nothing.
+      // Compiling a module: that module, or nothing.
       const resident = this.residents.get(context.xcubeActivate);
       if (!resident) {
         throw new Error('xcube: the revision being compiled is no longer resident');
@@ -484,21 +599,196 @@ export class XcubeRuntime {
       }
       throw forbidden('The security context names no model');
     }
+    const revision = this.revisionFor(context, model);
+    if (!revision) {
+      throw this.notServable(model);
+    }
+    return this.moduleOf(revision, context);
+  }
 
+  /** The revision a context is served: the one it was pinned to while it is kept, else the active one. */
+  protected revisionFor(context: any, model: string): ServedRevision | undefined {
     const pin: Pin | undefined = context?.xcubePin;
     if (pin && pin.model === model) {
-      const resident = this.residents.get(pin.appId);
-      if (resident?.model === model) {
-        return resident;
+      const pinned = this.served.get(pin.appId);
+      if (pinned && pinned.model === model && pinned.state !== 'activating') {
+        return pinned;
       }
       this.warn('xcube: pinned revision retired; answering from the active one', { model, appId: pin.appId });
     }
+    return this.models.get(model)?.active;
+  }
 
-    const active = this.models.get(model)?.active;
-    if (active) {
-      return active;
+  /** The module a context names (extendContext's choice, or the jobs' claim), else the whole model. */
+  protected moduleOf(revision: ServedRevision, context: any): Resident {
+    if (revision.single) {
+      return revision.modules.values().next().value!;
     }
-    throw this.notServable(model);
+    const id = context?.[MODULE_KEY] ?? context?.securityContext?.[MODULE_KEY] ?? context?.authInfo?.[MODULE_KEY];
+    if (typeof id === 'string' && id.startsWith(UNION_PREFIX)) {
+      const union = this.unionOf(revision, id.slice(UNION_PREFIX.length).split('+'));
+      if (union) {
+        union.lastUsed = Date.now();
+        return union;
+      }
+    }
+    const module = typeof id === 'string' ? revision.modules.get(id) : undefined;
+    if (module) {
+      return module;
+    }
+    const whole = this.wholeOf(revision);
+    whole.lastUsed = Date.now();
+    return whole;
+  }
+
+  /**
+   * The modules of a query spanning several, as one model: their files
+   * together (shared cubes once), compiled on first use and kept with the
+   * revision. Two facts joined through a shared cube are answered this way.
+   */
+  protected unionOf(revision: ServedRevision, ids: string[]): Resident | undefined {
+    const parts = ids.map((id) => revision.modules.get(id));
+    if (parts.some((p) => !p) || parts.length < 2) {
+      return undefined;
+    }
+    const key = [...ids].sort().join('+');
+    let union = revision.unions.get(key);
+    if (!union) {
+      const files = new Map<string, SnapshotFile>();
+      parts.forEach((p) => p!.files.forEach((f) => files.set(f.path, f)));
+      const appId = `xcube:${revision.model}:u:${contentHash([...files.values()]).slice(0, 12)}`;
+      union = this.residents.get(appId) ?? {
+        kind: 'revision',
+        appId,
+        model: revision.model,
+        generation: revision.generation,
+        revision: revision.revision,
+        moduleId: `${UNION_PREFIX}${key}`,
+        files: [...files.values()],
+        compiled: false,
+      };
+      this.residents.set(appId, union);
+      revision.unions.set(key, union);
+      if (revision.unions.size > MAX_UNIONS) {
+        const [oldest] = [...revision.unions].sort(([, a], [, b]) => (a.lastUsed ?? 0) - (b.lastUsed ?? 0))[0];
+        revision.unions.delete(oldest);
+        this.retireUnused();
+      }
+      this.log('xcube: compiling a union of modules for a query spanning them', {
+        model: revision.model, revision: revision.revision, modules: ids,
+      });
+    }
+    return union;
+  }
+
+  /** The whole revision as one model, compiled on first use: for contexts no module serves (the SQL API, GraphQL). */
+  protected wholeOf(revision: ServedRevision): Resident {
+    if (!revision.whole) {
+      const appId = `xcube:${revision.model}:all:${revision.contentHash.slice(0, 12)}`;
+      const whole = this.residents.get(appId) ?? {
+        kind: 'revision' as const,
+        appId,
+        model: revision.model,
+        generation: revision.generation,
+        revision: revision.revision,
+        moduleId: 'all',
+        files: revision.data.files,
+        compiled: false,
+      };
+      this.residents.set(appId, whole);
+      revision.whole = whole;
+      this.warn('xcube: a request names no module; compiling the whole model for it', {
+        model: revision.model, revision: revision.revision,
+      });
+    }
+    return revision.whole;
+  }
+
+  /**
+   * The modules to merge `/v1/meta` from: those of the revision a context is
+   * served, when it has several and the context chose none.
+   */
+  public metaModules(context: any): string[] | null {
+    if (!this.serving || context?.xcubeCandidate !== undefined || context?.xcubeActivate !== undefined) {
+      return null;
+    }
+    let model: string | undefined;
+    try {
+      model = this.modelOf(context?.securityContext ?? context?.authInfo);
+    } catch {
+      return null;
+    }
+    const revision = model === undefined ? undefined : this.revisionFor(context, model);
+    if (!revision || revision.single || context?.[MODULE_KEY] !== undefined
+      || context?.securityContext?.[MODULE_KEY] !== undefined) {
+      return null;
+    }
+    return [...revision.modules.keys()].sort();
+  }
+
+  /**
+   * The modules a jobs context builds in: those owning the pre-aggregations
+   * or cubes the selector names, or all of them. `null` when the model isn't
+   * served in modules, or the context already names one.
+   */
+  public jobModules(securityContext: any, selector: { preAggregations?: string[]; cubes?: string[] }): string[] | null {
+    if (!this.serving) {
+      return null;
+    }
+    let model: string | undefined;
+    try {
+      model = this.modelOf(securityContext);
+    } catch {
+      return null;
+    }
+    const revision = model === undefined ? undefined : this.models.get(model)?.active;
+    if (!revision || revision.single || typeof securityContext?.[MODULE_KEY] === 'string') {
+      return null;
+    }
+    const cubes = [
+      ...(Array.isArray(selector.preAggregations) ? selector.preAggregations : []).map((id) => String(id).split('.')[0]),
+      ...(Array.isArray(selector.cubes) ? selector.cubes : []).map(String),
+    ];
+    const owners = [...new Set(cubes.map((c) => revision.owner.get(c)).filter((m): m is string => Boolean(m)))];
+    return owners.length ? owners.sort() : [...revision.modules.keys()].sort();
+  }
+
+  /**
+   * The module holding every cube a query names: its first cube's owner when
+   * that holds them all, else commons, else the smallest that does. None
+   * when no module holds them all (a blending query): the whole model.
+   */
+  public moduleForQuery(revision: ModuleIndex, query: unknown): string | undefined {
+    const cubes = [...cubesOfQuery(query)];
+    if (!cubes.length || revision.single) {
+      return undefined;
+    }
+    let candidates: Set<string> | undefined;
+    for (const cube of cubes) {
+      const holders = revision.holders.get(cube);
+      if (!holders) {
+        // A name no module has: Cube answers it, from the first cube's module.
+        return revision.owner.get(cubes[0]);
+      }
+      candidates = candidates ? new Set([...candidates].filter((m) => holders.has(m))) : new Set(holders);
+    }
+    if (!candidates?.size) {
+      // No one module holds them all: the union of the modules owning them,
+      // when they share a cube (two facts joined through it). Modules sharing
+      // nothing can't be joined: the first cube's module, for Cube to say so.
+      const owners = [...new Set(cubes.map((c) => revision.owner.get(c) ?? [...revision.holders.get(c)!][0]))].sort();
+      const joinable = [...revision.holders.values()].some((holders) => owners.every((o) => holders.has(o)));
+      return owners.length > 1 && joinable ? `${UNION_PREFIX}${owners.join('+')}` : revision.owner.get(cubes[0]);
+    }
+    const first = revision.owner.get(cubes[0]);
+    if (first && candidates.has(first)) {
+      return first;
+    }
+    if (candidates.has(COMMONS)) {
+      return COMMONS;
+    }
+    return [...candidates].sort((a, b) => revision.modules.get(a)!.files.length - revision.modules.get(b)!.files.length
+      || (a < b ? -1 : 1))[0];
   }
 
   protected notServable(model: string): CubejsHandlerError {
@@ -522,7 +812,7 @@ export class XcubeRuntime {
    * after waiting, briefly, for this instance to reach the revision the
    * request asks for at least.
    */
-  public async pinFor(req: any): Promise<{ xcubePin?: Pin }> {
+  public async pinFor(req: any): Promise<{ xcubePin?: Pin; xcubeModule?: string }> {
     const securityContext = req?.securityContext;
     const model = this.modelOf(securityContext);
     const res = req?.res;
@@ -535,21 +825,89 @@ export class XcubeRuntime {
       return {};
     }
 
-    let resident: Resident;
+    let revision: ServedRevision;
     try {
-      resident = await this.servingResident(model, this.revisionOf(securityContext));
+      revision = await this.servingRevision(model, this.revisionOf(securityContext));
     } catch (e: any) {
       if (e instanceof CubejsHandlerError && e.status === 503) {
         setHeader(res, 'Retry-After', '2');
       }
       throw e;
     }
-    setHeader(res, 'x-xcube-revision', `${model}@${resident.revision}`);
-    setHeader(res, 'x-xcube-generation', resident.generation);
-    return { xcubePin: { model, appId: resident.appId } };
+    setHeader(res, 'x-xcube-revision', `${model}@${revision.revision}`);
+    setHeader(res, 'x-xcube-generation', revision.generation);
+    const module = this.moduleForQuery(revision, queryOf(req));
+    if (!revision.single && module?.startsWith(UNION_PREFIX)) {
+      // A union is compiled in the compile lane, not on the request path. (Requests without
+      // a query, such as /v1/meta, are merged per module and never need the whole model.)
+      const resident = this.moduleOf(revision, { [MODULE_KEY]: module });
+      try {
+        await this.ensureCompiled(resident);
+      } catch (e: any) {
+        if (e instanceof LaneBusyError) {
+          setHeader(res, 'Retry-After', String(Math.ceil(e.retryAfterMs / 1000)));
+          throw unavailable('Cube is busy compiling; try again');
+        }
+        throw e;
+      }
+    }
+    return { xcubePin: { model, appId: revision.key }, ...(module ? { [MODULE_KEY]: module } : {}) };
   }
 
-  protected async servingResident(model: string, atLeast?: number): Promise<Resident> {
+  protected readonly compiling = new Map<string, Promise<void>>();
+
+  /** Compiles a resident once, in the compile lane. */
+  protected async ensureCompiled(resident: Resident): Promise<void> {
+    const { core } = this;
+    if (resident.compiled || !core) {
+      return;
+    }
+    let pending = this.compiling.get(resident.appId);
+    if (!pending) {
+      const { modelClaim } = this.servingOptions;
+      const requestId = `xcube-compile-${resident.model}-${resident.moduleId}-${crypto.randomBytes(3).toString('hex')}`;
+      pending = this.lane.run(Priority.Import, async () => {
+        const compilerApi = await core.getCompilerApi({
+          securityContext: { [modelClaim]: resident.model },
+          authInfo: { [modelClaim]: resident.model },
+          requestId,
+          xcubeActivate: resident.appId,
+        });
+        await compilerApi.getCompilers({ requestId });
+        resident.compiled = true;
+      }).finally(() => this.compiling.delete(resident.appId));
+      this.compiling.set(resident.appId, pending);
+    }
+    await pending;
+  }
+
+  /**
+   * A `queryRewrite` in cube.js runs in the module the query was sent to: it
+   * may not add cubes that module doesn't hold.
+   */
+  public checkRewritten(query: unknown, context: any) {
+    const id = context?.[MODULE_KEY];
+    if (typeof id !== 'string' || id.startsWith(UNION_PREFIX)) {
+      return;
+    }
+    let model: string | undefined;
+    try {
+      model = this.modelOf(context?.securityContext ?? context?.authInfo);
+    } catch {
+      return;
+    }
+    const revision = model === undefined ? undefined : this.revisionFor(context, model);
+    if (!revision || revision.single) {
+      return;
+    }
+    const missing = [...cubesOfQuery(query)].filter((c) => !revision.holders.get(c)?.has(id));
+    if (missing.length) {
+      throw new CubejsHandlerError(400, 'User Error',
+        `queryRewrite added ${missing.join(', ')}, which the query's own cubes don't reach; add them through access policies instead`);
+    }
+  }
+
+  protected async servingRevision(model: string, atLeast?: number): Promise<ServedRevision> {
     /** `fresh`: the database was read after the request arrived, so its current revision is known. */
     const satisfied = (fresh: boolean) => {
       const state = this.models.get(model);
@@ -563,7 +921,7 @@ export class XcubeRuntime {
       // A revision the database doesn't have (its schema was recreated since
       // the client heard of it) can't be waited for: answer from the current one.
       if (fresh && state?.target && atLeast > state.target.revision
-        && appIdOf(state.target) === active.appId) {
+        && appIdOf(state.target) === active.key) {
         return active;
       }
       return undefined;
@@ -601,7 +959,11 @@ export class XcubeRuntime {
     throw this.notServable(model);
   }
 
-  /** Background contexts for the refresh scheduler, each pinned to its model's active revision. */
+  /**
+   * Background contexts for the refresh scheduler, each pinned to its model's
+   * active revision; one per module, which the context names, when it has
+   * several.
+   */
   public async refreshContexts(user?: () => any[] | Promise<any[]>): Promise<any[]> {
     await this.ready;
     const { modelClaim, withoutModel } = this.servingOptions;
@@ -615,7 +977,7 @@ export class XcubeRuntime {
       ];
 
     return base.flatMap((entry) => {
-      const { xcubePin: _pin, xcubeCandidate: _candidate, ...context } = entry || {};
+      const { xcubePin: _pin, xcubeCandidate: _candidate, xcubeActivate: _activate, ...context } = entry || {};
       let model: string | undefined;
       try {
         model = this.modelOf(context.securityContext ?? context.authInfo);
@@ -625,27 +987,45 @@ export class XcubeRuntime {
       if (model === undefined) {
         return withoutModel === 'disk' ? [context] : [];
       }
-      const active = this.models.get(model)?.active;
-      return active ? [{ ...context, xcubePin: { model, appId: active.appId } }] : [];
+      const revision = this.models.get(model)?.active;
+      if (!revision) {
+        return [];
+      }
+      const pin = { model, appId: revision.key };
+      const securityContext = context.securityContext ?? context.authInfo ?? {};
+      if (revision.single || typeof securityContext[MODULE_KEY] === 'string') {
+        return [{ ...context, xcubePin: pin }];
+      }
+      return [...revision.modules.keys()].sort().map((id) => ({
+        ...context,
+        securityContext: { ...securityContext, [MODULE_KEY]: id },
+        xcubePin: pin,
+      }));
     });
   }
 
+  /** The module a query is served from, as a context key, when the revision has several. */
+  protected moduleContext(revision: ServedRevision, query: unknown): Record<string, string> {
+    const module = this.moduleForQuery(revision, query);
+    return module ? { [MODULE_KEY]: module } : {};
+  }
+
   /** The revision a background context is served, if any, without throwing. */
-  public residentOf(context: any): Resident | undefined {
+  public revisionOfContext(context: any): ServedRevision | undefined {
     try {
-      const served = this.resolve(context);
-      return served.kind === 'revision' ? served : undefined;
+      const model = this.modelOf(context?.securityContext ?? context?.authInfo);
+      return model === undefined ? undefined : this.revisionFor(context, model);
     } catch {
       return undefined;
     }
   }
 
-  public hold(resident: Resident) {
-    resident.holds++;
+  public hold(revision: ServedRevision) {
+    revision.holds++;
   }
 
-  public release(resident: Resident) {
-    resident.holds = Math.max(0, resident.holds - 1);
+  public release(revision: ServedRevision) {
+    revision.holds = Math.max(0, revision.holds - 1);
   }
 
   // ------------------------------------------------------------ following
@@ -720,7 +1100,7 @@ export class XcubeRuntime {
       const state = this.admit(head.model);
       const appId = appIdOf(head);
       // Only the model's sync chain writes its target; this only asks it to run.
-      if (state && (!state.active || state.active.appId !== appId || !state.target || appIdOf(state.target) !== appId)) {
+      if (state && (!state.active || state.active.key !== appId || !state.target || appIdOf(state.target) !== appId)) {
         if (fromPoll && this.core && state.target && appIdOf(state.target) !== appId) {
           this.warn('xcube: poll found a revision no notification announced', { model: head.model, revision: head.revision });
         }
@@ -815,7 +1195,7 @@ export class XcubeRuntime {
     }
 
     const appId = appIdOf(head);
-    if (state.active?.appId === appId) {
+    if (state.active?.key === appId) {
       return;
     }
     if (state.failed?.appId === appId && Date.now() < state.failed.retryAt) {
@@ -826,17 +1206,76 @@ export class XcubeRuntime {
     }
   }
 
-  protected async filesFor(head: ModelHead): Promise<SnapshotFile[] | null> {
-    const appId = appIdOf(head);
-    const known = this.residents.get(appId)?.files ?? this.detachedFiles.get(appId);
+  /** A revision's files and modules: from what this process holds, else the database. */
+  protected async dataFor(head: ModelHead): Promise<RevisionData | null> {
+    const key = appIdOf(head);
+    const known = this.served.get(key)?.data ?? this.detached.get(key);
     if (known) {
       return known;
     }
-    const files = await this.requireStore().files(head.model, head.revision);
-    if (files && contentHash(files) !== head.contentHash) {
+    const store = this.requireStore();
+    const files = await store.files(head.model, head.revision);
+    if (!files) {
+      return null;
+    }
+    if (contentHash(files) !== head.contentHash) {
       throw new CorruptRevisionError(`revision ${head.revision} of model "${head.model}" does not match its content hash`);
     }
-    return files;
+    const modules = head.mode === 'items' ? await store.modules(head.model, head.revision) : [];
+    return { files, modules };
+  }
+
+  /** How a revision is served: its modules' compiled models, shared with other revisions where unchanged. */
+  protected servedRevision(head: ModelHead, data: RevisionData): ServedRevision {
+    const key = appIdOf(head);
+    const existing = this.served.get(key);
+    if (existing) {
+      return existing;
+    }
+    const resident = (appId: string, moduleId: string, files: SnapshotFile[]): Resident => {
+      const known = this.residents.get(appId);
+      if (known) {
+        return known;
+      }
+      const created: Resident = {
+        kind: 'revision', appId, model: head.model, generation: head.generation, revision: head.revision, moduleId, files, compiled: false,
+      };
+      this.residents.set(appId, created);
+      return created;
+    };
+
+    const modules = new Map<string, Resident>();
+    const holders = new Map<string, Set<string>>();
+    const owner = new Map<string, string>();
+    if (!data.modules.length) {
+      modules.set('all', resident(key, 'all', data.files));
+    } else {
+      const byPath = new Map(data.files.map((f) => [f.path, f]));
+      for (const module of data.modules) {
+        const names = [...module.members, ...module.copies];
+        const files = names.map((n) => byPath.get(`${n}.yml`)).filter((f): f is SnapshotFile => Boolean(f));
+        modules.set(module.id, resident(`xcube:${head.model}:m:${module.id}:${module.version.slice(0, 12)}`, module.id, files));
+        names.forEach((n) => holders.set(n, (holders.get(n) ?? new Set()).add(module.id)));
+        module.members.forEach((n) => owner.set(n, module.id));
+      }
+    }
+    const revision: ServedRevision = {
+      key,
+      model: head.model,
+      generation: head.generation,
+      revision: head.revision,
+      contentHash: head.contentHash,
+      data,
+      modules,
+      holders,
+      owner,
+      single: modules.size === 1,
+      unions: new Map(),
+      state: 'activating',
+      holds: 0,
+    };
+    this.served.set(key, revision);
+    return revision;
   }
 
   /**
@@ -845,9 +1284,9 @@ export class XcubeRuntime {
    * retry: it says nothing about the revision.
    */
   protected async activateHead(head: ModelHead, fallback = false): Promise<boolean> {
-    let files: SnapshotFile[] | null;
+    let data: RevisionData | null;
     try {
-      files = await this.filesFor(head);
+      data = await this.dataFor(head);
     } catch (e: any) {
       if (!(e instanceof CorruptRevisionError)) {
         throw e;
@@ -855,95 +1294,87 @@ export class XcubeRuntime {
       this.recordFailure(this.state(head.model), head, appIdOf(head), e);
       return false;
     }
-    if (!files) {
+    if (!data) {
       return false;
     }
-    return this.activate(head, files, fallback);
+    return this.activate(head, data, fallback);
   }
 
   /**
-   * Compiles one revision, then switches to it if it is still the model's
-   * current revision, or, with `fallback`, if nothing serves the model here.
-   * Runs only in the model's sync chain, one at a time per model.
+   * Compiles every module of a revision that isn't compiled yet (an
+   * unchanged module already is), then switches to the revision if it is
+   * still the model's current one, or, with `fallback`, if nothing serves
+   * the model here. Runs only in the model's sync chain.
    */
-  protected async activate(head: ModelHead, files: SnapshotFile[], fallback = false): Promise<boolean> {
+  protected async activate(head: ModelHead, data: RevisionData, fallback = false): Promise<boolean> {
     const { core } = this;
     if (!core) {
       return false;
     }
     const { model } = head;
     const state = this.state(model);
-    const appId = appIdOf(head);
-    if (state.active?.appId === appId) {
+    const key = appIdOf(head);
+    if (state.active?.key === key) {
       return true;
     }
 
-    let resident = this.residents.get(appId);
-    if (!resident) {
-      resident = {
-        kind: 'revision',
-        appId,
-        model,
-        generation: head.generation,
-        revision: head.revision,
-        contentHash: head.contentHash,
-        files,
-        state: 'activating',
-        holds: 0,
-      };
-      this.residents.set(appId, resident);
-    }
-    const reused = resident.state === 'retiring';
-    resident.retireAfter = undefined;
-    const drop = (r: Resident) => {
+    const revision = this.servedRevision(head, data);
+    const reused = revision.state === 'retiring';
+    revision.retireAfter = undefined;
+    const drop = () => {
       if (reused) {
-        // Still a replaced revision: it retires as it would have.
-        r.retireAfter = Date.now() + this.settings.retireGraceMs;
-      } else if (this.core === core && state.active !== r) {
-        this.residents.delete(r.appId);
-        core.retireAppId(r.appId);
+        revision.retireAfter = Date.now() + this.settings.retireGraceMs;
+      } else if (state.active !== revision) {
+        this.served.delete(key);
+        this.retireUnused();
       }
     };
 
-    const requestId = `xcube-activate-${model}-${head.revision}-${crypto.randomBytes(3).toString('hex')}`;
     const { modelClaim } = this.servingOptions;
-    const context = {
-      securityContext: { [modelClaim]: model },
-      authInfo: { [modelClaim]: model },
-      requestId,
-      xcubeActivate: appId,
-    };
     const started = Date.now();
-
+    let compiled = 0;
     try {
-      await this.lane.run(Priority.Activate, async () => {
-        const compilerApi = await core.getCompilerApi(context);
-        await compilerApi.getCompilers({ requestId });
-      });
+      const toCompile = [...revision.modules].sort(([a], [b]) => (a < b ? -1 : 1))
+        .map(([, resident]) => resident).filter((resident) => !resident.compiled);
+      for (const resident of toCompile) {
+        const requestId = `xcube-activate-${model}-${head.revision}-${resident.moduleId}-${crypto.randomBytes(3).toString('hex')}`;
+        const context = {
+          securityContext: { [modelClaim]: model },
+          authInfo: { [modelClaim]: model },
+          requestId,
+          xcubeActivate: resident.appId,
+        };
+        await this.lane.run(Priority.Activate, async () => {
+          const compilerApi = await core.getCompilerApi(context);
+          await compilerApi.getCompilers({ requestId });
+        });
+        resident.compiled = true;
+        compiled++;
+      }
     } catch (e: any) {
-      drop(resident);
-      this.recordFailure(state, head, appId, e);
+      drop();
+      this.recordFailure(state, head, key, e);
       return false;
     }
 
     if (this.core !== core) {
       return false;
     }
-    const current = state.target !== undefined && appIdOf(state.target) === appId;
+    const current = state.target !== undefined && appIdOf(state.target) === key;
     if (!current && !(fallback && !state.active)) {
       // Superseded while it compiled: the next read switches to the newer one.
-      drop(resident);
+      drop();
       return false;
     }
 
     const previous = state.active;
-    state.active = resident;
-    resident.state = 'active';
-    if (current || state.failed?.appId === appId) {
+    state.active = revision;
+    revision.state = 'active';
+    if (current || state.failed?.appId === key) {
       state.failed = undefined;
     }
-    this.detachedFiles.delete(appId);
-    if (previous && previous !== resident) {
+    this.detached.delete(key);
+    if (previous && previous !== revision) {
       previous.state = 'retiring';
       previous.retireAfter = Date.now() + this.settings.retireGraceMs;
     }
@@ -951,6 +1382,8 @@ export class XcubeRuntime {
       model,
       revision: head.revision,
       previous: previous?.revision ?? null,
+      modules: revision.modules.size,
+      compiledModules: compiled,
       compileMs: Date.now() - started,
     });
     return true;
@@ -995,28 +1428,54 @@ export class XcubeRuntime {
     state.failed = failure;
   }
 
+  /** Replaced revisions leave once their grace period is over and no refresh run holds them. */
   protected retireDue() {
-    const { core } = this;
-    if (!core) {
-      return;
-    }
     const now = Date.now();
-    const due = [...this.residents.values()].filter((resident) => resident.state === 'retiring'
-      && (resident.retireAfter ?? Infinity) <= now
-      && resident.holds === 0
-      && this.models.get(resident.model)?.active !== resident);
-    for (const resident of due) {
-      this.residents.delete(resident.appId);
-      core.retireAppId(resident.appId);
-      this.log('xcube: retired revision', { model: resident.model, revision: resident.revision });
+    const idle = (r?: Resident) => Boolean(r && (r.lastUsed ?? 0) + this.settings.retireGraceMs <= now);
+    for (const revision of this.served.values()) {
+      for (const [key, union] of [...revision.unions]) {
+        if (idle(union)) {
+          revision.unions.delete(key);
+        }
+      }
+      if (revision.whole && idle(revision.whole)) {
+        revision.whole = undefined;
+      }
     }
+    for (const revision of [...this.served.values()]) {
+      if (revision.state === 'retiring' && (revision.retireAfter ?? Infinity) <= now && revision.holds === 0
+        && this.models.get(revision.model)?.active !== revision) {
+        this.served.delete(revision.key);
+      }
+    }
+    this.retireUnused();
     for (const [model, until] of this.absent) {
       if (until <= now) {
         this.absent.delete(model);
       }
     }
-    if (this.residents.size > 100) {
-      this.warn('xcube: many compiled revisions are resident', { residents: this.residents.size });
+    if (this.residents.size > 250) {
+      this.warn('xcube: many compiled models are resident', { residents: this.residents.size });
+    }
+  }
+
+  /** Compiled models no kept revision uses any more leave Cube's compiler cache. */
+  protected retireUnused() {
+    const { core } = this;
+    const used = new Set<string>();
+    for (const revision of this.served.values()) {
+      revision.modules.forEach((r) => used.add(r.appId));
+      revision.unions.forEach((r) => used.add(r.appId));
+      if (revision.whole) {
+        used.add(revision.whole.appId);
+      }
+    }
+    for (const resident of [...this.residents.values()]) {
+      if (!used.has(resident.appId)) {
+        this.residents.delete(resident.appId);
+        core?.retireAppId(resident.appId);
+        this.log('xcube: retired compiled model', { model: resident.model, appId: resident.appId });
+      }
     }
   }
 
@@ -1042,15 +1501,24 @@ export class XcubeRuntime {
       return { revision: state.active?.revision ?? null, state: 'failed', error: state.failed.error };
     }
     if (state?.active) {
-      const current = state.target && appIdOf(state.target) === state.active.appId;
+      const current = state.target && appIdOf(state.target) === state.active.key;
       return { revision: state.active.revision, state: current || !state.target ? 'active' : 'activating' };
     }
     return { revision: null, state: state?.target ? 'activating' : 'none' };
   }
 
-  public async status(model: string): Promise<(ModelStatus & { instance: InstanceModelStatus }) | null> {
-    const status = await this.requireStore().status(model);
-    return status && { ...status, instance: this.instanceStatus(model) };
+  public async status(model: string) {
+    const store = this.requireStore();
+    const status: ModelStatus | null = await store.status(model);
+    if (!status) {
+      return null;
+    }
+    const modules = status.mode === 'items' && status.current
+      ? (await store.modules(model, status.current.revision)).map((m) => ({
+        id: m.id, version: m.version, cubes: m.members.length, copies: m.copies.length,
+      }))
+      : undefined;
+    return { ...status, ...(modules ? { modules } : {}), instance: this.instanceStatus(model) as InstanceModelStatus };
   }
 
   /**
@@ -1108,7 +1576,8 @@ export class XcubeRuntime {
                       securityContext: probeContext,
                       authInfo: probeContext,
                       requestId,
-                      xcubePin: { model, appId: active.appId },
+                      xcubePin: { model, appId: active.key },
+                      ...this.moduleContext(active, probe.query),
                     }),
                     revision: active.revision,
                   }
@@ -1345,9 +1814,12 @@ export class XcubeRuntime {
         ? { status: same.outcome, current: same.current }
         : { status: same.outcome, head: same.head, items: XcubeRuntime.refs(published.items, changed) };
     }
-    const validation = await this.validate(
+    const modules = await this.modulesFor(head, input.tree, published.items);
+    const validation = await this.validateModules(
       model,
+      head,
       files,
+      modules,
       check ? Priority.DryRun : Priority.Import,
       check?.securityContext ?? {},
       check?.probes ?? [],
@@ -1369,12 +1841,105 @@ export class XcubeRuntime {
       itemsHash: hash!,
       source: request.source,
       folders,
+      modules,
     });
     if ('current' in result) {
       return { status: result.outcome, current: result.current };
     }
     this.announced(model, result.outcome);
     return { status: result.outcome, head: result.head, items: XcubeRuntime.refs(published.items, changed) };
+  }
+
+  /**
+   * The modules items compile in: reference-closed groups (see
+   * `groupModules`), keeping the previous revision's ids, each versioned by
+   * the hash of its files.
+   */
+  protected async modulesFor(head: ModelHead | null, tree: FolderTree, items: PublishedItem[]): Promise<StoredModule[]> {
+    const previous = head?.mode === 'items' ? await this.requireStore().modules(head.model, head.revision) : [];
+    const zoneOf = (folderId: string) => {
+      const chain = tree.chain(folderId);
+      return chain.length >= 2 ? chain[chain.length - 2] : ROOT;
+    };
+    const grouped = groupModules(items.map((item) => ({
+      fullName: item.fullName,
+      folderId: item.folderId,
+      kind: item.kind,
+      references: [...new Set(Object.values(item.bindings))].filter((n) => n !== item.fullName),
+    })), zoneOf, previous, this.settings.modules);
+    const byPath = new Map(filesOf(items).map((f) => [f.path, f]));
+    return grouped.map((m) => ({
+      id: m.id,
+      members: m.members,
+      copies: m.copies,
+      version: contentHash([...m.members, ...m.copies].map((n) => byPath.get(`${n}.yml`)!)),
+    }));
+  }
+
+  /**
+   * Checks the modules a publish changes, each compiled on its own as it
+   * will be served; an unchanged module compiled before. Probes run in the
+   * module holding their cubes.
+   */
+  protected async validateModules(
+    model: string,
+    head: ModelHead | null,
+    files: SnapshotFile[],
+    modules: StoredModule[],
+    priority: Priority,
+    securityContext: Record<string, unknown>,
+    probes: Probe[],
+  ): Promise<ValidationResult> {
+    if (modules.length <= 1) {
+      return this.validate(model, files, priority, securityContext, probes);
+    }
+    const byPath = new Map(files.map((f) => [f.path, f]));
+    const filesOfModule = (m: StoredModule) => [...m.members, ...m.copies].map((n) => byPath.get(`${n}.yml`)!);
+    const index: ModuleIndex = { single: false, holders: new Map(), owner: new Map(), modules: new Map() };
+    for (const module of modules) {
+      index.modules.set(module.id, { files: filesOfModule(module) });
+      [...module.members, ...module.copies].forEach((n) => index.holders.set(n, (index.holders.get(n) ?? new Set()).add(module.id)));
+      module.members.forEach((n) => index.owner.set(n, module.id));
+    }
+
+    const previous = new Set((head?.mode === 'items' ? await this.requireStore().modules(head.model, head.revision) : [])
+      .map((m) => m.version));
+    const probesOf = new Map<string, Probe[]>();
+    probes.forEach((probe) => {
+      const chosen = this.moduleForQuery(index, probe.query);
+      // A probe spanning modules is asked of the whole model.
+      const id = chosen && !chosen.startsWith(UNION_PREFIX) ? chosen : '';
+      probesOf.set(id, [...(probesOf.get(id) ?? []), probe]);
+    });
+
+    const checks: { files: SnapshotFile[]; probes: Probe[] }[] = modules
+      .filter((m) => !previous.has(m.version) || probesOf.has(m.id))
+      .map((m) => ({ files: index.modules.get(m.id)!.files, probes: probesOf.get(m.id) ?? [] }));
+    if (probesOf.has('')) {
+      // Probes no module holds are asked of the whole model.
+      checks.push({ files, probes: probesOf.get('')! });
+    }
+
+    const result: ValidationResult = { valid: true, errors: [], cubeMessage: null, probes: [] };
+    const answers = new Map<string, ProbeResult>();
+    const seen = new Set<string>();
+    for (const one of checks) {
+      const validation = await this.validate(model, one.files, priority, securityContext, one.probes);
+      for (const error of validation.errors) {
+        const key = `${error.path}\u0000${error.message}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          result.errors.push(error);
+        }
+      }
+      if (!validation.valid) {
+        result.valid = false;
+        result.cubeMessage = result.cubeMessage ?? validation.cubeMessage;
+      }
+      validation.probes.forEach((p) => answers.set(p.id, p));
+    }
+    result.probes = result.valid ? probes.map((p) => answers.get(p.id)).filter((p): p is ProbeResult => Boolean(p)) : [];
+    return result;
   }
 
   /** The current revision's items: full names, and what each short name they use is bound to. */

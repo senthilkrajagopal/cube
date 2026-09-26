@@ -67,6 +67,7 @@ export function createConfig(
 
   const contextToAppId = (context: any) => runtime.resolve(context).appId;
   RUNTIMES.set(contextToAppId, runtime);
+  const userRewrite = cube.queryRewrite;
 
   return {
     ...cube,
@@ -90,6 +91,15 @@ export function createConfig(
     },
     scheduledRefreshContexts: () => runtime.refreshContexts(cube.scheduledRefreshContexts),
     allowNodeRequire: cube.allowNodeRequire ?? false,
+    // xcube retires compiled models itself; Cube's cache must not evict them first.
+    compilerCacheSize: cube.compilerCacheSize ?? 2000,
+    ...(userRewrite ? {
+      queryRewrite: async (query: any, context: any) => {
+        const rewritten = await userRewrite(query, context);
+        runtime.checkRewritten(rewritten, context);
+        return rewritten;
+      },
+    } : {}),
   };
 }
 
