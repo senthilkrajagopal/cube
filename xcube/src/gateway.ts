@@ -30,6 +30,8 @@ import {
   pageOfTables,
 } from './requests';
 import type { DataSourceDescription, DataSourceIntrospectionApi } from './types';
+import { initAdminRoutes } from './admin/routes';
+import type { XcubeRuntime } from './runtime/runtime';
 
 /** The API scope the introspection routes are in. */
 export const INTROSPECTION_SCOPE = 'introspection';
@@ -65,6 +67,7 @@ export class XcubeApiGateway extends ApiGateway {
     logger: any,
     options: ApiGatewayOptions,
     protected readonly introspectionFor: IntrospectionFactory,
+    protected readonly xcubeRuntime: () => XcubeRuntime | undefined = () => undefined,
   ) {
     super(apiSecret, compilerApi, adapterApi, logger, options);
   }
@@ -73,6 +76,10 @@ export class XcubeApiGateway extends ApiGateway {
     // Before Cube's routes, so that Cube's error middleware, which it adds
     // last, also answers for these.
     this.initIntrospectionRoutes(app);
+    const runtime = this.xcubeRuntime();
+    if (runtime) {
+      initAdminRoutes(app, this.basePath, runtime, (type, params) => this.log({ type, ...params }));
+    }
     super.initApp(app);
   }
 

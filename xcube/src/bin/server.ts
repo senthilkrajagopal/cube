@@ -1,9 +1,13 @@
 #!/usr/bin/env node
 /**
  * Starts Cube as `cubejs server` does (production mode, the configuration
- * and data model from the working directory), with the introspection routes.
+ * and data model from the working directory), with the introspection routes,
+ * and with xcube's runtime when `XCUBE_DATABASE_URL` is set.
  * Pass `--debug` for Cube's debug output.
  */
+import { setGlobalRuntime } from '../config';
+import { XcubeRuntime } from '../runtime/runtime';
+import { settingsFromEnv } from '../runtime/settings';
 import { XcubeServerContainer } from '../server';
 
 /**
@@ -27,6 +31,16 @@ function assertCubeVersion() {
 async function main() {
   assertCubeVersion();
   process.env.NODE_ENV = 'production';
+  // Each compile's transpiler pool; unset, a compile can take gigabytes.
+  process.env.CUBEJS_TRANSPILATION_WORKER_THREADS_COUNT ??= '2';
+
+  const settings = settingsFromEnv();
+  if (settings) {
+    // Before Cube loads cube.js, whose require('xcube').config() needs it.
+    const runtime = new XcubeRuntime(settings);
+    setGlobalRuntime(runtime);
+    await runtime.start();
+  }
 
   const container = new XcubeServerContainer({
     debug: process.argv.includes('--debug'),
