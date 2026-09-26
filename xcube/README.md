@@ -438,6 +438,24 @@ still come from the environment.
 - **A connection's driver can't change** (`409 driver_change`): Cube fixes a
   data source's SQL dialect when it compiles.
 
+**Binding at publish.** In a model with connections, a cube's `data_source`
+names a data source by its short name, and publishing binds it to the
+nearest one, from the cube's folder toward the root, never a sibling's or a
+descendant's.
+- The resolved file holds the full name (`data_source: fsales__warehouse`).
+- A name no folder on the path holds is refused, as is a full name written
+  by hand.
+- A cube naming none gets the nearest `default`, or, when that is the
+  root's, none: Cube's default is the root's. A cube that `extends` another
+  inherits its parent's.
+- As with names, a published cube keeps its binding until it is published
+  again.
+- A connection a published cube uses can't be dropped (`409 in_use`, naming
+  the cubes). For the root's `default`, that is every cube naming none.
+- In a model without connections, `data_source` is left as written.
+- **Introspection** lists a model's connections, so a data source can be
+  browsed before any cube uses it.
+
 ### Admin API
 
 For the client's server alone. The routes are under
@@ -664,8 +682,9 @@ Stores a model's data source:
 
 #### `GET …/connections`, `DELETE …/connections/{name}`
 
-The model's connections (no secrets); dropping one (`204`) makes Cube refuse
-its queries at once.
+The model's connections (no secrets). Dropping one answers `204`, and Cube
+refuses its queries at once; a connection published cubes use can't be
+dropped (`409 in_use`).
 
 #### `GET …/connections/{name}/health`
 

@@ -1287,7 +1287,7 @@ export class XcubeRuntime {
         model: base.model, generation: base.generation, revision: base.revision, contentHash: base.contentHash, mode: 'items',
       };
       const tree = new FolderTree(await this.requireStore().folders(base.model));
-      const applied = this.applyOverlay(tree, await this.itemsAt(head), record, base.data.modules);
+      const applied = this.applyOverlay(tree, await this.itemsAt(head), record, base.data.modules, await this.dataSourcesOf(base.model));
       if ('errors' in applied) {
         this.brokenOverlays.set(key, { id: record.id, errors: applied.errors, cubeMessage: null, at: Date.now() });
         throw brokenOverlay(record.id, applied.errors);
@@ -1362,9 +1362,10 @@ export class XcubeRuntime {
     current: PublishedItem[],
     overlay: { upserts: AuthoredItem[]; deletes: { folderId: string; name: string }[] },
     previous: StoredModule[],
+    dataSources?: { folderId: string; name: string }[],
   ): { items: PublishedItem[]; changed: string[]; files: SnapshotFile[]; modules: StoredModule[] } | { errors: ItemError[] } {
     const published = publish({
-      tree, current, upserts: overlay.upserts, deletes: overlay.deletes, lenientDeletes: true, overlay: true,
+      tree, current, upserts: overlay.upserts, deletes: overlay.deletes, lenientDeletes: true, overlay: true, dataSources,
     });
     if (published.errors.length) {
       return { errors: published.errors };
@@ -1421,7 +1422,7 @@ export class XcubeRuntime {
     const treeHash = folderTreeHash(folders);
     const tree = new FolderTree(folders);
     const current = await this.itemsAt(head);
-    const applied = this.applyOverlay(tree, current, body, await store.modules(model, head.revision));
+    const applied = this.applyOverlay(tree, current, body, await store.modules(model, head.revision), await this.dataSourcesOf(model));
     if ('errors' in applied) {
       return { status: 'invalid', errors: applied.errors, cubeMessage: null };
     }
@@ -1564,7 +1565,40 @@ export class XcubeRuntime {
     return (await this.requireStore().connections(model)).map((c) => XcubeRuntime.connectionView(c));
   }
 
+  /** A model's connections as publishes bind to them (none: `data_source` is left as written). */
+  protected async dataSourcesOf(model: string): Promise<{ folderId: string; name: string }[] | undefined> {
+    const connections = await this.requireStore().connections(model);
+    return connections.length
+      ? connections.map((c) => ({ folderId: c.folderId, name: c.name.includes('__') ? c.name.slice(c.name.indexOf('__') + 2) : c.name }))
+      : undefined;
+  }
+
+  /** The published cubes using a data source: bound to it, or, for the root's `default`, naming none. */
+  protected async usersOf(model: string, name: string): Promise<string[]> {
+    const head = await this.requireStore().head(model);
+    if (!head || head.mode !== 'items') {
+      return [];
+    }
+    const users: string[] = [];
+    for (const item of await this.itemsAt(head)) {
+      if (item.kind === 'cube') {
+        const bound = /^(?: {4}| {2}- )(?:data_source|dataSource): *"?([^"\n]+?)"? *$/m.exec(item.resolvedYaml)?.[1];
+        const extendsOther = /^(?: {4}| {2}- )extends:/m.test(item.resolvedYaml);
+        if (bound === name || (name === 'default' && bound === undefined && !extendsOther)) {
+          users.push(`${item.folderId}/${item.name}`);
+        }
+      }
+    }
+    return users.sort();
+  }
+
   public async deleteConnection(model: string, name: string): Promise<boolean> {
+    const users = await this.usersOf(model, name);
+    if (users.length) {
+      throw new ConnectionError(`Connection "${name}" is used by what is published`, [
+        `${users.slice(0, 20).join(', ')}${users.length > 20 ? `, and ${users.length - 20} more` : ''} use${users.length === 1 ? 's' : ''} it`,
+      ], 'in_use');
+    }
     const dropped = await this.requireStore().deleteConnection(model, name);
     this.persistently('a connection', model, () => this.connections.changed(model, name));
     return dropped;
@@ -2663,7 +2697,7 @@ export class XcubeRuntime {
       throw new FolderTreeError([`Model "${model}" has no folder tree yet: put its folders first`]);
     }
     return this.publishItems(model, head, {
-      tree, current, upserts: changeset.upserts, deletes: changeset.deletes,
+      tree, current, upserts: changeset.upserts, deletes: changeset.deletes, dataSources: await this.dataSourcesOf(model),
     }, changeset, check);
   }
 
@@ -2683,6 +2717,7 @@ export class XcubeRuntime {
       upserts: snapshot.items,
       deletes: [],
       replaceAll: true,
+      dataSources: await this.dataSourcesOf(model),
     }, snapshot, undefined, snapshot.folders) as Promise<ItemsOutcome>;
   }
 

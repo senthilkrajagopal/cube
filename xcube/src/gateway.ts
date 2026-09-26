@@ -586,6 +586,12 @@ export class XcubeApiGateway extends ApiGateway {
     const compilerApi = await this.getCompilerApi(contexts[0] as RequestContext);
     const declared = getEnv('dataSources');
     const names = new Set<string>(declared.length ? declared : ['default']);
+    // A model's connections, browsable before any cube uses them.
+    const runtime = this.xcubeRuntime();
+    const model = runtime?.modelOfContext(context);
+    if (runtime && model) {
+      (await runtime.connections.of(model)).forEach((_c, name) => names.add(name));
+    }
 
     try {
       for (const one of contexts) {

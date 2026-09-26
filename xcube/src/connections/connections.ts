@@ -19,7 +19,7 @@ export class ConnectionError extends Error {
   public constructor(
     message: string,
     public readonly problems: string[] = [],
-    public readonly code: 'invalid_connection' | 'driver_change' = 'invalid_connection',
+    public readonly code: 'invalid_connection' | 'driver_change' | 'in_use' = 'invalid_connection',
   ) {
     super(message);
   }

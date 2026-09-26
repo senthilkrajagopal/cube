@@ -93,6 +93,7 @@ describeWithDatabase('connections: data sources served from sealed credentials',
       devServer: false,
       telemetry: false,
       logger: () => undefined,
+      contextToApiScopes: async (_securityContext: any, defaults: any) => [...defaults, 'introspection'],
     }) as any);
     process.env.NODE_ENV = nodeEnv;
     await runtime.attach(core);
@@ -219,37 +220,72 @@ describeWithDatabase('connections: data sources served from sealed credentials',
     expect(JSON.stringify(res.body)).not.toContain('hunter2');
   });
 
-  test('a connection\'s driver can\'t change; one dropped is refused by Cube at once', async () => {
+  test('a connection\'s driver can\'t change, nor can one published cubes use be dropped', async () => {
     const changed = await admin('put', '/connections/default', {
       folderId: 'froot', driver: 'mysql', authMethod: 'password', fields: { ...target, user: 'x' }, sealed: { password: seal('x', target, 'password', 'mysql') },
     }).expect(409);
     expect(changed.body.code).toBe('driver_change');
 
+    // orders names no data source: it uses the root's default.
+    const used = await admin('delete', '/connections/default').expect(409);
+    expect(used.body).toMatchObject({ code: 'in_use', problems: ['froot/orders uses it'] });
+    const res = await admin('post', '/changesets', { baseRevision: revision, deletes: [{ folderId: 'froot', name: 'orders' }] }).expect(201);
+    revision = res.body.revision;
     await admin('delete', '/connections/default').expect(204);
     await admin('get', '/connections/default/health').expect(404);
-    let answer: any;
-    for (let i = 0; i < 50; i++) {
-      answer = await load();
-      if (answer.status !== 200) {
-        break;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    expect(answer.status).not.toBe(200);
-    expect(answer.body.error).toMatch(/Connection "default" was removed|Data source "default" of model "dev" has no connection/);
   });
 
   test('a dropped connection pushed again serves again, with no restart', async () => {
     await admin('put', '/connections/default', connection(role, 'second-password')).expect(200);
-    let answer: any;
-    for (let i = 0; i < 50; i++) {
-      answer = await load();
-      if (answer.status === 200) {
-        break;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
+    const res = await admin('post', '/changesets', {
+      baseRevision: revision,
+      upserts: [{
+        folderId: 'froot',
+        name: 'orders',
+        kind: 'cube',
+        yaml: `cubes:\n  - name: orders\n    sql_table: ${warehouse}.orders\n    measures:\n      - name: total\n        sql: amount\n        type: sum\n`,
+      }],
+    }).expect(201);
+    revision = res.body.revision;
+    const answer = await load();
     expect({ status: answer.status, error: answer.body.error }).toEqual({ status: 200, error: undefined });
     expect(answer.body.data[0]['orders.total']).toBe('42');
+  });
+
+  test('a cube in a folder names its data source by its short name, bound at publish to the nearest one (AC-273)', async () => {
+    await admin('put', '/folders', { folders: [{ id: 'froot', parentId: null }, { id: 'fa', parentId: 'froot' }] }).expect(200);
+    await admin('put', '/connections/fa__warehouse', { ...connection(role, 'second-password'), folderId: 'fa' }).expect(200);
+    const res = await admin('post', '/changesets', {
+      baseRevision: revision,
+      upserts: [{
+        folderId: 'fa',
+        name: 'sales',
+        kind: 'cube',
+        yaml: `cubes:\n  - name: sales\n    data_source: warehouse\n    sql_table: ${warehouse}.orders\n    measures:\n      - name: total\n        sql: amount\n        type: sum\n`,
+      }],
+    }).expect(201);
+    revision = res.body.revision;
+    const answer = await request(server).get('/cubejs-api/v1/load')
+      .query({ query: JSON.stringify({ measures: ['fa__sales.total'] }) })
+      .set('Authorization', jwt.sign({ wechartModel: 'dev', wechartRevision: revision }, API_SECRET));
+    expect({ status: answer.status, error: answer.body.error }).toEqual({ status: 200, error: undefined });
+    expect(answer.body.data[0]['fa__sales.total']).toBe('42');
+    const health = (await admin('get', '/connections/fa__warehouse/health').expect(200)).body;
+    expect(health.instances[0]).toMatchObject({ state: 'live', current: true });
+
+    const unknown = await admin('post', '/changesets', {
+      baseRevision: revision,
+      upserts: [{ folderId: 'fa', name: 'lost', kind: 'cube', yaml: 'cubes:\n  - name: lost\n    data_source: nowhere\n    sql_table: t\n' }],
+    }).expect(422);
+    expect(unknown.body.errors[0].message).toMatch(/uses the data source "nowhere", which no folder on this item's path holds/);
+
+    // Browsable in introspection, and in use: fa's sales won't let it go.
+    const listed = await request(server).get('/cubejs-api/v1/introspection/data-sources')
+      .set('Authorization', jwt.sign({ wechartModel: 'dev' }, API_SECRET))
+      .expect(200);
+    expect(listed.body.dataSources).toEqual(expect.arrayContaining([
+      { dataSource: 'default', dbType: 'postgres' }, { dataSource: 'fa__warehouse', dbType: 'postgres' },
+    ]));
+    expect((await admin('delete', '/connections/fa__warehouse').expect(409)).body.problems).toEqual(['fa/sales uses it']);
   });
 });

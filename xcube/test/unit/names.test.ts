@@ -567,6 +567,54 @@ describe('overlays', () => {
   });
 });
 
+describe('data sources', () => {
+  // The tree: froot → fsales → feu, and froot → fops.
+  const sources = [
+    { folderId: 'froot', name: 'default' },
+    { folderId: 'fsales', name: 'warehouse' },
+    { folderId: 'fsales', name: 'default' },
+    { folderId: 'fops', name: 'lake' },
+  ];
+  const cubeWith = (folderId: string, name: string, extra = '') => cube(folderId, name, `    sql_table: t\n${extra}    dimensions:\n      - name: id\n        sql: id\n        type: number\n        primary_key: true\n`);
+  const dataSourceOf = (items: PublishedItem[], fullName: string) => doc(byName(items, fullName)).data_source;
+
+  test('a cube\'s data source binds nearest-first from its folder, never to a sibling\'s or a descendant\'s (AC-273)', () => {
+    const { items, errors } = publish({
+      tree,
+      current: [],
+      deletes: [],
+      dataSources: sources,
+      upserts: [cubeWith('feu', 'a', '    data_source: warehouse\n'), cubeWith('froot', 'b', '    data_source: default\n')],
+    });
+    expect(errors).toEqual([]);
+    expect(dataSourceOf(items, 'feu__a')).toBe('fsales__warehouse');
+    expect(dataSourceOf(items, 'b')).toBe('default');
+    const sibling = publish({ tree, current: [], deletes: [], dataSources: sources, upserts: [cubeWith('feu', 'c', '    data_source: lake\n')] });
+    expect(sibling.errors[0].message).toMatch(/uses the data source "lake", which no folder on this item's path holds/);
+    const full = publish({ tree, current: [], deletes: [], dataSources: sources, upserts: [cubeWith('feu', 'c', '    data_source: fsales__warehouse\n')] });
+    expect(full.errors[0].message).toMatch(/is a full name/);
+  });
+
+  test('a cube naming none gets the nearest default; the root\'s is left unwritten; one that extends inherits (AC-310)', () => {
+    const { items, errors } = publish({
+      tree,
+      current: [],
+      deletes: [],
+      dataSources: sources,
+      upserts: [cubeWith('feu', 'a'), cubeWith('fops', 'b'), cube('feu', 'child', '    extends: a\n')],
+    });
+    expect(errors).toEqual([]);
+    expect(dataSourceOf(items, 'feu__a')).toBe('fsales__default');
+    expect(dataSourceOf(items, 'fops__b')).toBeUndefined();
+    expect(dataSourceOf(items, 'feu__child')).toBeUndefined();
+  });
+
+  test('without connections, data_source is left as written', () => {
+    const { items } = publish({ tree, current: [], deletes: [], upserts: [cubeWith('feu', 'a', '    data_source: anything\n')] });
+    expect(dataSourceOf(items, 'feu__a')).toBe('anything');
+  });
+});
+
 describe('titles match Cube\'s own', () => {
   test('for names with digit words, ids and single letters', async () => {
     const names = ['orders', 'order_items', 'sales_2023', 'q3_sales', 'user_id', 'user_ids', 'a2b_c', 'v1', 'x_2_y', 'id', 'kpi_2023_q4'];

@@ -296,7 +296,7 @@ export function initAdminRoutes(
         status = 400;
         body = { error: e.message, code: e.code };
       } else if (e instanceof ConnectionError) {
-        status = e.code === 'driver_change' ? 409 : 400;
+        status = e.code === 'invalid_connection' ? 400 : 409;
         body = { error: e.message, code: e.code, problems: e.problems };
       } else if (e instanceof CredentialError) {
         status = 422;

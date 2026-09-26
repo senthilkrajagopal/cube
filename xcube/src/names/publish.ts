@@ -6,6 +6,7 @@ import yaml from 'js-yaml';
 import type { SnapshotFile } from '../model/snapshot';
 import {
   FolderTree,
+  fullNameOf,
   itemKey,
   parseItem,
   ROOT,
@@ -65,6 +66,12 @@ export interface PublishInput {
    * two may share a short name.
    */
   overlay?: boolean;
+  /**
+   * The model's data sources (connections), by folder and short name: when
+   * given, a cube's `data_source` is bound to one nearest-first from its
+   * folder, and a cube naming none to the nearest `default`.
+   */
+  dataSources?: { folderId: string; name: string }[];
 }
 
 export interface PublishResult {
@@ -207,7 +214,52 @@ function checkAliases(entries: { def: ItemDefinition; doc: Record<string, any>; 
  * other item as it was published (no rebinding), and refuses to remove an
  * item another still refers to.
  */
-export function publish({ tree, current, upserts, deletes, replaceAll, lenientDeletes, overlay }: PublishInput): PublishResult {
+/**
+ * Binds a cube's `data_source` to the full name of the data source it
+ * names, nearest-first from the cube's folder toward the root (never a
+ * descendant's or a sibling's, AC-273); a cube naming none gets the
+ * nearest `default` (AC-310), unless it extends another, whose it inherits.
+ */
+function bindDataSource(
+  def: ItemDefinition,
+  doc: Record<string, any>,
+  tree: FolderTree,
+  dataSources: { folderId: string; name: string }[],
+): ItemError | undefined {
+  const at = { folderId: def.folderId, name: def.name };
+  const byFolder = new Map<string, Set<string>>();
+  dataSources.forEach(({ folderId, name }) => byFolder.set(folderId, (byFolder.get(folderId) ?? new Set()).add(name)));
+  const nearest = (name: string) => {
+    const folder = tree.chain(def.folderId).find((f) => byFolder.get(f)?.has(name));
+    return folder === undefined ? undefined : fullNameOf(folder, name);
+  };
+  const key = ['data_source', 'dataSource'].find((k) => doc[k] !== undefined);
+  if (key) {
+    const named = doc[key];
+    if (typeof named !== 'string' || !named) {
+      return { ...at, kind: 'reference', message: 'data_source must name a data source' };
+    }
+    if (named.includes('__')) {
+      return { ...at, kind: 'reference', message: `"${named}" is a full name; name the data source by its short name` };
+    }
+    const bound = nearest(named);
+    if (!bound) {
+      return { ...at, kind: 'reference', message: `It uses the data source "${named}", which no folder on this item's path holds` };
+    }
+    doc[key] = bound;
+  } else if (!def.extendsName) {
+    const bound = nearest('default');
+    // The root's default is Cube's default: nothing to write.
+    if (bound && bound !== 'default') {
+      doc.data_source = bound;
+    }
+  }
+  return undefined;
+}
+
+export function publish({
+  tree, current, upserts, deletes, replaceAll, lenientDeletes, overlay, dataSources,
+}: PublishInput): PublishResult {
   const errors: ItemError[] = [];
 
   for (const item of [...upserts, ...deletes]) {
@@ -298,6 +350,12 @@ export function publish({ tree, current, upserts, deletes, replaceAll, lenientDe
     const def = defs.get(key)!;
     const { doc, bindings, errors: rewriteErrors } = rewriteReferences(def, scope);
     errors.push(...rewriteErrors);
+    if (dataSources && def.kind === 'cube') {
+      const dataSourceError = bindDataSource(def, doc, tree, dataSources);
+      if (dataSourceError) {
+        errors.push(dataSourceError);
+      }
+    }
     finish(def, doc);
     resolvedDocs.set(key, doc);
     newBindings.set(key, bindings);
