@@ -31,13 +31,20 @@ function keyDir(n = 1) {
 describe('credential sealing, scheme v1', () => {
   test('the binding: driver, field and the target keys sorted, as strings, from the values as sent', () => {
     expect(secretAadV1('postgres', 'password', target).toString()).toBe(
-      '["wechart/data-source-secret/v1","postgres","password",[["host","db.example.com"],["port","5432"]]]',
+      '["wechart/data-source-secret/v1","postgres","password",[["host","db.example.com"],["port","5432"],["ssl",""],["sslCa",""],["sslRejectUnauthorized",""]]]',
+    );
+    // TLS settings are bound as the host is (wechart's decision): turning verification off needs the secret again.
+    expect(secretAadV1('mysql', 'password', { host: 'h', port: 3306, ssl: true, sslRejectUnauthorized: false, sslCa: 'PEM' }).toString()).toBe(
+      '["wechart/data-source-secret/v1","mysql","password",[["host","h"],["port","3306"],["ssl","true"],["sslCa","PEM"],["sslRejectUnauthorized","false"]]]',
+    );
+    expect(secretAadV1('mssql', 'password', { host: 'h', encrypt: true }).toString()).toBe(
+      '["wechart/data-source-secret/v1","mssql","password",[["encrypt","true"],["host","h"],["port",""],["trustServerCertificate",""]]]',
     );
     expect(secretAadV1('oracle', 'password', { host: 'h' }).toString()).toBe(
       '["wechart/data-source-secret/v1","oracle","password",[["connectString",""],["database",""],["host","h"],["port",""]]]',
     );
     expect(secretAadV1('dremio', 'token', { url: 'https://api.dremio.cloud/v0/projects/p' }).toString()).toBe(
-      '["wechart/data-source-secret/v1","dremio","token",[["host",""],["port",""],["url","https://api.dremio.cloud/v0/projects/p"]]]',
+      '["wechart/data-source-secret/v1","dremio","token",[["host",""],["port",""],["ssl",""],["url","https://api.dremio.cloud/v0/projects/p"]]]',
     );
   });
 

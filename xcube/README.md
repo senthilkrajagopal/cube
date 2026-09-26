@@ -355,16 +355,20 @@ xcube's credential key, so the client stores them and can't open them.
 
 | Driver | Auth methods | Target (what a secret is bound to) |
 | --- | --- | --- |
-| `postgres` | `password`, `client-certificate` | host, port |
-| `redshift` | `password` (Cube's driver takes IAM from its environment only) | host, port |
-| `mysql` | `password`, `client-certificate` | host, port |
+| `postgres` | `password`, `client-certificate` | host, port, ssl, sslRejectUnauthorized, sslCa |
+| `redshift` | `password` (Cube's driver takes IAM from its environment only) | host, port, ssl, sslRejectUnauthorized, sslCa |
+| `mysql` | `password`, `client-certificate` | host, port, ssl, sslRejectUnauthorized, sslCa |
 | `snowflake` | `key-pair`, `oauth`, `password` | account, region, warehouse |
 | `bigquery` | `service-account` | projectId |
-| `mssql` | `sql-login`, `ntlm`, `entra-service-principal` | host, port |
+| `mssql` | `sql-login`, `ntlm`, `entra-service-principal` | host, port, encrypt, trustServerCertificate |
 | `oracle` | `password` | connectString, database, host, port |
-| `dremio` | `token`, `password` (Software only) | host, port, url |
+| `dremio` | `token`, `password` (Software only) | host, port, url, ssl |
 
-The fields of each are in `src/connections/drivers.ts`. xcube builds each
+A target includes how the driver checks the server, so a secret must be
+entered again to turn verification off, as to change the host. Snowflake,
+BigQuery and Oracle have no such setting: the first two always verify, and
+Oracle's is in its `connectString`. The fields of each are in
+`src/connections/drivers.ts`. xcube builds each
 driver's config itself and sets every key, so nothing of Cube's own
 `CUBEJS_DB_*` or libpq (`PG*`) environment reaches a connection:
 - no host, user, password, token or credentials file;

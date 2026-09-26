@@ -27,8 +27,8 @@ export interface DriverSpec {
   connection: FieldSpec[];
   auth: Record<string, FieldSpec[]>;
   /**
-   * The fields that say where it connects: what a sealed secret is bound to
-   * (scheme v1: frozen per driver, `credentials.ts`).
+   * The fields that say where it connects and how it checks the server: what
+   * a sealed secret is bound to (scheme v1: frozen per driver, `credentials.ts`).
    */
   target: string[];
   /** Cube's driver config from the connection's fields and opened secrets. */
@@ -66,6 +66,13 @@ function tls(fields: Fields, secrets: Record<string, string>, clientCert: boolea
   };
 }
 
+/**
+ * TLS settings a secret is sealed to, as its host is: changing one needs the
+ * secret entered again, so an editor can't turn verification off and leave
+ * the password usable against an attacker in between (wechart's decision).
+ */
+const TLS_TARGET = ['ssl', 'sslRejectUnauthorized', 'sslCa'];
+
 const tlsFields = [
   text('ssl', { kind: 'boolean' }),
   text('sslRejectUnauthorized', { kind: 'boolean' }),
@@ -87,7 +94,7 @@ export const DRIVERS: Record<DriverType, DriverSpec> = {
       password: [text('user', { required: true }), secret('password')],
       'client-certificate': clientCertificate,
     },
-    target: ['host', 'port'],
+    target: ['host', 'port', ...TLS_TARGET],
     config: (f, auth, s) => ({
       host: str(f.host),
       port: num(f.port, 5432),
@@ -103,7 +110,7 @@ export const DRIVERS: Record<DriverType, DriverSpec> = {
     connection: [text('host', { required: true }), text('port', { kind: 'number' }), text('database', { required: true }), ...tlsFields],
     // Cube's Redshift driver reads IAM authentication from its environment only: a password here.
     auth: { password: [text('user', { required: true }), secret('password')] },
-    target: ['host', 'port'],
+    target: ['host', 'port', ...TLS_TARGET],
     config: (f, _auth, s) => ({
       host: str(f.host),
       port: num(f.port, 5439),
@@ -122,7 +129,7 @@ export const DRIVERS: Record<DriverType, DriverSpec> = {
       password: [text('user', { required: true }), secret('password')],
       'client-certificate': clientCertificate,
     },
-    target: ['host', 'port'],
+    target: ['host', 'port', ...TLS_TARGET],
     config: (f, auth, s) => {
       const ssl = tls(f, s, auth === 'client-certificate', false);
       return {
@@ -211,7 +218,7 @@ export const DRIVERS: Record<DriverType, DriverSpec> = {
       ntlm: [text('domain', { required: true }), text('user', { required: true }), secret('password')],
       'entra-service-principal': [text('tenantId', { required: true }), text('clientId', { required: true }), secret('clientSecret')],
     },
-    target: ['host', 'port'],
+    target: ['host', 'port', 'encrypt', 'trustServerCertificate'],
     config: (f, auth, s) => ({
       server: str(f.host),
       port: num(f.port, 1433),
@@ -260,7 +267,7 @@ export const DRIVERS: Record<DriverType, DriverSpec> = {
       token: [secret('token')],
       password: [text('user', { required: true }), secret('password')],
     },
-    target: ['host', 'port', 'url'],
+    target: ['host', 'port', 'url', 'ssl'],
     config: (f, auth, s) => {
       const url = str(f.url);
       if (!url && !str(f.host)) {

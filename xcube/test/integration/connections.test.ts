@@ -127,6 +127,17 @@ describeWithDatabase('connections: data sources served from sealed credentials',
     sealed: { password: seal(password) },
     revisions: { password: `rev-${user}` },
   });
+  // An instance reports a connection's state in the background: wait for the report `until` accepts.
+  const reported = async (name: string, until: (instance: any) => boolean) => {
+    for (let i = 0; i < 100; i++) {
+      const health = (await admin('get', `/connections/${name}/health`).expect(200)).body;
+      if (health.instances[0] && until(health.instances[0])) {
+        return health;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return (await admin('get', `/connections/${name}/health`).expect(200)).body;
+  };
   let revision = 0;
   const load = () => request(server).get('/cubejs-api/v1/load')
     .query({ query: JSON.stringify({ measures: ['orders.total'] }) })
@@ -149,6 +160,11 @@ describeWithDatabase('connections: data sources served from sealed credentials',
       ...connection(url.username, 'x'), sealed: { password: seal('x', { ...target, host: 'elsewhere.example.com' }) },
     }).expect(422);
     expect(moved.body).toMatchObject({ code: 'invalid_secret' });
+    // Verification turned off, the stored secret kept: it no longer opens (TLS settings are bound).
+    const unverified = await admin('put', '/connections/other', {
+      ...connection(url.username, 'x'), fields: { ...target, user: url.username, ssl: true, sslRejectUnauthorized: false },
+    }).expect(422);
+    expect(unverified.body).toMatchObject({ code: 'invalid_secret' });
     const wrong = await admin('put', '/connections/other', { ...connection(url.username, 'x'), fields: { ...target, password: 'plain' } }).expect(400);
     expect(wrong.body.problems).toContain('password is a secret: send it sealed, never in the fields');
     await admin('put', '/connections/fnope__other', { ...connection(url.username, 'x'), folderId: 'fnope' }).expect(400);
@@ -171,22 +187,15 @@ describeWithDatabase('connections: data sources served from sealed credentials',
     revision = res.body.revision;
     const answer = await load().expect(200);
     expect(answer.body.data[0]['orders.total']).toBe('42');
-    const health = await admin('get', '/connections/default/health').expect(200);
-    expect(health.body.instances).toEqual([expect.objectContaining({ instance: runtime.instanceId, state: 'live', current: true })]);
+    const health = await reported('default', (i) => i.state === 'live');
+    expect(health.instances).toEqual([expect.objectContaining({ instance: runtime.instanceId, state: 'live', current: true })]);
   });
 
   test('a changed connection is swapped in while Cube runs, with no restart', async () => {
     const before = (await admin('get', '/connections/default/health').expect(200)).body.version;
     const res = await admin('put', '/connections/default', connection(role, 'second-password')).expect(200);
     expect(res.body.version).toBeGreaterThan(before);
-    for (let i = 0; i < 50; i++) {
-      const health = (await admin('get', '/connections/default/health')).body;
-      if (health.instances[0]?.version === res.body.version) {
-        break;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    const health = (await admin('get', '/connections/default/health').expect(200)).body;
+    const health = await reported('default', (i) => i.version === res.body.version);
     expect(health.instances[0]).toMatchObject({ version: res.body.version, state: 'live', current: true });
     expect((await load().expect(200)).body.data[0]['orders.total']).toBe('42');
   });
@@ -270,7 +279,7 @@ describeWithDatabase('connections: data sources served from sealed credentials',
       .set('Authorization', jwt.sign({ wechartModel: 'dev', wechartRevision: revision }, API_SECRET));
     expect({ status: answer.status, error: answer.body.error }).toEqual({ status: 200, error: undefined });
     expect(answer.body.data[0]['fa__sales.total']).toBe('42');
-    const health = (await admin('get', '/connections/fa__warehouse/health').expect(200)).body;
+    const health = await reported('fa__warehouse', (i) => i.state === 'live');
     expect(health.instances[0]).toMatchObject({ state: 'live', current: true });
 
     const unknown = await admin('post', '/changesets', {
