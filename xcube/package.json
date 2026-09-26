@@ -1,13 +1,13 @@
 {
-  "name": "cube-introspection",
+  "name": "xcube",
   "version": "1.7.45-1",
-  "description": "Data source introspection and cube scaffolding API for Cube, as a package over an unmodified Cube",
+  "description": "xcube: the runtime side of the wechart integration, as a package over an unmodified Cube",
   "license": "Apache-2.0",
   "private": true,
   "main": "dist/src/index.js",
   "typings": "dist/src/index.d.ts",
   "bin": {
-    "cube-introspection-server": "dist/src/bin/server.js"
+    "xcube-server": "dist/src/bin/server.js"
   },
   "files": [
     "dist/src",

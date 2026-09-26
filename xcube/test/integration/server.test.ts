@@ -11,16 +11,16 @@ import jwt from 'jsonwebtoken';
 import request from 'supertest';
 import { DuckDBDriver } from '@cubejs-backend/duckdb-driver';
 
-import { IntrospectionServerCore } from '../../src';
+import { XcubeServerCore } from '../../src';
 
 jest.setTimeout(60 * 1000);
 
 const API_SECRET = 'server-test-secret';
 
-describe('IntrospectionServerCore', () => {
+describe('XcubeServerCore', () => {
   let modelDir: string;
   let driver: DuckDBDriver;
-  let core: IntrospectionServerCore;
+  let core: XcubeServerCore;
   let app: express.Application;
 
   // As wechart grants it: introspection alone, to the token that asks for it.
@@ -29,7 +29,7 @@ describe('IntrospectionServerCore', () => {
   const base = '/cubejs-api/v1/introspection/data-sources/default';
 
   beforeAll(async () => {
-    modelDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cube-introspection-'));
+    modelDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xcube-'));
     fs.mkdirSync(path.join(modelDir, 'cubes'));
     fs.writeFileSync(path.join(modelDir, 'cubes', 'existing.yml'), [
       'cubes:',
@@ -54,10 +54,11 @@ describe('IntrospectionServerCore', () => {
     const nodeEnv = process.env.NODE_ENV;
     process.env.NODE_ENV = 'production';
     process.env.CUBEJS_DB_TYPE = 'duckdb';
-    core = new IntrospectionServerCore({
+    core = new XcubeServerCore({
       apiSecret: API_SECRET,
       driverFactory: () => driver,
-      schemaPath: modelDir,
+      // Cube joins schemaPath onto the working directory (FileRepository).
+      schemaPath: path.relative(process.cwd(), modelDir),
       cacheAndQueueDriver: 'memory',
       devServer: false,
       telemetry: false,
@@ -128,6 +129,12 @@ describe('IntrospectionServerCore', () => {
     ]);
     expect(res.body.cubes[0].content).toContain('type: sum');
     expect(res.body.cubes[0].content).toContain('relationship: many_to_one');
+  });
+
+  test('serves its data model', async () => {
+    const res = await get('/cubejs-api/v1/meta', userToken).expect(200);
+
+    expect(res.body.cubes.map(c => c.name)).toEqual(['existing']);
   });
 
   test('keeps the introspection scope to the introspection routes', async () => {

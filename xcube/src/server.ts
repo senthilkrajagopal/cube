@@ -8,14 +8,14 @@ import type { ApiGatewayOptions } from '@cubejs-backend/api-gateway';
 import type { DriverFactoryByDataSource } from '@cubejs-backend/query-orchestrator';
 
 import { CatalogQueues } from './catalog/queue';
-import { IntrospectionApiGateway } from './gateway';
+import { XcubeApiGateway } from './gateway';
 import { DataSourceIntrospection } from './introspection';
 
 /**
  * Cube's server core, serving the introspection routes with its API gateway.
  * Everything else is Cube's own.
  */
-export class IntrospectionServerCore extends CubejsServerCore {
+export class XcubeServerCore extends CubejsServerCore {
   /** Each orchestrator API's driver factory, as Cube built it. */
   protected readonly driverFactories = new WeakMap<OrchestratorApi, DriverFactoryByDataSource>();
 
@@ -33,8 +33,8 @@ export class IntrospectionServerCore extends CubejsServerCore {
     getOrchestratorApi: (context: any) => Promise<any>,
     logger: any,
     options: ApiGatewayOptions,
-  ): IntrospectionApiGateway {
-    return new IntrospectionApiGateway(
+  ): XcubeApiGateway {
+    return new XcubeApiGateway(
       apiSecret,
       getCompilerApi,
       getOrchestratorApi,
@@ -66,9 +66,9 @@ export class IntrospectionServerCore extends CubejsServerCore {
   }
 }
 
-export class IntrospectionServer extends CubejsServer {
+export class XcubeServer extends CubejsServer {
   protected createCoreInstance(config: any, systemOptions?: any): CubejsServerCore {
-    return new IntrospectionServerCore(config, systemOptions);
+    return new XcubeServerCore(config, systemOptions);
   }
 }
 
@@ -76,8 +76,8 @@ export class IntrospectionServer extends CubejsServer {
  * Cube's server container, as `cubejs server` runs it, with the introspection
  * server in place of Cube's.
  */
-export class IntrospectionServerContainer extends ServerContainer {
+export class XcubeServerContainer extends ServerContainer {
   protected createServer(config: any, systemOptions?: any): CubejsServer {
-    return new IntrospectionServer(config, systemOptions);
+    return new XcubeServer(config, systemOptions);
   }
 }

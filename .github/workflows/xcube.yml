@@ -1,0 +1,111 @@
+# xcube: the Cube-side package of the wechart integration (xcube/). It lives
+# only in this fork; upstream has no such file, so pulls never conflict with it.
+# Builds and tests the package and its image; publishing the image waits on the
+# registry decision in the integration plan.
+name: xcube
+
+on:
+  push:
+    paths:
+      - 'xcube/**'
+      - '.github/workflows/xcube.yml'
+  pull_request:
+    paths:
+      - 'xcube/**'
+      - '.github/workflows/xcube.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xcube-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test"
+          --health-interval 5s
+          --health-retries 20
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_DATABASE: test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -uroot -ptest --silent"
+          --health-interval 5s
+          --health-retries 30
+      trino:
+        image: trinodb/trino:476
+        ports:
+          - 8080:8080
+        options: >-
+          --health-cmd "trino --execute 'SELECT 1'"
+          --health-interval 10s
+          --health-retries 30
+    defaults:
+      run:
+        working-directory: xcube
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: xcube/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - name: Test, with the live-database suites
+        run: npm test
+        env:
+          INTROSPECTION_TEST_POSTGRES: 127.0.0.1:5432
+          INTROSPECTION_TEST_MYSQL: 127.0.0.1:3306
+          INTROSPECTION_TEST_TRINO: 127.0.0.1:8080
+          # The Trino client sends the OS user as the Trino user.
+          USER: presto
+
+  image:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build
+        uses: docker/build-push-action@v7
+        with:
+          context: xcube
+          load: true
+          push: false
+          tags: xcube:ci
+      - name: Boots as Cube does, as the non-root user Helm runs it as
+        run: |
+          docker run -d --name xcube-ci --user 1000 \
+            -e CUBEJS_DB_TYPE=postgres -e CUBEJS_DB_HOST=127.0.0.1 \
+            -e CUBEJS_API_SECRET=ci -e CUBEJS_DEV_MODE=false \
+            -e CUBEJS_CACHE_AND_QUEUE_DRIVER=memory -e CUBEJS_TELEMETRY=false \
+            xcube:ci
+          for _ in $(seq 1 60); do
+            if docker logs xcube-ci 2>&1 | grep -q "is listening on"; then
+              docker logs xcube-ci 2>&1 | tail -3
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs xcube-ci
+          exit 1

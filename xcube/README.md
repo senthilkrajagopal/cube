@@ -1,9 +1,14 @@
-# cube-introspection
+# xcube
 
-A data source introspection and cube scaffolding API for Cube, as a package
-over an unmodified Cube. It browses a data source's schemas, tables and
-columns and generates cubes from its tables, as Superset and Metabase do when
-creating a dataset.
+The Cube side of the wechart integration, as a package over an unmodified
+Cube. It runs inside every Cube instance and the refresh worker and does only
+what needs Cube's runtime or code; wechart remains the system of record. The
+shared plan (ownership, names, modules, contract, slices) is the
+"wechart ↔ Cube integration plan" doc.
+
+Today it serves the data source introspection API: it browses a data
+source's schemas, tables and columns and generates cubes from its tables, as
+Superset and Metabase do when creating a dataset.
 
 ## How it plugs into Cube
 
@@ -29,7 +34,7 @@ The `Dockerfile` builds Cube's published image with the package added and
 started in place of `cubejs server`:
 
 ```sh
-docker build -t cube:v1.7.45-introspection .
+docker build -t xcube:v1.7.45-$(git rev-parse --short=10 HEAD) .
 ```
 
 It takes the same configuration, environment and mounts as `cubejs/cube`

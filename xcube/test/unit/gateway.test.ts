@@ -5,7 +5,7 @@ import request from 'supertest';
 
 import { CubejsHandlerError } from '@cubejs-backend/api-gateway';
 
-import { DataSourceIntrospectionApi, DataSourceTable, IntrospectionApiGateway } from '../../src';
+import { DataSourceIntrospectionApi, DataSourceTable, XcubeApiGateway } from '../../src';
 import { generateAuthToken } from './utils';
 
 const API_SECRET = 'secret';
@@ -61,7 +61,7 @@ async function createGateway(
   // As Cube's own gateway tests: outside production, Cube lets an invalid token through.
   const nodeEnv = process.env.NODE_ENV;
   process.env.NODE_ENV = 'production';
-  const apiGateway = new IntrospectionApiGateway(
+  const apiGateway = new XcubeApiGateway(
     API_SECRET,
     async () => compilerApi,
     async () => orchestratorApi,
@@ -126,7 +126,7 @@ describe('Data source introspection API', () => {
     });
 
     test('is not among the default scopes', async () => {
-      const apiGateway = new IntrospectionApiGateway(API_SECRET, async () => ({}), async () => ({}), () => undefined, {
+      const apiGateway = new XcubeApiGateway(API_SECRET, async () => ({}), async () => ({}), () => undefined, {
         standalone: true, dataSourceStorage: {}, basePath: '/cubejs-api', refreshScheduler: {},
       }, jest.fn());
 

@@ -57,7 +57,7 @@ function asyncHandler(handler: Handler): RequestHandler {
  * `{basePath}/v1/introspection/data-sources`, in the `introspection` API
  * scope. Every other route is Cube's own, unchanged.
  */
-export class IntrospectionApiGateway extends ApiGateway {
+export class XcubeApiGateway extends ApiGateway {
   public constructor(
     apiSecret: string,
     compilerApi: (ctx: RequestContext) => Promise<any>,

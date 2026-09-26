@@ -4,7 +4,7 @@
  * and data model from the working directory), with the introspection routes.
  * Pass `--debug` for Cube's debug output.
  */
-import { IntrospectionServerContainer } from '../server';
+import { XcubeServerContainer } from '../server';
 
 /**
  * The package extends Cube through protected methods that can change in any
@@ -18,7 +18,7 @@ function assertCubeVersion() {
 
   if (version !== expected) {
     throw new Error(
-      `cube-introspection is built for Cube ${expected}, but this is Cube ${version}. ` +
+      `xcube is built for Cube ${expected}, but this is Cube ${version}. ` +
       'Build the package against this version of Cube.'
     );
   }
@@ -28,7 +28,7 @@ async function main() {
   assertCubeVersion();
   process.env.NODE_ENV = 'production';
 
-  const container = new IntrospectionServerContainer({
+  const container = new XcubeServerContainer({
     debug: process.argv.includes('--debug'),
   });
   await container.runProjectDiagnostics();

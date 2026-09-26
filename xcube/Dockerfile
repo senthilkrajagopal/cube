@@ -1,10 +1,10 @@
-# Cube's published image with the introspection package added. Cube itself is
+# Cube's published image with the xcube package added. Cube itself is
 # unchanged: the package is laid beside Cube's own packages, so it uses the very
 # modules the image runs, and the image starts it instead of `cubejs server`.
 #
 # Build from this directory:
 #
-#   docker build -t cube:v1.7.45-introspection .
+#   docker build -t xcube:v1.7.45-$(git rev-parse --short=10 HEAD) .
 #
 # CUBE_VERSION must be the version the package's peerDependencies name; the
 # server refuses to start on any other.
@@ -25,7 +25,7 @@ RUN npm run build
 
 FROM cubejs/cube:${CUBE_VERSION}
 
-COPY --from=build /package/dist/src /cube/node_modules/cube-introspection/dist/src
-COPY package.json NOTICE README.md /cube/node_modules/cube-introspection/
+COPY --from=build /package/dist/src /cube/node_modules/xcube/dist/src
+COPY package.json NOTICE README.md /cube/node_modules/xcube/
 
-CMD ["node", "/cube/node_modules/cube-introspection/dist/src/bin/server.js"]
+CMD ["node", "/cube/node_modules/xcube/dist/src/bin/server.js"]
