@@ -1,8 +1,9 @@
 # xcube: the Cube-side package of the wechart integration (xcube/). It lives
 # only in this fork; upstream has no such file, so pulls never conflict with it.
 # Builds and tests the package and its image, which boots both with
-# introspection only and serving models from xcube's schema; publishing the
-# image waits on the registry decision in the integration plan.
+# introspection only and serving models from xcube's schema. Each push to
+# feat/xcube that passes publishes the image, for amd64 and arm64, to
+# ghcr.io/<owner>/xcube as v<cube version>-<commit>.
 name: xcube
 
 on:
@@ -85,6 +86,9 @@ jobs:
     needs: test
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
     services:
       postgres:
         image: postgres:18-alpine
@@ -126,3 +130,43 @@ jobs:
           exit 1
       - name: Serves models from xcube's schema, imported through its admin API
         run: xcube/test/image/serving.sh xcube:ci
+      - name: Tags to publish
+        id: tags
+        if: github.event_name == 'push' && github.ref == 'refs/heads/feat/xcube'
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/xcube"
+          cube="$(node -p "require('./xcube/package.json').peerDependencies['@cubejs-backend/server-core']")"
+          {
+            echo "tags<<EOF"
+            echo "$image:v$cube-${GITHUB_SHA::10}"
+            echo "$image:v$cube-feat-xcube"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Log in to the GitHub Container Registry
+        if: steps.tags.outputs.tags
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish, for amd64 and arm64
+        id: publish
+        if: steps.tags.outputs.tags
+        uses: docker/build-push-action@v7
+        with:
+          context: xcube
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+      - name: Name what was published
+        if: steps.tags.outputs.tags
+        env:
+          TAGS: ${{ steps.tags.outputs.tags }}
+          DIGEST: ${{ steps.publish.outputs.digest }}
+        run: |
+          {
+            echo "Published $DIGEST, tagged:"
+            echo '```'
+            echo "$TAGS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

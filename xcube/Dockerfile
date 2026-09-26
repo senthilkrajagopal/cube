@@ -11,7 +11,9 @@
 
 ARG CUBE_VERSION=v1.7.45
 
-FROM node:24.21.0-trixie-slim AS build
+# The build only compiles TypeScript, so it runs once, on the builder's own
+# platform; the image for each platform is Cube's with the output copied in.
+FROM --platform=$BUILDPLATFORM node:24.21.0-trixie-slim AS build
 
 WORKDIR /package
 
@@ -24,6 +26,10 @@ COPY src src
 RUN npm run build
 
 FROM cubejs/cube:${CUBE_VERSION}
+
+LABEL org.opencontainers.image.source="https://github.com/senthilkrajagopal/cube" \
+      org.opencontainers.image.description="Cube with the xcube package: models served from xcube's schema, and data source introspection" \
+      org.opencontainers.image.licenses="Apache-2.0"
 
 COPY --from=build /package/dist/src /cube/node_modules/xcube/dist/src
 COPY package.json NOTICE README.md /cube/node_modules/xcube/
