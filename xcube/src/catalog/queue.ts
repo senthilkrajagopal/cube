@@ -44,6 +44,17 @@ export function runCatalogOperation(driver: BaseDriver, { operation, params }: C
 }
 
 /**
+ * Reads `QueryCache`'s protected `cachePrefix` from a subclass, so the
+ * compiler checks it against Cube's declarations on every upgrade. It is
+ * never instantiated.
+ */
+class QueryCacheInternals extends QueryCache {
+  public static prefixOf(queryCache: QueryCache): string {
+    return (queryCache as QueryCacheInternals).cachePrefix;
+  }
+}
+
+/**
  * A queue per data source for catalog reads, beside the one Cube keeps for
  * its queries and with that queue's driver, concurrency and wait timeout. A
  * read waits there like a query: the same read asked for twice runs once,
@@ -121,7 +132,7 @@ export class CatalogQueues {
     const { options } = queryCache;
     const queueOptions = options.queueOptions ? await options.queueOptions(dataSource) : {};
     // `cachePrefix` tells apart the orchestrators of different apps.
-    const cachePrefix = (queryCache as any).cachePrefix || 'STANDALONE';
+    const cachePrefix = QueryCacheInternals.prefixOf(queryCache) || 'STANDALONE';
 
     return QueryCache.createQueue(
       `INTROSPECTION_${cachePrefix}_${dataSource}`,

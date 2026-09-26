@@ -23,27 +23,27 @@ class TestDriver extends BaseDriver {
     return undefined;
   }
 
-  public readOnly() {
+  public override readOnly() {
     return true;
   }
 }
 
 class PostgresDriver extends TestDriver {
-  public param(index: number) {
+  public override param(index: number) {
     return `$${index + 1}`;
   }
 
-  protected foreignKeysQuery(): string | null {
+  protected override foreignKeysQuery(): string | null {
     return 'upstream postgres foreign keys';
   }
 }
 
 class RedshiftDriver extends PostgresDriver {
-  protected foreignKeysQuery(): string | null {
+  protected override foreignKeysQuery(): string | null {
     return null;
   }
 
-  public async getTablesForSpecificSchemas(schemas: { schema_name: string }[]) {
+  public override async getTablesForSpecificSchemas(schemas: { schema_name: string }[]) {
     const tables: any[] = await super.getTablesForSpecificSchemas(schemas);
     tables.push({ schema_name: 'spectrum', table_name: 'events' });
     return tables;
@@ -51,7 +51,7 @@ class RedshiftDriver extends PostgresDriver {
 }
 
 class ClickHouseDriver extends TestDriver {
-  protected getTablesForSpecificSchemasQuery() {
+  protected override getTablesForSpecificSchemasQuery() {
     return 'upstream clickhouse tables';
   }
 }
@@ -66,7 +66,7 @@ class PrestoDriver extends TestDriver {
 }
 
 class DatabricksDriver extends TestDriver {
-  public async getTablesForSpecificSchemas() {
+  public override async getTablesForSpecificSchemas() {
     return [{ schema_name: 'upstream', table_name: 'upstream' }];
   }
 
@@ -85,22 +85,22 @@ class BigQueryDriver extends TestDriver {
     }),
   };
 
-  public async getTablesQuery() {
+  public override async getTablesQuery() {
     return [{ table_name: 'upstream' }];
   }
 
   // As upstream's: without the type.
-  public async getTablesForSpecificSchemas(schemas: { schema_name: string }[]) {
+  public override async getTablesForSpecificSchemas(schemas: { schema_name: string }[]) {
     return schemas.map(({ schema_name }) => ({ schema_name, table_name: 'upstream' }));
   }
 }
 
 class MySqlDriver extends TestDriver {
-  protected primaryKeysQuery(): string | null {
+  protected override primaryKeysQuery(): string | null {
     return 'upstream mysql primary keys';
   }
 
-  protected foreignKeysQuery(): string | null {
+  protected override foreignKeysQuery(): string | null {
     return 'upstream mysql foreign keys';
   }
 }

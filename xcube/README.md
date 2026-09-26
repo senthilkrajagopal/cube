@@ -132,7 +132,11 @@ In both modes:
    `config()` refuses them. `extendContext` and `scheduledRefreshContexts`
    are combined with xcube's. `contextToGroups` defaults to the security
    context's `groups`, and never yields the folder gate's reserved group.
-   `allowNodeRequire` defaults to `false`.
+   `allowNodeRequire` defaults to `false`, and `compilerCacheSize` to 2000.
+   The query and pre-aggregation queues beat every 8 seconds unless
+   `orchestratorOptions` sets their `heartBeatInterval`. Cube releases a query
+   or build whose instance misses four, so a crashed instance's work is taken
+   up in about 30 seconds, not Cube's 2 minutes.
 3. **Run every Cube process from this image**, API instances and the refresh
    worker alike, with `XCUBE_DATABASE_URL` set. A process with the database
    set whose `cube.js` doesn't use `config()` refuses to start.
@@ -367,9 +371,10 @@ driver's config itself and sets every key, so nothing of Cube's own
 - no export bucket, whose AWS keys Redshift would send to the host;
 - no IAM or ambient Google credentials.
 
-The image's CI check builds every driver under a poisoned environment and
-fails on any of it (`test/image/drivers-env.js`). Pool sizes and timeouts
-still come from the environment.
+The image's CI check builds every driver under a poisoned environment
+(`test/image/drivers-env.js`). It fails on any poisoned value in a driver,
+and on any of the connection's own fields or secrets that doesn't reach it.
+Pool sizes and timeouts still come from the environment.
 - **Empty secrets are refused:** a driver would fill them from its environment.
 - **BigQuery takes only a service-account key.** It is rebuilt from its
   plain fields, as Google's other credential types read files or call URLs of
@@ -972,10 +977,28 @@ Postgres, imports a snapshot and queries it; CI runs it on every build.
 
 ## Moving to another Cube version
 
+xcube relies on parts of Cube that a release can change. Each has a check
+that fails when it changes:
+
+| What | Checked by |
+| --- | --- |
+| Every hook xcube overrides (server core, gateway, compiler API, server) | The typecheck: each is marked `override` (`noImplicitOverride`) |
+| Protected members xcube reads (`compilerCache`, `QueryCache`'s `cachePrefix`) | The typecheck: each is read from a subclass, never through a cast |
+| Deep imports (`CubePropContextTranspiler`, `transform-meta-extended`, `Python3Lexer`) | The typecheck |
+| One Cube version everywhere: `peerDependencies`, `devDependencies`, what is installed, the `Dockerfile` | `test/unit/cube-contract.test.ts` |
+| The environment variable names behind `getEnv` keys xcube sets or reads | `test/unit/cube-contract.test.ts` |
+| The text of Cube's compile errors, which xcube places by file and line | `test/unit/errors.test.ts`, on a live compile |
+| The queue options Cube builds, with xcube's heartbeat | `test/unit/config.test.ts`, through Cube's own `OptsHandler` |
+| Each driver's option names: every connection field reaches the driver, and no `CUBEJS_DB_*` or `PG*` value does | `test/image/drivers-env.js`, in the image (CI) |
+| Policies, routing, overlays, connections and refresh, end to end | The integration tests and `test/image/serving.sh` |
+
+To move:
+
 1. Set the new version in `peerDependencies`, `devDependencies` and the
    `Dockerfile`'s `CUBE_VERSION`, and `npm install`.
-2. Run `npm run typecheck` and `npm test`: a protected method Cube changed
-   fails there.
+2. Run `npm run typecheck` and `npm test` with the integration databases
+   (see Development), then build the image and run `test/image/serving.sh`
+   and `test/image/drivers-env.js` in it.
 3. Compare `src/scaffolding` with the new version's
    `packages/cubejs-schema-compiler/src/scaffolding`, and the queries in
    `src/catalog/views.ts` with the drivers', and carry over what changed.

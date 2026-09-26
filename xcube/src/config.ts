@@ -35,6 +35,35 @@ export function modelSchema(base: string, model: string): string {
   return `${base.slice(0, 29)}_${model.replace(/[^a-z0-9_]/g, '_').slice(0, 20)}_${hash}`;
 }
 
+/**
+ * Seconds between the heartbeats of a running query or rollup build. Cube
+ * releases one whose instance stopped beating after four missed, so a
+ * crashed instance's work is picked up in about 30 s, not Cube's 2 minutes.
+ */
+export const QUEUE_HEART_BEAT_S = 8;
+
+/** A queue's options, `cube.js`'s own first, with xcube's heartbeat where it sets none. */
+function withHeartBeat(queueOptions: unknown) {
+  return (dataSource: string) => {
+    const options = (typeof queueOptions === 'function' ? queueOptions(dataSource) : queueOptions) || {};
+    // Cube reads these synchronously: a promise is passed on, as Cube would take it.
+    return typeof options.then === 'function' ? options : { heartBeatInterval: QUEUE_HEART_BEAT_S, ...options };
+  };
+}
+
+/** `cube.js`'s orchestrator options, with xcube's defaults for both queues. */
+export function orchestratorDefaults(options: Record<string, any> | null | undefined): Record<string, any> {
+  const given = options || {};
+  return {
+    ...given,
+    queryCacheOptions: { ...given.queryCacheOptions, queueOptions: withHeartBeat(given.queryCacheOptions?.queueOptions) },
+    preAggregationsOptions: {
+      ...given.preAggregationsOptions,
+      queueOptions: withHeartBeat(given.preAggregationsOptions?.queueOptions),
+    },
+  };
+}
+
 /** Cube options xcube sets itself; cube.js must not. */
 const OWNED = ['contextToAppId', 'repositoryFactory', 'schemaVersion'] as const;
 
@@ -165,6 +194,9 @@ export function createConfig(
     allowNodeRequire: cube.allowNodeRequire ?? false,
     // xcube retires compiled models itself; Cube's cache must not evict them first.
     compilerCacheSize: cube.compilerCacheSize ?? 2000,
+    orchestratorOptions: async (context: any) => orchestratorDefaults(
+      typeof cube.orchestratorOptions === 'function' ? await cube.orchestratorOptions(context) : cube.orchestratorOptions,
+    ),
     // The SQL API's contexts obey the rules HS256 tokens do: no role, and no model that has keys.
     ...(cube.checkSqlAuth ? {
       checkSqlAuth: async (req: any, user: string | null, password: string | null) => {

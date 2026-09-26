@@ -21,7 +21,7 @@ class SlowDriver extends BaseDriver {
     return undefined;
   }
 
-  public readOnly() {
+  public override readOnly() {
     return true;
   }
 }

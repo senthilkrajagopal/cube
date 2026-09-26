@@ -1,6 +1,6 @@
 {
   "name": "xcube",
-  "version": "1.7.45-5",
+  "version": "1.7.45-6",
   "description": "xcube: the runtime side of the wechart integration, as a package over an unmodified Cube",
   "license": "Apache-2.0",
   "private": true,

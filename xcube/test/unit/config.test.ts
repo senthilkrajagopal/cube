@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import cloneDeep from 'lodash/cloneDeep';
 
 import { config, createConfig, runtimeOf, setGlobalRuntime, XcubeRuntime, XcubeServerCore } from '../../src';
+import { orchestratorDefaults, QUEUE_HEART_BEAT_S } from '../../src/config';
 import type { XcubeSettings } from '../../src';
 
 const settings: XcubeSettings = {
@@ -115,6 +116,47 @@ describe('config', () => {
     } finally {
       process.env.NODE_ENV = nodeEnv;
       delete process.env.CUBEJS_DB_TYPE;
+    }
+  });
+
+  test('the queues beat every few seconds, unless cube.js says otherwise', async () => {
+    const own = orchestratorDefaults({
+      redisPrefix: 'p',
+      queryCacheOptions: { backgroundRenew: true, queueOptions: (ds: string) => ({ concurrency: ds === 'a' ? 1 : 2 }) },
+      preAggregationsOptions: { queueOptions: { heartBeatInterval: 20 } },
+    });
+    expect(own.redisPrefix).toBe('p');
+    expect(own.queryCacheOptions.backgroundRenew).toBe(true);
+    expect(own.queryCacheOptions.queueOptions('a')).toEqual({ heartBeatInterval: QUEUE_HEART_BEAT_S, concurrency: 1 });
+    expect(own.preAggregationsOptions.queueOptions('a')).toEqual({ heartBeatInterval: 20 });
+    expect(orchestratorDefaults(undefined).queryCacheOptions.queueOptions('a')).toEqual({ heartBeatInterval: QUEUE_HEART_BEAT_S });
+  });
+
+  test('Cube\'s queues take the heartbeat', async () => {
+    // Widens what Cube keeps protected, to read the options it builds a queue with.
+    class TestCore extends XcubeServerCore {
+      public async queueOptions(context: any, kind: 'queryCacheOptions' | 'preAggregationsOptions') {
+        const options = this.optsHandler.getOrchestratorInitializedOptions(context, (await this.orchestratorOptions(context)) || {});
+        return options[kind]!.queueOptions!('default');
+      }
+    }
+    const nodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      const options = createConfig(runtime(), {}, {
+        apiSecret: 'secret',
+        devServer: false,
+        telemetry: false,
+        logger: () => undefined,
+        driverFactory: () => ({ type: 'postgres' }),
+        orchestratorOptions: () => ({ queryCacheOptions: { queueOptions: { concurrency: 3 } }, preAggregationsOptions: { queueOptions: { concurrency: 1 } } }),
+      });
+      const core = new TestCore(options as any);
+      const context = { securityContext: {}, requestId: 'r' };
+      expect(await core.queueOptions(context, 'queryCacheOptions')).toMatchObject({ concurrency: 3, heartBeatInterval: QUEUE_HEART_BEAT_S });
+      expect(await core.queueOptions(context, 'preAggregationsOptions')).toMatchObject({ concurrency: 1, heartBeatInterval: QUEUE_HEART_BEAT_S });
+    } finally {
+      process.env.NODE_ENV = nodeEnv;
     }
   });
 });

@@ -115,7 +115,7 @@ export class XcubeApiGateway extends ApiGateway {
     super(apiSecret, compilerApi, adapterApi, logger, options);
   }
 
-  public initApp(app: ExpressApplication) {
+  public override initApp(app: ExpressApplication) {
     // Before Cube's routes, so that Cube's error middleware, which it adds
     // last, also answers for these.
     this.initIntrospectionRoutes(app);
@@ -181,7 +181,7 @@ export class XcubeApiGateway extends ApiGateway {
   }
 
   /** `/v1/meta` of a model served in modules: every module's own answer, merged. */
-  public async meta(args: Parameters<ApiGateway['meta']>[0]) {
+  public override async meta(args: Parameters<ApiGateway['meta']>[0]) {
     const modules = this.xcubeRuntime()?.metaModules(args.context);
     if (!modules) {
       return super.meta(args);
@@ -189,7 +189,7 @@ export class XcubeApiGateway extends ApiGateway {
     return this.mergedMeta(modules, args.context, args.res, (context, res) => super.meta({ ...args, context, res }));
   }
 
-  public async metaExtended(args: Parameters<ApiGateway['metaExtended']>[0]) {
+  public override async metaExtended(args: Parameters<ApiGateway['metaExtended']>[0]) {
     const modules = this.xcubeRuntime()?.metaModules(args.context);
     if (!modules) {
       return super.metaExtended(args);
@@ -290,7 +290,7 @@ export class XcubeApiGateway extends ApiGateway {
    * A context xcube's verifier built is granted by its role: the service
    * credential jobs and introspection alone, a user never those or GraphQL.
    */
-  protected createContextToApiScopesFn(options: ApiGatewayOptions): ContextToApiScopesFn {
+  protected override createContextToApiScopesFn(options: ApiGatewayOptions): ContextToApiScopesFn {
     const { contextToApiScopes } = options;
     const cubes: ContextToApiScopesFn = contextToApiScopes
       ? async (securityContext, defaultApiScopes) => {
@@ -334,7 +334,7 @@ export class XcubeApiGateway extends ApiGateway {
    * are verified by xcube, others go to Cube's (read per request, as Cube
    * builds this before the runtime is set on the gateway).
    */
-  protected createCheckAuthFn(options: ApiGatewayOptions) {
+  protected override createCheckAuthFn(options: ApiGatewayOptions) {
     const cubes = super.createCheckAuthFn(options);
     return async (req: any, authorization?: string) => {
       const runtime = this.xcubeRuntime?.();
@@ -350,7 +350,7 @@ export class XcubeApiGateway extends ApiGateway {
    * Cube's log, but a token it refused is logged as a fingerprint: a
    * token carries groups and is good until it expires.
    */
-  public log(event: { type: string, [key: string]: any }, context?: Partial<RequestContext>) {
+  public override log(event: { type: string, [key: string]: any }, context?: Partial<RequestContext>) {
     if (typeof event?.token === 'string' && event.token) {
       const fingerprint = crypto.createHash('sha256').update(event.token, 'utf8').digest('hex').slice(0, 16);
       return super.log({ ...event, token: `sha256:${fingerprint}` }, context);

@@ -34,7 +34,7 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
     return runtimeOf(this.options) ?? globalRuntime();
   }
 
-  protected createOrchestratorApi(getDriver: DriverFactoryByDataSource, options: OrchestratorApiOptions): OrchestratorApi {
+  protected override createOrchestratorApi(getDriver: DriverFactoryByDataSource, options: OrchestratorApiOptions): OrchestratorApi {
     // xcube's connection drivers this orchestrator was given, released with it. Not through
     // Cube's seen data sources: /livez would then test every model's connections.
     const connections = new Set<any>();
@@ -60,7 +60,7 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
    * A model's connection gets xcube's stable driver, built from the
    * connection's own config and secrets; any other data source, Cube's.
    */
-  public async resolveDriver(context: any, options?: any): Promise<any> {
+  public override async resolveDriver(context: any, options?: any): Promise<any> {
     const runtime = this.xcube;
     const model = runtime?.serving ? runtime.modelOfContext(context) : undefined;
     if (runtime && model) {
@@ -84,7 +84,7 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
    * model reads the permissions of the model it was compiled for, afresh on
    * every check.
    */
-  protected createCompilerApi(repository: any, options: Record<string, any> = {}) {
+  protected override createCompilerApi(repository: any, options: Record<string, any> = {}) {
     const runtime = this.xcube;
     if (!runtime?.serving) {
       return super.createCompilerApi(repository, options);
@@ -97,7 +97,7 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
     );
   }
 
-  protected createApiGatewayInstance(
+  protected override createApiGatewayInstance(
     apiSecret: string,
     getCompilerApi: (context: any) => Promise<any>,
     getOrchestratorApi: (context: any) => Promise<any>,
@@ -153,7 +153,7 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
   }
 
   /** A refresh run keeps the compiled model it started with, so its revision stays compiled until it ends. */
-  public async runScheduledRefresh(context: any, queryingOptions?: any) {
+  public override async runScheduledRefresh(context: any, queryingOptions?: any) {
     const revision = context && this.xcube?.serving ? this.xcube.revisionOfContext(context) : undefined;
     if (!revision) {
       return super.runScheduledRefresh(context, queryingOptions);
@@ -168,7 +168,7 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
 }
 
 export class XcubeServer extends CubejsServer {
-  protected createCoreInstance(config: any, systemOptions?: any): CubejsServerCore {
+  protected override createCoreInstance(config: any, systemOptions?: any): CubejsServerCore {
     return new XcubeServerCore(config, systemOptions);
   }
 
@@ -177,12 +177,12 @@ export class XcubeServer extends CubejsServer {
   }
 
   /** Compiles every model's current revision before Cube listens, so it is never ready on a cold model. */
-  public async listen(options: http.ServerOptions = {}) {
+  public override async listen(options: http.ServerOptions = {}) {
     await this.xcubeCore.xcube?.attach(this.xcubeCore);
     return super.listen(options);
   }
 
-  public async shutdown(signal: string, graceful: boolean = true) {
+  public override async shutdown(signal: string, graceful: boolean = true) {
     const runtime = this.xcubeCore.xcube;
     // After Cube has drained its requests, which are served until then.
     const code = await super.shutdown(signal, graceful);
@@ -200,7 +200,7 @@ export class XcubeServer extends CubejsServer {
  * in place of Cube's.
  */
 export class XcubeServerContainer extends ServerContainer {
-  protected createServer(config: any, systemOptions?: any): CubejsServer {
+  protected override createServer(config: any, systemOptions?: any): CubejsServer {
     return new XcubeServer(config, systemOptions);
   }
 }
