@@ -1,6 +1,7 @@
 import path from 'path';
 import { FileRepository } from '@cubejs-backend/server-core';
-import { getEnv } from '@cubejs-backend/shared';
+import crypto from 'crypto';
+import { assertDataSource, getEnv } from '@cubejs-backend/shared';
 
 import { XcubeRuntime, type ServingOptions } from './runtime/runtime';
 import { GATE_GROUP } from './security/marker';
@@ -22,6 +23,16 @@ export interface XcubeConfigOptions {
    * `xcubeOverlay`.
    */
   overlayClaim?: string;
+}
+
+/**
+ * A model's own pre-aggregation schema: `<base>_<model>_<hash>`, the hash of
+ * the model id as it is, so two models never share one (`a-b` and `a_b`),
+ * within Postgres's 63 bytes.
+ */
+export function modelSchema(base: string, model: string): string {
+  const hash = crypto.createHash('sha256').update(model).digest('hex').slice(0, 12);
+  return `${base.slice(0, 29)}_${model.replace(/[^a-z0-9_]/g, '_').slice(0, 20)}_${hash}`;
 }
 
 /** Cube options xcube sets itself; cube.js must not. */
@@ -106,6 +117,51 @@ export function createConfig(
       return { ...rest, ...await runtime.pinFor(req) };
     },
     scheduledRefreshContexts: () => runtime.refreshContexts(cube.scheduledRefreshContexts),
+    // A model with connections has data sources of its own: its own
+    // orchestrator (drivers, queues, caches). Every model has its own
+    // pre-aggregation schema, fixed whatever its connections, as a compiled
+    // model keeps the schema it was compiled with.
+    contextToOrchestratorId: async (context: any) => {
+      const base = cube.contextToOrchestratorId ? await cube.contextToOrchestratorId(context) : 'STANDALONE';
+      const model = runtime.modelOfContext(context);
+      return model && (await runtime.connections.of(model)).size ? `${base}_${model}` : base;
+    },
+    preAggregationsSchema: async (context: any) => {
+      const configured = typeof cube.preAggregationsSchema === 'function'
+        ? await cube.preAggregationsSchema(context)
+        : cube.preAggregationsSchema;
+      const base = configured
+        ?? getEnv('preAggregationsSchema')
+        ?? ((cube.devServer ?? getEnv('devMode')) ? 'dev_pre_aggregations' : 'prod_pre_aggregations');
+      const model = runtime.modelOfContext(context);
+      return model ? modelSchema(base, model) : base;
+    },
+    // A model's connection names its driver type; any other data source is
+    // cube.js's, or Cube's from its environment. Only `{ type }`: xcube hands
+    // Cube the driver itself (XcubeServerCore.resolveDriver).
+    driverFactory: async (context: any) => {
+      const model = runtime.modelOfContext(context);
+      const connections = model ? await runtime.connections.of(model) : undefined;
+      const dataSource = context?.dataSource ?? 'default';
+      const type = connections ? await runtime.connections.typeOf(model!, dataSource) : undefined;
+      if (type) {
+        return { type };
+      }
+      if (connections?.size && dataSource !== 'default') {
+        // A model with connections reads its own data sources: only its default may be Cube's.
+        throw new Error(`Data source "${dataSource}" of model "${model}" has no connection`);
+      }
+      if (cube.driverFactory) {
+        return cube.driverFactory(context);
+      }
+      const envType = getEnv('dbType', { dataSource: assertDataSource(dataSource), preAggregations: context?.preAggregations });
+      if (!envType) {
+        throw new Error(model
+          ? `Data source "${dataSource}" of model "${model}" has no connection, and Cube's environment names none`
+          : `Data source "${dataSource}" has no CUBEJS_DB_TYPE`);
+      }
+      return { type: envType };
+    },
     allowNodeRequire: cube.allowNodeRequire ?? false,
     // xcube retires compiled models itself; Cube's cache must not evict them first.
     compilerCacheSize: cube.compilerCacheSize ?? 2000,

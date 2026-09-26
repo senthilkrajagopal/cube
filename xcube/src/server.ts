@@ -35,9 +35,48 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
   }
 
   protected createOrchestratorApi(getDriver: DriverFactoryByDataSource, options: OrchestratorApiOptions): OrchestratorApi {
-    const orchestratorApi = super.createOrchestratorApi(getDriver, options);
-    this.driverFactories.set(orchestratorApi, getDriver);
+    // xcube's connection drivers this orchestrator was given, released with it. Not through
+    // Cube's seen data sources: /livez would then test every model's connections.
+    const connections = new Set<any>();
+    const tracked: DriverFactoryByDataSource = async (dataSource, preAggregations) => {
+      const driver: any = await getDriver(dataSource, preAggregations);
+      if (driver?.__xcubeConnection) {
+        connections.add(driver);
+      }
+      return driver;
+    };
+    const orchestratorApi = super.createOrchestratorApi(tracked, options);
+    const release = orchestratorApi.release.bind(orchestratorApi);
+    orchestratorApi.release = async () => {
+      const released = await release();
+      await Promise.all([...connections].map((driver) => Promise.resolve(driver.release()).catch(() => undefined)));
+      return released;
+    };
+    this.driverFactories.set(orchestratorApi, tracked);
     return orchestratorApi;
+  }
+
+  /**
+   * A model's connection gets xcube's stable driver, built from the
+   * connection's own config and secrets; any other data source, Cube's.
+   */
+  public async resolveDriver(context: any, options?: any): Promise<any> {
+    const runtime = this.xcube;
+    const model = runtime?.serving ? runtime.modelOfContext(context) : undefined;
+    if (runtime && model) {
+      const dataSource = context.dataSource ?? 'default';
+      const driver = await runtime.connections.driverFor(model, dataSource, {
+        preAggregations: Boolean(context.preAggregations),
+        maxPoolSize: await CubejsServerCore.getDriverMaxPool(context, options),
+      });
+      if (driver) {
+        return driver;
+      }
+      if (dataSource !== 'default' && (await runtime.connections.of(model)).size) {
+        throw new Error(`Data source "${dataSource}" of model "${model}" has no connection`);
+      }
+    }
+    return super.resolveDriver(context, options);
   }
 
   /**

@@ -154,6 +154,9 @@ In both modes:
 | `XCUBE_MAX_OVERLAYS` | `1000` | The most overlays one model holds |
 | `XCUBE_OVERLAY_IDLE_MS` | `600000` | How long an overlay's compiled modules stay once no query uses them |
 | `XCUBE_MAX_ACTIVE_OVERLAYS` | `50` | The most overlays kept compiled on one instance; the least recently used makes room |
+| `XCUBE_CREDENTIAL_KEY_IDS` | unset | The credential keys to load, comma-separated kids (see Connections). Unset, connections can't be used |
+| `XCUBE_CREDENTIAL_ACTIVE_KID` | the only kid | The key re-wrap seals to; required when there are several |
+| `XCUBE_CREDENTIAL_KEY_DIR` | `/run/secrets/xcube-credential-keys` | Where `<kid>.pem` and `<kid>.check` are (a mounted Secret) |
 | `XCUBE_ADMIN_TOKENS` | unset | Static bearer tokens the admin routes also accept, comma-separated, each at least 32 characters and none equal to `CUBEJS_API_SECRET`: for bootstrap and development. With neither these nor service keys, the admin routes are off (the refresh worker) |
 | `XCUBE_MIGRATE` | `true` | `false` only checks the schema is up to date |
 | `XCUBE_POLL_INTERVAL_MS` | `60000` | How often each model's current revision is re-read |
@@ -336,6 +339,104 @@ query previews when its token names it.
   theirs: their previews read the source. The rest keep their built rollups.
 - **Everything else applies:** the folder gate by each item's folder, `/v1/meta`
   merged across the overlay's modules, unions for queries spanning modules.
+
+### Connections
+
+A model's data sources are pushed to xcube as **connections**, and served to
+Cube without a restart. Their secrets are sealed by the client's browser to
+xcube's credential key, so the client stores them and can't open them.
+
+**Drivers.** `postgres`, `redshift`, `mysql`, `snowflake`, `bigquery`, `mssql`,
+`oracle` and `dremio`, through Cube's own drivers:
+
+| Driver | Auth methods | Target (what a secret is bound to) |
+| --- | --- | --- |
+| `postgres` | `password`, `client-certificate` | host, port |
+| `redshift` | `password` (Cube's driver takes IAM from its environment only) | host, port |
+| `mysql` | `password`, `client-certificate` | host, port |
+| `snowflake` | `key-pair`, `oauth`, `password` | account, region, warehouse |
+| `bigquery` | `service-account` | projectId |
+| `mssql` | `sql-login`, `ntlm`, `entra-service-principal` | host, port |
+| `oracle` | `password` | connectString, database, host, port |
+| `dremio` | `token`, `password` (Software only) | host, port, url |
+
+The fields of each are in `src/connections/drivers.ts`. xcube builds each
+driver's config itself and sets every key, so nothing of Cube's own
+`CUBEJS_DB_*` or libpq (`PG*`) environment reaches a connection:
+- no host, user, password, token or credentials file;
+- no export bucket, whose AWS keys Redshift would send to the host;
+- no IAM or ambient Google credentials.
+
+The image's CI check builds every driver under a poisoned environment and
+fails on any of it (`test/image/drivers-env.js`). Pool sizes and timeouts
+still come from the environment.
+- **Empty secrets are refused:** a driver would fill them from its environment.
+- **BigQuery takes only a service-account key.** It is rebuilt from its
+  plain fields, as Google's other credential types read files or call URLs of
+  their own.
+- **BigQuery's constructor checks `CUBEJS_DB_EXPORT_BUCKET_TYPE`** against
+  its own types. An environment naming, say, `s3` stops BigQuery connections
+  from building.
+
+**Credential keys.**
+- **The key.** xcube holds X25519 private keys, one file per key in
+  `XCUBE_CREDENTIAL_KEY_DIR`: `<kid>.pem` and `<kid>.check`, its sample
+  credential. The kid is the key's RFC 7638 thumbprint.
+- **At start** each key must be X25519, match its kid, and open its sample,
+  or xcube doesn't start. Mount the Secret into every Cube process: API
+  instances and the refresh worker.
+- **Making one.** `xcube-keygen <dir>` makes a key and prints the public JWK
+  the client seals to; `xcube-keygen <dir> <key.pem>` makes the files for an
+  existing key, e.g. one from `openssl genpkey -algorithm X25519`.
+- **Losing every key** means entering every secret again.
+- **Sealing, scheme v1** (the client's `research/credential-sealing.md`):
+  - HPKE (RFC 9180) base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256,
+    AES-128-GCM, with `info` `wechart/data-source-secret/v1`;
+  - the AAD is `["wechart/data-source-secret/v1", driver, field, [[targetKey, value], …]]`,
+    with the target keys sorted and the values as strings;
+  - the plaintext is padded to 256 bytes;
+  - each envelope is `{ v: 1, kid, enc, ct }`, base64url.
+
+  xcube opens it with its own RFC 9180 code on `node:crypto`. That code is
+  checked against RFC 9180's vector A.1 and against `hpke` 1.1.7, the
+  client's library.
+- **A secret opens only for the connection it was sealed for.** xcube computes
+  the binding from the connection it is about to use, so an envelope moved to
+  another host, field or driver doesn't open.
+
+**Serving.**
+- **Drivers.** Cube asks `resolveDriver` for a data source's driver.
+  - A model's connection gets a stable xcube driver, with Cube's own driver
+    for it behind it, once it has connected.
+  - A changed connection is built and tested, then swapped in. Changes go one
+    at a time and never back to an older version. Running queries finish on
+    the old driver, which is released once idle. A failure keeps the old one.
+  - A removed connection's driver refuses calls, and serves again if the
+    connection is pushed again.
+  - Errors from a connection's driver reach Cube with its secrets taken out.
+  - Releasing an orchestrator releases these drivers, but `/livez` doesn't
+    test them.
+  - Any other data source is `cube.js`'s `driverFactory`, which must return
+    configs, not drivers, or Cube's from its environment.
+- **Orchestrators.** A model with connections has its own orchestrator
+  (drivers, queues, caches), so models never share a data source's name.
+  Models without connections share Cube's, as before.
+  - Cube keeps at most 100 orchestrators, so keep the models with connections
+    on one process under that.
+- **Pre-aggregation schemas.** Every model has its own,
+  `<schema>_<model>_<hash of the id>`, fixed whatever its connections, since a
+  compiled model keeps its schema. Upgrading to this makes each model's
+  rollups build once more.
+- **Names and the environment.**
+  - A data source is named as items are: its short name in the root,
+    `<folderId>__<name>` elsewhere.
+  - Keep `CUBEJS_DATASOURCES` unset: Cube refuses names it doesn't declare.
+  - Of a model with connections, only `default` may be Cube's from its
+    environment when it has no connection: any other name is refused.
+  - A model without connections uses Cube's environment for every name, as
+    before.
+- **A connection's driver can't change** (`409 driver_change`): Cube fixes a
+  data source's SQL dialect when it compiles.
 
 ### Admin API
 
@@ -537,6 +638,65 @@ under xcube (it takes the playground secret):
 It reads the active revision: each module owning a named pre-aggregation is
 asked, or every module when none is named, and a shared cube's rollups appear
 once.
+
+#### `PUT …/connections/{name}`
+
+Stores a model's data source:
+
+```json
+{ "folderId": "froot", "driver": "postgres", "authMethod": "password",
+  "fields": { "host": "db", "port": 5432, "database": "sales", "user": "cube" },
+  "sealed": { "password": { "v": 1, "kid": "…", "enc": "…", "ct": "…" } },
+  "revisions": { "password": "<the client's revision id>" } }
+```
+
+- **`fields`** are the form's values, secrets excepted, exactly as the
+  browser sealed with them.
+- **Checks.** It is taken only when its fields are the driver's and auth
+  method's, every required one is there, and every secret opens for its
+  target. Nothing connects: that is the test route's job.
+- **Answers.**
+  - `200` with the connection, its secret fields named but never returned;
+  - `400 invalid_connection` (`problems`);
+  - `422 invalid_secret`;
+  - `409 driver_change`.
+- **After storing,** every instance swaps it in as soon as it hears.
+
+#### `GET …/connections`, `DELETE …/connections/{name}`
+
+The model's connections (no secrets); dropping one (`204`) makes Cube refuse
+its queries at once.
+
+#### `GET …/connections/{name}/health`
+
+`{ name, version, revisions, instances: [{ instance, version, state, error, reportedAt, current }] }`.
+- Each instance that built a driver for the connection reports it: `live`,
+  or `failed` with a redacted error.
+- `current` says it serves the stored version.
+
+#### `POST …/connections/test`
+
+Tests a connection without storing it: `{ driver, authMethod, fields, sealed }`
+→ `{ ok, checks: [{ id, status, durationMs, error? }] }`.
+
+| Check | Does |
+| --- | --- |
+| `secrets` | Opens each secret for this target |
+| `config` | Builds the driver's config |
+| `connect` | Cube's `testConnection()` |
+| `schemas` | Reads the catalog, where the driver can |
+
+Every error has the connection's secrets taken out.
+
+#### `GET /v1/semantic/credential-keys`, `POST /v1/semantic/credentials/rewrap`
+
+Not per model, so a service token naming a model can't use them:
+- **`credential-keys`** answers `{ keys: [{ kid, x, active }] }`: the public
+  keys the client seals to.
+- **`rewrap`** takes `{ items: [{ ref, driver, field, fields, envelope }] }`
+  (up to 1,000) and seals each to the active key with the same binding. It
+  answers `{ items: [{ ref, envelope } | { ref, error }] }`, never anything
+  opened.
 
 #### `GET …/meta`
 

@@ -98,6 +98,26 @@ class MemoryStore implements RevisionStore {
     return 0;
   }
 
+  public async connections() {
+    return [];
+  }
+
+  public async putConnection(): Promise<any> {
+    throw new Error('not used');
+  }
+
+  public async deleteConnection() {
+    return false;
+  }
+
+  public async reportConnection() {
+    return undefined;
+  }
+
+  public async connectionReports() {
+    return [];
+  }
+
   public async items() {
     return [];
   }

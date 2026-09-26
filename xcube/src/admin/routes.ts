@@ -25,6 +25,8 @@ import {
   PermissionsError,
   SecurityModeError,
 } from '../store/revisions';
+import { ConnectionError } from '../connections/connections';
+import { CredentialError } from '../credentials/credentials';
 import { MODEL_ID, SnapshotError } from '../model/snapshot';
 import { adminAuth } from './auth';
 
@@ -150,6 +152,29 @@ const resolveSchema = Joi.object({
   overlay: Joi.string().pattern(OVERLAY_ID),
 });
 
+const connectionTestSchema = Joi.object({
+  driver: Joi.string().max(64).required(),
+  authMethod: Joi.string().max(64).required(),
+  fields: Joi.object().unknown(true).default({}),
+  sealed: Joi.object().unknown(true).default({}),
+});
+
+const connectionSchema = connectionTestSchema.keys({
+  folderId: Joi.string().max(64).required(),
+  revisions: Joi.object().pattern(Joi.string(), Joi.string().max(128)).default({}),
+});
+
+const rewrapSchema = Joi.object({
+  items: Joi.array().min(1).max(1000).items(Joi.object({
+    ref: Joi.string().max(256).required(),
+    driver: Joi.string().max(64).required(),
+    field: Joi.string().max(64).required(),
+    fields: Joi.object().unknown(true).required(),
+    envelope: Joi.object().unknown(true).required(),
+  }))
+    .required(),
+});
+
 const overlaySchema = Joi.object({
   upserts: Joi.array().max(2000).items(itemSchema).default([]),
   deletes: Joi.array().max(2000).items(itemRefSchema).default([]),
@@ -270,6 +295,12 @@ export function initAdminRoutes(
       } else if (e instanceof KeySetError) {
         status = 400;
         body = { error: e.message, code: e.code };
+      } else if (e instanceof ConnectionError) {
+        status = e.code === 'driver_change' ? 409 : 400;
+        body = { error: e.message, code: e.code, problems: e.problems };
+      } else if (e instanceof CredentialError) {
+        status = 422;
+        body = { error: e.message, code: 'invalid_secret' };
       } else if (e instanceof PermissionsError) {
         status = 400;
         body = { error: e.message, code: 'invalid_permissions', problems: e.problems };
@@ -493,6 +524,65 @@ export function initAdminRoutes(
     const model = modelOf(req);
     const body = valid<any>(resolveSchema, req.body);
     res.json(await runtime.resolveNames(model, body.folderId, body.names, body.overlay));
+  }));
+
+  // Not per model: the keys the client seals data-source secrets to, and their rotation.
+  app.get(`${basePath}/v1/semantic/credential-keys`, auth, handle('credential-keys', async (_req, res) => {
+    res.json({ keys: runtime.credentialKeys?.publicKeys() ?? [] });
+  }));
+
+  app.post(`${basePath}/v1/semantic/credentials/rewrap`, auth, json, handle('rewrap', async (req, res) => {
+    const body = valid<any>(rewrapSchema, req.body);
+    const items = runtime.rewrap(body.items);
+    logger('xcube: secrets re-wrapped', { items: items.length, failed: items.filter((i: any) => i.error).length });
+    res.json({ items });
+  }));
+
+  const connectionNameOf = (req: Request) => {
+    if (!/^[a-z0-9_]{1,128}$/.test(req.params.name)) {
+      throw new AdminError(400, 'invalid_connection_name', 'A data source is named by its short name in the root, and <folderId>__<name> elsewhere');
+    }
+    return req.params.name;
+  };
+
+  app.get(`${base}/connections`, auth, handle('connections', async (req, res) => {
+    const model = modelOf(req);
+    res.json({ model, connections: await runtime.listConnections(model) });
+  }));
+
+  app.post(`${base}/connections/test`, auth, json, handle('connections', async (req, res) => {
+    const model = modelOf(req);
+    const body = valid<any>(connectionTestSchema, req.body);
+    const started = Date.now();
+    const result = await runtime.testConnection(body);
+    logger('xcube: connection tested', { model, driver: body.driver, ok: result.ok, durationMs: Date.now() - started });
+    res.json(result);
+  }));
+
+  app.put(`${base}/connections/:name`, auth, json, handle('connections', async (req, res) => {
+    const model = modelOf(req);
+    const name = connectionNameOf(req);
+    const body = valid<any>(connectionSchema, req.body);
+    const stored = await runtime.putConnection(model, name, body);
+    logger('xcube: connection stored', { model, connection: name, driver: stored.driver, version: stored.version });
+    res.json({ model, ...stored });
+  }));
+
+  app.get(`${base}/connections/:name/health`, auth, handle('connections', async (req, res) => {
+    const model = modelOf(req);
+    const health = await runtime.connectionHealth(model, connectionNameOf(req));
+    if (!health) {
+      throw new AdminError(404, 'unknown_connection', 'No such connection');
+    }
+    res.json({ model, ...health });
+  }));
+
+  app.delete(`${base}/connections/:name`, auth, handle('connections', async (req, res) => {
+    const model = modelOf(req);
+    const name = connectionNameOf(req);
+    const dropped = await runtime.deleteConnection(model, name);
+    logger('xcube: connection dropped', { model, connection: name, existed: dropped });
+    res.status(204).end();
   }));
 
   const overlayIdOf = (req: Request) => {

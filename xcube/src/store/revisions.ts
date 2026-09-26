@@ -111,6 +111,24 @@ export type PutOverlayResult = {
   overlay: StoredOverlay | null;
 };
 
+/** A data source of a model: where it connects, and its sealed secrets. */
+export interface StoredConnection {
+  model: string;
+  /** What models name it by: its short name in the root, `<folderId>__<name>` elsewhere. */
+  name: string;
+  folderId: string;
+  driver: string;
+  authMethod: string;
+  /** Its fields, secrets excepted. */
+  fields: Record<string, string | number | boolean | null>;
+  /** Each secret field's envelope, sealed to xcube's credential key. */
+  sealed: Record<string, unknown>;
+  /** The client's revision id of each secret, reported back as what a live driver uses. */
+  revisions: Record<string, string>;
+  version: number;
+  updatedAt: Date;
+}
+
 /** What each model's permissions and keys are at, for an instance to tell it is behind. */
 export interface ModelVersions {
   model: string;
@@ -187,6 +205,11 @@ export interface RevisionStore {
   overlay(model: string, id: string): Promise<StoredOverlay | null>;
   /** How many live overlays a model holds. */
   overlayCount(model: string): Promise<number>;
+  connections(model: string): Promise<StoredConnection[]>;
+  putConnection(connection: Omit<StoredConnection, 'version' | 'updatedAt'>): Promise<StoredConnection>;
+  deleteConnection(model: string, name: string): Promise<boolean>;
+  reportConnection(model: string, name: string, instance: string, version: number | null, state: string, error: string | null): Promise<void>;
+  connectionReports(model: string, name: string): Promise<{ instance: string; version: number | null; state: string; error: string | null; reportedAt: Date }[]>;
   deleteOverlay(model: string, id: string): Promise<boolean>;
   /** A revision's items, with their authored and resolved YAML. */
   items(model: string, revision: number): Promise<PublishedItem[]>;
@@ -565,6 +588,81 @@ export class PgRevisionStore implements RevisionStore {
       [model, id]
     );
     return row ? this.overlayOf(row) : null;
+  }
+
+  protected connectionOf(row: any): StoredConnection {
+    return {
+      model: row.model,
+      name: row.name,
+      folderId: row.folder_id,
+      driver: row.driver,
+      authMethod: row.auth_method,
+      fields: row.fields,
+      sealed: row.sealed,
+      revisions: row.revisions,
+      version: versionOf(row.version),
+      updatedAt: new Date(row.updated_at),
+    };
+  }
+
+  public async connections(model: string): Promise<StoredConnection[]> {
+    const { rows } = await this.pool.query(
+      `SELECT * FROM ${this.s}.connections WHERE model = $1 ORDER BY name COLLATE "C"`,
+      [model]
+    );
+    return rows.map((row) => this.connectionOf(row));
+  }
+
+  public async putConnection(c: Omit<StoredConnection, 'version' | 'updatedAt'>): Promise<StoredConnection> {
+    const { s } = this;
+    return inTransaction(this.pool, async (client) => {
+      await client.query(`INSERT INTO ${s}.models (id) VALUES ($1) ON CONFLICT (id) DO NOTHING`, [c.model]);
+      const { rows: [row] } = await client.query(
+        `INSERT INTO ${s}.connections (model, name, folder_id, driver, auth_method, fields, sealed, revisions, version)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::jsonb, nextval('${s}.connection_versions'))
+         ON CONFLICT (model, name) DO UPDATE SET
+           folder_id = EXCLUDED.folder_id, driver = EXCLUDED.driver, auth_method = EXCLUDED.auth_method,
+           fields = EXCLUDED.fields, sealed = EXCLUDED.sealed, revisions = EXCLUDED.revisions,
+           version = EXCLUDED.version, updated_at = now()
+         RETURNING *`,
+        [c.model, c.name, c.folderId, c.driver, c.authMethod, JSON.stringify(c.fields), JSON.stringify(c.sealed), JSON.stringify(c.revisions)]
+      );
+      const stored = this.connectionOf(row);
+      await client.query('SELECT pg_notify($1, $2)', [
+        channelOf(s), JSON.stringify({ model: c.model, connection: c.name, version: stored.version }),
+      ]);
+      return stored;
+    });
+  }
+
+  public async deleteConnection(model: string, name: string): Promise<boolean> {
+    return inTransaction(this.pool, async (client) => {
+      const { rowCount } = await client.query(`DELETE FROM ${this.s}.connections WHERE model = $1 AND name = $2`, [model, name]);
+      await client.query(`DELETE FROM ${this.s}.connection_reports WHERE model = $1 AND name = $2`, [model, name]);
+      await client.query('SELECT pg_notify($1, $2)', [channelOf(this.s), JSON.stringify({ model, connection: name })]);
+      return Boolean(rowCount);
+    });
+  }
+
+  public async reportConnection(model: string, name: string, instance: string, version: number | null, state: string, error: string | null) {
+    await this.pool.query(
+      `INSERT INTO ${this.s}.connection_reports (model, name, instance, version, state, error, reported_at)
+       VALUES ($1, $2, $3, $4, $5, $6, now())
+       ON CONFLICT (model, name, instance) DO UPDATE SET
+         version = EXCLUDED.version, state = EXCLUDED.state, error = EXCLUDED.error, reported_at = now()`,
+      [model, name, instance, version, state, error]
+    );
+  }
+
+  public async connectionReports(model: string, name: string) {
+    const { rows } = await this.pool.query(
+      `SELECT instance, version, state, error, reported_at FROM ${this.s}.connection_reports
+        WHERE model = $1 AND name = $2 ORDER BY instance`,
+      [model, name]
+    );
+    return rows.map((r) => ({
+      instance: r.instance, version: r.version === null ? null : versionOf(r.version), state: r.state, error: r.error, reportedAt: new Date(r.reported_at),
+    }));
   }
 
   public async overlayCount(model: string): Promise<number> {

@@ -45,8 +45,8 @@ export function adminAuth(tokens: string[], verifier?: TokenVerifier): RequestHa
       });
       return;
     }
-    if (model !== undefined && req.params.model !== undefined && req.params.model !== model) {
-      // A service token naming a model is for that model alone.
+    if (model !== undefined && req.params.model !== model) {
+      // A service token naming a model is for that model alone: not another's, nor the routes of every model.
       res.status(403).json({ error: `This service token is for model "${model}"`, code: 'forbidden' });
       return;
     }

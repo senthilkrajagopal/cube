@@ -8,6 +8,8 @@ export interface Notice {
   /** An overlay changed or went: its id, and its version when it changed. */
   overlay?: string;
   version?: number;
+  /** A connection changed or went: its name (and `version` when it changed). */
+  connection?: string;
 }
 
 /** What the listener needs of a `pg.Client`. */
@@ -94,7 +96,7 @@ export class RevisionListener {
       }
       try {
         const {
-          model, rev, permissions, keys, overlay, version,
+          model, rev, permissions, keys, overlay, version, connection,
         } = JSON.parse(message.payload || '{}');
         if (typeof model === 'string') {
           const notice: Notice = {};
@@ -109,9 +111,12 @@ export class RevisionListener {
           }
           if (typeof overlay === 'string') {
             notice.overlay = overlay;
-            if (typeof version === 'number') {
-              notice.version = version;
-            }
+          }
+          if (typeof connection === 'string') {
+            notice.connection = connection;
+          }
+          if ((notice.overlay || notice.connection) && typeof version === 'number') {
+            notice.version = version;
           }
           this.options.onNotify(model, notice);
           return;

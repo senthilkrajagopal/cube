@@ -19,3 +19,8 @@ export * from './model/validate';
 export * from './names/items';
 export { publish, filesOf, itemsHash, titleOf, aliasOf } from './names/publish';
 export { Scope, rewriteReferences } from './names/rewrite';
+export * from './credentials/credentials';
+export { open as hpkeOpen, seal as hpkeSeal } from './credentials/hpke';
+export { Connections, ConnectionError, redact } from './connections/connections';
+export { DRIVERS, DRIVER_TYPES, type DriverType } from './connections/drivers';
+export { SwitchableDriver } from './connections/switchable';

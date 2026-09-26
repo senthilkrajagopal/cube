@@ -130,6 +130,8 @@ jobs:
           exit 1
       - name: Serves models from xcube's schema, imported through its admin API
         run: xcube/test/image/serving.sh xcube:ci
+      - name: No connection's driver takes Cube's environment
+        run: docker run --rm -v "$PWD/xcube/test/image:/t:ro" --entrypoint node xcube:ci /t/drivers-env.js
       - name: Tags to publish
         id: tags
         if: github.event_name == 'push' && github.ref == 'refs/heads/feat/xcube'

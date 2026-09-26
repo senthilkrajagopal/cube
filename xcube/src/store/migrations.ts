@@ -190,6 +190,42 @@ export const MIGRATIONS: Migration[] = [
       CREATE INDEX overlays_expires_idx ON ${s}.overlays (expires_at);
     `,
   },
+  {
+    version: 6,
+    name: 'connections',
+    // Additive: older code reads Cube's data sources from its environment, as before.
+    minReader: 2,
+    sql: (s) => `
+      -- Each model's data sources: where each connects, and its secrets
+      -- sealed by the client to xcube's credential key. Never plaintext.
+      CREATE SEQUENCE ${s}.connection_versions;
+      CREATE TABLE ${s}.connections (
+        model       text        NOT NULL REFERENCES ${s}.models (id) ON DELETE CASCADE,
+        name        text        NOT NULL,
+        folder_id   text        NOT NULL,
+        driver      text        NOT NULL,
+        auth_method text        NOT NULL,
+        fields      jsonb       NOT NULL,
+        sealed      jsonb       NOT NULL,
+        revisions   jsonb       NOT NULL DEFAULT '{}'::jsonb,
+        version     bigint      NOT NULL,
+        updated_at  timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (model, name)
+      );
+
+      -- What each instance's driver for a connection is doing, for the client to show.
+      CREATE TABLE ${s}.connection_reports (
+        model       text        NOT NULL,
+        name        text        NOT NULL,
+        instance    text        NOT NULL,
+        version     bigint,
+        state       text        NOT NULL,
+        error       text,
+        reported_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (model, name, instance)
+      );
+    `,
+  },
 ];
 
 /** The newest schema version this code knows. */

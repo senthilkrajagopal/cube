@@ -20,6 +20,7 @@ import {
   FolderTree,
   fullNameOf,
   ROOT,
+  SHORT_NAME,
   type AuthoredItem,
   type Folder,
   type ItemError,
@@ -27,6 +28,9 @@ import {
 } from '../names/items';
 import { filesOf, itemsHash, publish } from '../names/publish';
 import { rollupsToStrip, withoutRollups } from '../overlays/rollups';
+import { Connections, ConnectionError, type ConnectionInput } from '../connections/connections';
+import { CredentialError, CredentialKeys, type SealedV1 } from '../credentials/credentials';
+import { isDriverType } from '../connections/drivers';
 import { createListenClient, createPool, type Logger } from '../store/db';
 import { migrate } from '../store/migrate';
 import {
@@ -430,6 +434,12 @@ export class XcubeRuntime {
 
   public readonly verifier: TokenVerifier;
 
+  /** xcube's credential keys; `null` without XCUBE_CREDENTIAL_KEY_IDS. */
+  public credentialKeys: CredentialKeys | null = null;
+
+  /** Each model's data sources, and the drivers Cube holds for them. */
+  public readonly connections: Connections;
+
   protected started = false;
 
   protected stopped = false;
@@ -449,6 +459,12 @@ export class XcubeRuntime {
     this.store = deps.store ?? null;
     this.lane = new CompileLane({ maxWaiting: settings.compileQueue, maxWaitMs: settings.compileWaitMs });
     this.tokens = settings.tokens ?? DEFAULT_TOKENS;
+    this.connections = new Connections(
+      () => this.requireStore(),
+      null,
+      this.instanceId,
+      (m, p) => this.log(m, p),
+    );
     this.verifier = new TokenVerifier(this.tokens, {
       modelClaim: () => this.options?.modelClaim ?? 'xcubeModel',
       revisionClaim: () => this.options?.revisionClaim ?? 'xcubeRevision',
@@ -498,6 +514,12 @@ export class XcubeRuntime {
     this.started = true;
     const { settings } = this;
     // Before anything else: keys that don't parse stop the process.
+    if (settings.credentials) {
+      const { dir, kids, activeKid } = settings.credentials;
+      this.credentialKeys = new CredentialKeys(dir, kids, activeKid);
+      this.connections.keys = this.credentialKeys;
+      this.log('xcube: credential keys loaded', { kids, activeKid });
+    }
     try {
       this.verifier.loadServiceKeys();
     } catch (e: any) {
@@ -1020,6 +1042,8 @@ export class XcubeRuntime {
         this.warn('xcube: the service credential\'s key file can\'t be read; keeping the keys it had', { error: e.message });
       }
     }
+    // Not awaited: a connection's driver test mustn't hold up following revisions and permissions.
+    this.connections.refresh().catch((e) => this.warn('xcube: could not read connections', { error: e.message }));
     const versions = await this.requireStore().versions();
     await Promise.all(versions.map(async ({ model, permissions, keys }) => {
       if (!MODEL_ID.test(model)) {
@@ -1467,6 +1491,126 @@ export class XcubeRuntime {
     return dropped;
   }
 
+  // ----------------------------------------------------------- connections
+
+  /** The model a context (a request's, or a driver's) names, or none; never throws. */
+  public modelOfContext(context: any): string | undefined {
+    try {
+      return this.serving ? this.modelOf(context?.securityContext ?? context?.authInfo) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Stores a model's data source, once its fields are right and every
+   * secret opens for its target. `name` is what models call it: its short
+   * name in the root, `<folderId>__<name>` elsewhere. Nothing connects here:
+   * the test route does that.
+   */
+  public async putConnection(
+    model: string,
+    name: string,
+    body: ConnectionInput & { folderId: string; revisions?: Record<string, string> },
+  ) {
+    const store = this.requireStore();
+    const separator = name.indexOf('__');
+    const shortName = separator === -1 ? name : name.slice(separator + 2);
+    if (!SHORT_NAME.test(shortName) || fullNameOf(body.folderId, shortName) !== name) {
+      throw new ConnectionError(`"${name}" isn't the name of a data source in folder ${body.folderId}`, [
+        `a data source is named by its short name in the root (${ROOT}), and <folderId>__<name> elsewhere`,
+      ]);
+    }
+    const folders = await store.folders(model);
+    if (body.folderId !== ROOT && !folders.some((f) => f.id === body.folderId)) {
+      throw new ConnectionError(`Folder ${body.folderId} is not in the folder tree`);
+    }
+    const known = (await store.connections(model)).find((c) => c.name === name);
+    if (known && known.driver !== body.driver) {
+      throw new ConnectionError(`Connection "${name}" is a ${known.driver} data source; its driver can't change`, [
+        'Cube fixes a data source\'s SQL dialect when it compiles: create one under another name',
+      ], 'driver_change');
+    }
+    const { driver, fields } = this.connections.check(body);
+    const stored = await store.putConnection({
+      model,
+      name,
+      folderId: body.folderId,
+      driver,
+      authMethod: body.authMethod,
+      fields: fields as Record<string, string | number | boolean | null>,
+      sealed: body.sealed ?? {},
+      revisions: body.revisions ?? {},
+    });
+    this.persistently('a connection', model, () => this.connections.changed(model, name));
+    return XcubeRuntime.connectionView(stored);
+  }
+
+  protected static connectionView(c: import('../store/revisions').StoredConnection) {
+    return {
+      name: c.name,
+      folderId: c.folderId,
+      driver: c.driver,
+      authMethod: c.authMethod,
+      fields: c.fields,
+      secrets: Object.keys(c.sealed).sort(),
+      revisions: c.revisions,
+      version: c.version,
+      updatedAt: c.updatedAt.toISOString(),
+    };
+  }
+
+  public async listConnections(model: string) {
+    return (await this.requireStore().connections(model)).map((c) => XcubeRuntime.connectionView(c));
+  }
+
+  public async deleteConnection(model: string, name: string): Promise<boolean> {
+    const dropped = await this.requireStore().deleteConnection(model, name);
+    this.persistently('a connection', model, () => this.connections.changed(model, name));
+    return dropped;
+  }
+
+  /** What each instance's driver for a connection is doing: which version it serves, or why it failed. */
+  public async connectionHealth(model: string, name: string) {
+    const store = this.requireStore();
+    const connection = (await store.connections(model)).find((c) => c.name === name);
+    if (!connection) {
+      return null;
+    }
+    const reports = await store.connectionReports(model, name);
+    return {
+      name,
+      version: connection.version,
+      revisions: connection.revisions,
+      instances: reports.map((r) => ({ ...r, reportedAt: r.reportedAt.toISOString(), current: r.version === connection.version })),
+    };
+  }
+
+  public testConnection(input: ConnectionInput) {
+    return this.connections.test(input);
+  }
+
+  /**
+   * Seals secrets again to the active credential key, each with the binding
+   * it had: rotation, never a re-bind. An item that doesn't open is answered
+   * with an error, never with anything of it.
+   */
+  public rewrap(items: { ref: string; driver: string; field: string; fields: Record<string, unknown>; envelope: unknown }[]) {
+    return items.map(({ ref, driver, field, fields, envelope }) => {
+      if (!this.credentialKeys) {
+        return { ref, error: 'xcube holds no credential key' };
+      }
+      if (!isDriverType(driver)) {
+        return { ref, error: `unknown driver ${String(driver).slice(0, 64)}` };
+      }
+      try {
+        return { ref, envelope: this.credentialKeys.rewrap(envelope, driver, field, fields as any) as SealedV1 };
+      } catch (e: any) {
+        return { ref, error: e instanceof CredentialError ? e.message : 'can\'t be re-wrapped' };
+      }
+    });
+  }
+
   /** A context for xcube's own reads of a model, pinned to its active revision. */
   public async adminContext(model: string): Promise<Record<string, any>> {
     const securityContext = { [this.servingOptions.modelClaim]: model };
@@ -1711,6 +1855,12 @@ export class XcubeRuntime {
   // ------------------------------------------------------------ following
 
   protected notified(model: string, notice: Notice = {}) {
+    if (notice.connection !== undefined) {
+      if (this.admit(model)) {
+        this.persistently('a connection', model, () => this.connections.changed(model, notice.connection!));
+      }
+      return;
+    }
     if (notice.overlay !== undefined) {
       if (MODEL_ID.test(model) && OVERLAY_ID.test(notice.overlay)) {
         this.overlayChanged(model, notice.overlay, notice.version);

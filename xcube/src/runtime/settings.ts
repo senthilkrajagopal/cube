@@ -32,6 +32,8 @@ export interface XcubeSettings {
   tokens?: TokenSettings;
   /** `DEFAULT_OVERLAYS` when absent. */
   overlays?: OverlaySettings;
+  /** xcube's credential keys, which data-source secrets are sealed to; none: connections can't be used. */
+  credentials?: { dir: string; kids: string[]; activeKid: string };
 }
 
 /** Workspace and proposal overlays. */
@@ -100,6 +102,18 @@ function number(env: NodeJS.ProcessEnv, name: string, fallback: number): number 
   return value;
 }
 
+function credentialSettings(env: NodeJS.ProcessEnv): XcubeSettings['credentials'] {
+  const kids = (env.XCUBE_CREDENTIAL_KEY_IDS || '').split(',').map((k) => k.trim()).filter(Boolean);
+  if (!kids.length) {
+    return undefined;
+  }
+  const activeKid = env.XCUBE_CREDENTIAL_ACTIVE_KID || (kids.length === 1 ? kids[0] : '');
+  if (!activeKid) {
+    throw new Error('XCUBE_CREDENTIAL_ACTIVE_KID must name one of XCUBE_CREDENTIAL_KEY_IDS when there are several');
+  }
+  return { dir: env.XCUBE_CREDENTIAL_KEY_DIR || '/run/secrets/xcube-credential-keys', kids, activeKid };
+}
+
 function hs256(raw: string | undefined): 'until-keys' | 'off' {
   const value = (raw || 'until-keys').toLowerCase();
   if (value !== 'until-keys' && value !== 'off') {
@@ -155,6 +169,7 @@ export function settingsFromEnv(env: NodeJS.ProcessEnv = process.env): XcubeSett
       packMin: number(env, 'XCUBE_MODULE_PACK_MIN', 50),
       packMax: Math.max(1, number(env, 'XCUBE_MODULE_PACK_MAX', 300)),
     },
+    credentials: credentialSettings(env),
     overlays: {
       ttlS: Math.max(1, number(env, 'XCUBE_OVERLAY_TTL_S', DEFAULT_OVERLAYS.ttlS)),
       maxTtlS: Math.max(1, number(env, 'XCUBE_OVERLAY_MAX_TTL_S', DEFAULT_OVERLAYS.maxTtlS)),

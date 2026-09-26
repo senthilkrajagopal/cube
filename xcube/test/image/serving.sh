@@ -58,6 +58,14 @@ if (what === 'service') {
 }
 JS
 node "$keys/tokens.js" init
+
+# Slice 6's credential key, made by the image's own tool, mounted into the server.
+mkdir -p "$keys/credential"
+chmod 777 "$keys/credential"
+docker run --rm --user 1000 -v "$keys/credential:/keys" --entrypoint node "$IMAGE" \
+  /cube/node_modules/xcube/dist/src/bin/keygen.js /keys > "$keys/credential.jwk"
+credential_kid="$(sed -E 's/.*"kid":"([^"]+)".*/\1/' "$keys/credential.jwk")"
+chmod -R a+rX "$keys/credential"
 mkdir -p "$conf/model"
 echo "module.exports = require('xcube').config({ modelClaim: 'wechartModel', revisionClaim: 'wechartRevision', overlayClaim: 'wechartOverlay' });" > "$conf/cube.js"
 chmod -R a+rX "$conf"
@@ -78,6 +86,8 @@ docker run -d --name "$NAME" --network "$DOCKER_NETWORK" "${publish[@]}" --user 
   -e XCUBE_DATABASE_URL="postgres://xcube:serving-check@$PG_HOST:5432/test" \
   -e XCUBE_ADMIN_TOKENS="$ADMIN_TOKEN" \
   -e XCUBE_SERVICE_KEYS="$(node "$keys/tokens.js" jwks service svc)" \
+  -v "$keys/credential:/run/secrets/xcube-credential-keys:ro" \
+  -e XCUBE_CREDENTIAL_KEY_IDS="$credential_kid" \
   -e CUBEJS_DB_TYPE=postgres -e CUBEJS_DB_HOST="$PG_HOST" -e CUBEJS_DB_NAME=test \
   -e CUBEJS_DB_USER=test -e CUBEJS_DB_PASS=test \
   -e CUBEJS_API_SECRET="$API_SECRET" -e CUBEJS_DEV_MODE=false \
@@ -184,3 +194,35 @@ status="$(signed DELETE /overlays/ws-check)"
 status="$(query "$(node "$keys/tokens.js" user g_sub "$revision" ws-check)")"
 [ "$status" = 410 ] || { echo "a dropped overlay's preview got $status"; exit 1; }
 echo "Overlay check passed: a workspace's change previewed through its overlay, then dropped."
+
+# Slice 6: a model whose default data source is a connection, its password
+# sealed (by the image's own code, as the client's browser would) to the key.
+target='{"host": "'"$PG_HOST"'", "port": 5432, "database": "test", "ssl": false}'
+sealed="$(docker run --rm --network "$DOCKER_NETWORK" --entrypoint node "$IMAGE" -e '
+  const { sealSecretV1 } = require("/cube/node_modules/xcube/dist/src/credentials/credentials");
+  const [x, kid, target] = process.argv.slice(1);
+  console.log(JSON.stringify(sealSecretV1(x, kid, "postgres", "password", JSON.parse(target), "test")));
+' "$(sed -E 's/.*"x":"([^"]+)".*/\1/' "$keys/credential.jwk")" "$credential_kid" "$target")"
+conn() {
+  curl -s -o /tmp/xcube-admin.json -w '%{http_code}' -X "$1" \
+    -H "Authorization: Bearer $service" -H 'Content-Type: application/json' \
+    ${3:+--data "$3"} "$CUBE_URL/cubejs-api/v1/semantic/models/conn$2"
+}
+connection="{\"folderId\": \"froot\", \"driver\": \"postgres\", \"authMethod\": \"password\", \"fields\": $(echo "$target" | sed 's/}$/, "user": "test"}/'), \"sealed\": {\"password\": $sealed}}"
+status="$(conn PUT /connections/default "$connection")"
+[ "$status" = 200 ] || { echo "the connection answered $status"; cat /tmp/xcube-admin.json; exit 1; }
+status="$(conn PUT /snapshot '{"baseRevision": null, "folders": [{"id": "froot", "parentId": null}], "items": [{"folderId": "froot", "name": "via_connection", "kind": "cube", "yaml": "cubes:\n  - name: via_connection\n    sql_table: public.serving_check\n    measures:\n      - name: total\n        sql: amount\n        type: sum\n"}]}')"
+case "$status" in 200|201) ;; *) echo "the connection model's snapshot answered $status"; cat /tmp/xcube-admin.json; exit 1 ;; esac
+conn_revision="$(sed -E 's/.*"revision":([0-9]+).*/\1/' /tmp/xcube-admin.json)"
+conn_token="$(node -e '
+  const crypto = require("crypto");
+  const part = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
+  const body = `${part({ alg: "HS256", typ: "JWT" })}.${part({ wechartModel: "conn", wechartRevision: Number(process.argv[2]) })}`;
+  console.log(`${body}.${crypto.createHmac("sha256", process.argv[1]).update(body).digest("base64url")}`);
+' "$API_SECRET" "$conn_revision")"
+answer="$(curl -s -H "Authorization: $conn_token" -H 'Content-Type: application/json' \
+  --data '{"query": {"measures": ["via_connection.total"]}}' "$CUBE_URL/cubejs-api/v1/load")"
+echo "$answer" | grep -q '"via_connection.total":"42"' || { echo "a query through the connection got: $(echo "$answer" | head -c 300)"; exit 1; }
+status="$(conn GET /connections/default/health)"
+grep -q '"state":"live"' /tmp/xcube-admin.json || { echo "the connection's health: $(cat /tmp/xcube-admin.json)"; exit 1; }
+echo "Connection check passed: a model's data source served from a connection whose password was sealed to xcube's key."
