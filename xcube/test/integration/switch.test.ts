@@ -201,4 +201,21 @@ describeWithDatabase('switching a file-set model to items', () => {
     // The jobs API sent the context to the module owning the cube.
     expect(done[0].selector.contexts[0].securityContext.xcubeModule).toMatch(/^m[0-9a-f]{10}$/);
   });
+
+  test('the admin partitions route lists a rollup\'s partitions and what is built, from the module owning it', async () => {
+    const partitions = (query: object) => request(server).post(`${base}/pre-aggregations/partitions`)
+      .set('Authorization', `Bearer ${ADMIN_TOKEN}`)
+      .send({ query })
+      .expect(200);
+    const one = (await partitions({
+      timezones: ['UTC'], preAggregations: [{ id: 'fsales__orders.main' }], expand: ['partitions.meta', 'partitions.versions'],
+    })).body.preAggregationPartitions;
+    expect(one).toHaveLength(1);
+    expect(one[0].preAggregation.id).toBe('fsales__orders.main');
+    expect(one[0].partitions.length).toBeGreaterThan(0);
+    expect(one[0].partitions.some((p: any) => p.versionEntries.length > 0)).toBe(true);
+    // Unnamed: every module's, each once.
+    const all = (await partitions({ timezones: ['UTC'] })).body.preAggregationPartitions.map((p: any) => p.preAggregation.id).sort();
+    expect(all).toEqual(['fsales__orders.main', 'orders.main']);
+  });
 });

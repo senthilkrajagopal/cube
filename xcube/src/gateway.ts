@@ -123,6 +123,7 @@ export class XcubeApiGateway extends ApiGateway {
     if (runtime) {
       initAdminRoutes(app, this.basePath, runtime, (type, params) => this.log({ type, ...params }), {
         meta: (model, extended) => this.ownMeta(model, extended),
+        partitions: (model, query) => this.ownPartitions(model, query),
       });
       // Before Cube's jobs route: each job's context names the module its pre-aggregations are in.
       app.post(`${this.basePath}/v1/pre-aggregations/jobs`, (req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
@@ -355,6 +356,54 @@ export class XcubeApiGateway extends ApiGateway {
       return super.log({ ...event, token: `sha256:${fingerprint}` }, context);
     }
     return super.log(event, context);
+  }
+
+  /**
+   * A model's pre-aggregation partitions and their build state, as Cube's
+   * `/cubejs-system/v1/pre-aggregations/partitions` answers (which isn't
+   * served under xcube: it takes the playground secret), for the model's
+   * active revision: asked of each module owning a named pre-aggregation,
+   * or of every module, and merged.
+   */
+  public async ownPartitions(model: string, query: any): Promise<{ status: number; body: any }> {
+    const runtime = this.xcubeRuntime()!;
+    const context: any = await runtime.adminContext(model);
+    const named: string[] = Array.isArray(query?.preAggregations)
+      ? query.preAggregations.map((p: any) => p?.id).filter((id: unknown): id is string => typeof id === 'string')
+      : [];
+    const modules = runtime.jobModules(context.securityContext, { preAggregations: named }) ?? ['all'];
+    // Each module is asked for the pre-aggregations it owns; a name no module owns, of every one, for Cube to answer.
+    const asked = modules.map((id) => ({
+      id,
+      mine: named.length && modules.length > 1
+        ? query.preAggregations.filter((p: any) => [id, undefined].includes(runtime.moduleOfCube(model, String(p?.id).split('.')[0])))
+        : query?.preAggregations,
+    })).filter(({ mine }) => !named.length || mine?.length);
+    const merged: any[] = [];
+    const seen = new Set<string>();
+    for (const { id, mine } of asked) {
+      let answer: { status: number; body: any } = { status: 500, body: null };
+      await super.getPreAggregationPartitions({
+        // None named: every one (Cube's own route needs the list; empty means all).
+        query: { ...query, preAggregations: mine ?? [] },
+        context: { ...context, [MODULE_KEY]: id },
+        res: (body: any, options?: any) => {
+          answer = { status: options?.status ?? 200, body };
+        },
+      });
+      if (answer.status !== 200) {
+        return answer;
+      }
+      for (const partitions of answer.body?.preAggregationPartitions ?? []) {
+        // A shared cube's copies are in several modules: its rollups once.
+        const key = partitions?.preAggregation?.id ?? JSON.stringify(partitions?.preAggregation ?? null);
+        if (!seen.has(key)) {
+          seen.add(key);
+          merged.push(partitions);
+        }
+      }
+    }
+    return { status: 200, body: { preAggregationPartitions: merged } };
   }
 
   /**

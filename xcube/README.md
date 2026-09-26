@@ -526,6 +526,18 @@ It answers `201` (created) or `200` with
 Drops the overlay (`204`, whether or not it was there). Its queries answer `410`
 from then on: at once on this instance, and on the others as soon as they hear.
 
+#### `POST …/pre-aggregations/partitions`
+
+A model's pre-aggregation partitions and their build state, for the client's
+Jobs view. It takes and answers what Cube's
+`/cubejs-system/v1/pre-aggregations/partitions` does, which isn't served
+under xcube (it takes the playground secret):
+`{ "query": { "timezones": ["UTC"], "preAggregations": [{ "id": "fsales__orders.main" }], "expand": ["partitions.meta", "partitions.versions"] } }`
+→ `{ "preAggregationPartitions": [{ preAggregation, partitions, timezones, errors, … }] }`.
+It reads the active revision: each module owning a named pre-aggregation is
+asked, or every module when none is named, and a shared cube's rollups appear
+once.
+
 #### `GET …/meta`
 
 The model's field list for the client's own reads (jobs, schedules):

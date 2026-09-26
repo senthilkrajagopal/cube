@@ -231,6 +231,8 @@ type Handler = (req: Request, res: Response) => Promise<void>;
 export interface AdminReads {
   /** A model's field list, unfiltered, merged across modules (`extended`: as `/v1/meta?extended`). */
   meta(model: string, extended: boolean): Promise<{ status: number; body: any }>;
+  /** A model's pre-aggregation partitions and their build state, as Cube's system route answers. */
+  partitions(model: string, query: any): Promise<{ status: number; body: any }>;
 }
 
 export function initAdminRoutes(
@@ -425,6 +427,15 @@ export function initAdminRoutes(
       throw new AdminError(404, 'no_keys', `Model "${model}" has no keys; it takes HS256 tokens while XCUBE_HS256 allows them`);
     }
     res.json({ model, ...set });
+  }));
+
+  app.post(`${base}/pre-aggregations/partitions`, auth, json, handle('partitions', async (req, res) => {
+    const model = modelOf(req);
+    if (!reads) {
+      throw new AdminError(404, 'not_found', 'Not served here');
+    }
+    const { status, body } = await reads.partitions(model, req.body?.query ?? {});
+    res.status(status).json(body);
   }));
 
   app.get(`${base}/meta`, auth, handle('meta', async (req, res) => {

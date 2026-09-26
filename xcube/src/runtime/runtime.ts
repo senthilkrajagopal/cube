@@ -853,6 +853,11 @@ export class XcubeRuntime {
     return owners.length ? owners.sort() : [...revision.modules.keys()].sort();
   }
 
+  /** The module of a model's active revision that owns a cube. */
+  public moduleOfCube(model: string, cube: string): string | undefined {
+    return this.models.get(model)?.active?.owner.get(cube);
+  }
+
   /**
    * The module holding every cube a query names: its first cube's owner when
    * that holds them all, else commons, else the smallest that does. None
