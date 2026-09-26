@@ -136,7 +136,14 @@ describeWithDatabase('PgRevisionStore', () => {
     const result = await store.import({ model: 'm', baseRevision: null, files: files(1), source: { reason: 'startup' } });
     expect(result).toEqual({
       outcome: 'created',
-      head: { model: 'm', generation: expect.stringMatching(/^[0-9a-f-]{36}$/), revision: 1, contentHash: contentHash(files(1)) },
+      head: {
+        model: 'm',
+        generation: expect.stringMatching(/^[0-9a-f-]{36}$/),
+        revision: 1,
+        contentHash: contentHash(files(1)),
+        mode: 'files',
+        itemsHash: null,
+      },
     });
     await settle();
     expect(heard).toEqual(['{"model":"m","rev":1}']);
@@ -199,5 +206,27 @@ describeWithDatabase('PgRevisionStore', () => {
     const result = await store.import({ model: 'm', baseRevision: null, files: files(1), source: {} });
     expect(result).toMatchObject({ outcome: 'created', head: { revision: 1 } });
     expect((result as any).head.generation).not.toBe(before.generation);
+  });
+
+  test('an items import on a stale base changes nothing, not even the folder tree', async () => {
+    const item = (folderId: string, name: string) => ({
+      folderId,
+      name,
+      kind: 'cube' as const,
+      yaml: `cubes:\n  - name: ${name}\n`,
+      fullName: folderId === 'froot' ? name : `${folderId}__${name}`,
+      bindings: {},
+      resolvedYaml: `cubes:\n  - name: ${name}\n`,
+    });
+    const folders = [{ id: 'froot', parentId: null }, { id: 'fsales', parentId: 'froot' }];
+    await store.putFolders('tree', folders);
+    const first = await store.importItems({ model: 'tree', baseRevision: null, items: [item('fsales', 'a')], itemsHash: 'a'.repeat(64), source: {} });
+    expect(first.outcome).toBe('created');
+
+    const stale = await store.importItems({
+      model: 'tree', baseRevision: null, items: [item('froot', 'b')], itemsHash: 'b'.repeat(64), source: {}, folders: [{ id: 'froot', parentId: null }],
+    });
+    expect(stale.outcome).toBe('conflict');
+    expect(await store.folders('tree')).toEqual(folders);
   });
 });

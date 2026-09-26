@@ -64,6 +64,44 @@ export const MIGRATIONS: Migration[] = [
         REFERENCES ${s}.revisions (model, rev) DEFERRABLE INITIALLY DEFERRED;
     `,
   },
+  {
+    version: 2,
+    name: 'items',
+    // Readers before 2 would prune authored item contents they don't know
+    // about, so they may not run on this schema.
+    minReader: 2,
+    sql: (s) => `
+      ALTER TABLE ${s}.models ADD COLUMN mode text NOT NULL DEFAULT 'files' CHECK (mode IN ('files', 'items'));
+      ALTER TABLE ${s}.revisions ADD COLUMN items_hash char(64) CHECK (items_hash ~ '^[0-9a-f]{64}$');
+
+      -- The client's folder tree: only what resolution needs, ids and parents.
+      CREATE TABLE ${s}.folders (
+        model     text NOT NULL REFERENCES ${s}.models (id) ON DELETE CASCADE,
+        id        text NOT NULL CHECK (id ~ '^f[a-z0-9]{1,40}$'),
+        parent_id text,
+        PRIMARY KEY (model, id)
+      );
+
+      -- Each revision's items: as written (authored_hash, in files), their
+      -- full name (the resolved file is <full_name>.yml in revision_files),
+      -- and what each short name they use was bound to at publish.
+      CREATE TABLE ${s}.revision_items (
+        model         text     NOT NULL,
+        rev           integer  NOT NULL,
+        folder_id     text     NOT NULL,
+        name          text     NOT NULL,
+        kind          text     NOT NULL CHECK (kind IN ('cube', 'view')),
+        full_name     text     NOT NULL,
+        authored_hash char(64) NOT NULL,
+        bindings      jsonb    NOT NULL DEFAULT '{}'::jsonb,
+        PRIMARY KEY (model, rev, folder_id, name),
+        UNIQUE (model, rev, full_name),
+        FOREIGN KEY (model, rev) REFERENCES ${s}.revisions (model, rev) ON DELETE CASCADE,
+        FOREIGN KEY (model, authored_hash) REFERENCES ${s}.files (model, hash)
+      );
+      CREATE INDEX revision_items_hash_idx ON ${s}.revision_items (model, authored_hash);
+    `,
+  },
 ];
 
 /** The newest schema version this code knows. */

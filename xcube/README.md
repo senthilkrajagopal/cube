@@ -57,6 +57,17 @@ models, the worker's `cube.js` needs it too.
 
 ### How it works
 
+A model is served in one of two modes:
+
+- **Files** (slice 2): the client sends the model's whole file set, and xcube
+  serves it as it is.
+- **Items** (slice 3): the client sends its folder tree and its items (one
+  cube or view each, in a folder) as changesets, and xcube resolves their
+  names (see [Folders and names](#folders-and-names)). A model moves from
+  files to items with its first items snapshot, and doesn't move back.
+
+In both modes:
+
 - **A model** is one wechart instance's whole data model (`dev`, `demo`, a
   Helm release name). Each import makes an immutable **revision**, numbered
   per model; the model's current revision is what every Cube process
@@ -136,6 +147,31 @@ models, the worker's `cube.js` needs it too.
 | `XCUBE_CATCH_UP_MS` | `10000` | How long a request naming a newer revision waits for it |
 | `CUBEJS_TRANSPILATION_WORKER_THREADS_COUNT` | `2` | Cube's; the image sets it when unset, as unset a compile can take gigabytes |
 
+### Folders and names
+
+- **One flat namespace.** Every item's cube or view is named by its short
+  name in the root folder (`orders`), and `<folderId>__<shortName>` in any
+  other folder (`f7k2__orders`). Short names are lower-case words joined by
+  single underscores, so they never hold `__`, and the two kinds can't
+  collide. A folder id is `f` and 1 to 40 lower-case letters and digits; the
+  root is `froot`.
+- **Resolution at publish.** A short name an item uses (a join, `{orders.id}`,
+  `extends`, a view's `join_path`, `FILTER_PARAMS.orders…`, a
+  pre-aggregation's `rollups`…) means the nearest item of that name, from the
+  item's own folder up to the root. xcube rewrites it to the full name and
+  records the binding, which stays until the item is published again: a
+  nearer item of the same name doesn't rebind items published before it.
+- **Removal.** An item another item is bound to can't be deleted or renamed;
+  the refusal names the items that refer to it.
+- **What people see.** An item in a folder gets `title` from its short name
+  (`Orders`, as Cube would title `orders`) and a `sql_alias` (its full name,
+  or a stable hash when that is longer than 20 characters), so SQL and
+  rollup table names stay short. xcube adds `meta.xcube = { folderId,
+  shortName }` to every item, for pickers. Root items keep their names,
+  titles and SQL as they were.
+- **Expressions** are read with Cube's own lexer, so names in string
+  literals, lambda parameters and keyword arguments are never rewritten.
+
 ### Admin API
 
 For the client's server alone. The routes are under
@@ -203,6 +239,57 @@ refusing the query. With `compare`, a probe the candidate refuses is also run
 against the current revision (`current`, with its `revision`), to tell a new
 refusal from one that already existed. Probes run only when the files are
 valid.
+
+#### `PUT …/folders`
+
+Replaces the folder tree: `{ "folders": [{ "id": "froot", "parentId": null }, { "id": "f7k2", "parentId": "froot" }] }`.
+It changes nothing Cube serves, only how later publishes resolve names.
+`400 invalid_folders` for a bad id, a missing root, an unknown parent or a
+cycle; `409 folder_in_use` when a folder that still holds items would go.
+
+#### `POST …/changesets`
+
+```json
+{
+  "baseRevision": 41,
+  "upserts": [{ "folderId": "f7k2", "name": "orders", "kind": "cube", "yaml": "cubes:\n  - name: orders\n…" }],
+  "deletes": [{ "folderId": "froot", "name": "old_orders" }],
+  "source": { "reason": "publish" }
+}
+```
+
+It applies the changes to the current items, resolves the changed ones,
+compiles the result and stores it as the new current revision. It answers
+like the snapshot import: `201` created, `200` the same items as now (a
+retry), `409 conflict` on a stale base, `409 mode` for a model still in
+files mode, `422 invalid_items` with `errors` of the form
+`{ folderId, name, line?, column?, kind, message }`. Each changed item comes
+back with its full name in `items`.
+
+With `?dryRun=true` it only checks, and takes slice 2's `securityContext`
+and `probes` (queries use full names); it answers `200` with `{ valid,
+errors, probes, items, itemsHash, currentRevision }`.
+
+#### `PUT …/snapshot` with items
+
+`{ baseRevision, folders, items, source }` replaces the whole folder tree and
+item set, resolving every item afresh: the first import, and a recovery. A
+model in items mode refuses a file set (`409 mode`).
+
+**The items hash** (`itemsHash`) is the SHA-256 of the items sorted by folder
+id then name, as the JSON `[{"folderId","name","kind","yaml"}, …]`; the client
+can compute it to know whether xcube holds its items.
+
+#### `GET …/items`
+
+Every item of the current revision:
+`{ folderId, name, kind, fullName, bindings: { shortName: fullName } }`.
+
+#### `POST …/resolve`
+
+`{ "folderId": "f7k2", "names": ["orders", "customers"] }` →
+`{ "names": { "orders": "f7k2__orders", "customers": "customers" } }`, or
+`null` for a name nothing on the folder's path holds.
 
 #### `GET …/revision`
 

@@ -74,3 +74,32 @@ echo "$answer" | head -c 400; echo
 grep -qi "x-xcube-revision: check@$revision" /tmp/xcube-headers.txt
 echo "$answer" | grep -q '"serving_check.total":"42"'
 echo "Serving check passed: revision $revision imported and queried."
+
+# Items mode: a folder tree, a root cube and a folder's own cube bound to it.
+admin() {
+  curl -s -o /tmp/xcube-admin.json -w '%{http_code}' -X "$1" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+    --data "$3" "$CUBE_URL/cubejs-api/v1/semantic/models/items$2"
+}
+status="$(admin PUT /folders '{"folders": [{"id": "froot", "parentId": null}, {"id": "fsub", "parentId": "froot"}]}')"
+[ "$status" = 200 ] || { echo "folders answered $status"; cat /tmp/xcube-admin.json; exit 1; }
+root_item='{"folderId": "froot", "name": "serving_check", "kind": "cube", "yaml": "cubes:\n  - name: serving_check\n    sql_table: public.serving_check\n    dimensions:\n      - name: id\n        sql: id\n        type: number\n        primary_key: true\n    measures:\n      - name: total\n        sql: amount\n        type: sum\n"}'
+sub_item='{"folderId": "fsub", "name": "doubled", "kind": "cube", "yaml": "cubes:\n  - name: doubled\n    sql: \"SELECT id, amount * 2 AS amount FROM {serving_check.sql()}\"\n    measures:\n      - name: total\n        sql: amount\n        type: sum\n"}'
+status="$(admin PUT '/snapshot' "{\"baseRevision\": null, \"folders\": [{\"id\": \"froot\", \"parentId\": null}, {\"id\": \"fsub\", \"parentId\": \"froot\"}], \"items\": [$root_item]}")"
+case "$status" in 200|201) ;; *) echo "items snapshot answered $status"; cat /tmp/xcube-admin.json; exit 1 ;; esac
+base="$(sed -E 's/.*"revision":([0-9]+).*/\1/' /tmp/xcube-admin.json)"
+status="$(admin POST /changesets "{\"baseRevision\": $base, \"upserts\": [$sub_item]}")"
+case "$status" in 200|201) ;; *) echo "changeset answered $status"; cat /tmp/xcube-admin.json; exit 1 ;; esac
+cat /tmp/xcube-admin.json; echo
+revision="$(sed -E 's/.*"revision":([0-9]+).*/\1/' /tmp/xcube-admin.json)"
+token="$(node -e '
+  const crypto = require("crypto");
+  const part = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
+  const body = `${part({ alg: "HS256", typ: "JWT" })}.${part({ wechartModel: "items", wechartRevision: Number(process.argv[2]) })}`;
+  console.log(`${body}.${crypto.createHmac("sha256", process.argv[1]).update(body).digest("base64url")}`);
+' "$API_SECRET" "$revision")"
+answer="$(curl -s -H "Authorization: $token" -H 'Content-Type: application/json' \
+  --data '{"query": {"measures": ["fsub__doubled.total"]}}' "$CUBE_URL/cubejs-api/v1/load")"
+echo "$answer" | head -c 300; echo
+echo "$answer" | grep -q '"fsub__doubled.total":"84"'
+echo "Items check passed: a folder's cube, bound to a root cube, queried by its full name."

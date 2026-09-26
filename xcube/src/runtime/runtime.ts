@@ -15,6 +15,15 @@ import {
   type ProbeResult,
   type ValidationResult,
 } from '../model/validate';
+import {
+  FolderTree,
+  ROOT,
+  type AuthoredItem,
+  type Folder,
+  type ItemError,
+  type PublishedItem,
+} from '../names/items';
+import { filesOf, itemsHash, publish } from '../names/publish';
 import { createListenClient, createPool, type Logger } from '../store/db';
 import { migrate } from '../store/migrate';
 import {
@@ -103,8 +112,39 @@ interface ModelState {
 
 export type ImportOutcome =
   | { status: 'created' | 'unchanged'; head: ModelHead }
-  | { status: 'conflict'; current: ModelHead | null }
+  | { status: 'conflict' | 'mode'; current: ModelHead | null }
   | { status: 'invalid'; contentHash: string; validation: ValidationResult };
+
+/** An item as the admin API names it. */
+export interface ItemRef {
+  folderId: string;
+  name: string;
+  fullName: string;
+}
+
+export type ItemsOutcome =
+  | { status: 'created' | 'unchanged'; head: ModelHead; items: ItemRef[] }
+  | { status: 'conflict' | 'mode'; current: ModelHead | null }
+  | { status: 'invalid'; errors: ItemError[]; cubeMessage: string | null };
+
+export interface ItemsCheck {
+  model: string;
+  valid: boolean;
+  errors: ItemError[];
+  cubeMessage: string | null;
+  probes: ProbeResult[];
+  itemsHash: string | null;
+  currentRevision: number | null;
+  /** The items the changeset writes, with the full names they would have. */
+  items: ItemRef[];
+}
+
+/** A folder tree that can't be taken as it is. */
+export class FolderTreeError extends Error {
+  public constructor(public readonly problems: string[]) {
+    super(problems.join('; '));
+  }
+}
 
 export interface InstanceModelStatus {
   revision: number | null;
@@ -1123,6 +1163,9 @@ export class XcubeRuntime {
     const store = this.requireStore();
 
     const head = await store.head(model);
+    if (head?.mode === 'items') {
+      return { status: 'mode', current: head };
+    }
     if (head?.contentHash === hash) {
       return { status: 'unchanged', head };
     }
@@ -1136,13 +1179,235 @@ export class XcubeRuntime {
     }
 
     const result = await store.import({ model, baseRevision, files: checked, source });
-    if (result.outcome === 'conflict') {
-      return { status: 'conflict', current: result.current };
+    if ('current' in result) {
+      return { status: result.outcome, current: result.current };
     }
-    if (result.outcome === 'created') {
+    this.announced(model, result.outcome);
+    return { status: result.outcome, head: result.head };
+  }
+
+  protected announced(model: string, outcome: 'created' | 'unchanged') {
+    if (outcome === 'created') {
       this.absent.delete(model);
       this.sync(model).catch((e) => this.warn('xcube: sync failed', { model, error: e.message }));
     }
-    return { status: result.outcome, head: result.head };
+  }
+
+  // ---------------------------------------------------------------- items (slice 3)
+
+  protected readonly itemsCache = new Map<string, PublishedItem[]>();
+
+  /** A revision's items, kept for the last few revisions read. */
+  protected async itemsAt(head: ModelHead): Promise<PublishedItem[]> {
+    if (head.mode !== 'items') {
+      return [];
+    }
+    const key = `${head.model}@${head.generation}@${head.revision}`;
+    let items = this.itemsCache.get(key);
+    if (!items) {
+      items = await this.requireStore().items(head.model, head.revision);
+      this.itemsCache.set(key, items);
+      while (this.itemsCache.size > 8) {
+        this.itemsCache.delete(this.itemsCache.keys().next().value!);
+      }
+    }
+    return items;
+  }
+
+  protected static refs(items: PublishedItem[], keys?: Set<string>): ItemRef[] {
+    return items
+      .filter((item) => !keys || keys.has(`${item.folderId}/${item.name}`))
+      .map(({ folderId, name, fullName }) => ({ folderId, name, fullName }));
+  }
+
+  /** Cube's errors, placed on the items whose resolved files they name. */
+  protected static itemErrors(validation: ValidationResult, items: PublishedItem[]): ItemError[] {
+    const byPath = new Map(items.map((item) => [`${item.fullName}.yml`, item]));
+    return validation.errors.map(({ path, line, column, kind, message }) => {
+      const item = path ? byPath.get(path) : undefined;
+      return {
+        folderId: item?.folderId ?? null,
+        name: item?.name ?? null,
+        ...(line !== undefined ? { line } : {}),
+        ...(column !== undefined ? { column } : {}),
+        kind,
+        message,
+      };
+    });
+  }
+
+  public async putFolders(model: string, folders: Folder[]): Promise<{ hash: string }> {
+    const problems = FolderTree.check(folders);
+    if (problems.length) {
+      throw new FolderTreeError(problems);
+    }
+    return { hash: await this.requireStore().putFolders(model, folders) };
+  }
+
+  /**
+   * Applies a changeset to the model's current items: resolves the items it
+   * changes, compiles the result as Cube would serve it, and stores it as a
+   * new revision (or, with `dryRun`, only checks it and runs the probes).
+   */
+  public async applyChangeset(
+    model: string,
+    changeset: {
+      baseRevision: number | null;
+      upserts: AuthoredItem[];
+      deletes: { folderId: string; name: string }[];
+      source: Record<string, unknown>;
+    },
+    check?: { securityContext: Record<string, unknown>; probes: Probe[] },
+  ): Promise<ItemsOutcome | ItemsCheck> {
+    const store = this.requireStore();
+    const head = await store.head(model);
+    if (head && head.mode !== 'items') {
+      return { status: 'mode', current: head };
+    }
+    const current = head ? await this.itemsAt(head) : [];
+    const tree = new FolderTree(await store.folders(model));
+    if (!tree.has(ROOT)) {
+      throw new FolderTreeError([`Model "${model}" has no folder tree yet: put its folders first`]);
+    }
+    return this.publishItems(model, head, {
+      tree, current, upserts: changeset.upserts, deletes: changeset.deletes,
+    }, changeset, check);
+  }
+
+  /** Replaces the model's whole folder tree and item set: a first import, or a recovery. */
+  public async importItemsSnapshot(
+    model: string,
+    snapshot: { baseRevision: number | null; folders: Folder[]; items: AuthoredItem[]; source: Record<string, unknown> },
+  ): Promise<ItemsOutcome> {
+    const problems = FolderTree.check(snapshot.folders);
+    if (problems.length) {
+      throw new FolderTreeError(problems);
+    }
+    const head = await this.requireStore().head(model);
+    return this.publishItems(model, head, {
+      tree: new FolderTree(snapshot.folders),
+      current: [],
+      upserts: snapshot.items,
+      deletes: [],
+      replaceAll: true,
+    }, snapshot, undefined, snapshot.folders) as Promise<ItemsOutcome>;
+  }
+
+  protected async publishItems(
+    model: string,
+    head: ModelHead | null,
+    input: Parameters<typeof publish>[0],
+    request: { baseRevision: number | null; source: Record<string, unknown> },
+    check?: { securityContext: Record<string, unknown>; probes: Probe[] },
+    folders?: Folder[],
+  ): Promise<ItemsOutcome | ItemsCheck> {
+    const baseMatches = (head?.revision ?? null) === request.baseRevision;
+    // A stale base is a conflict, unless the changes are already in (a retry).
+    const published = publish({ ...input, lenientDeletes: Boolean(!check && !baseMatches && !input.replaceAll) });
+    const hash = published.errors.length ? null : itemsHash(published.items);
+    const changed = new Set(published.changed);
+    const sameAsHead = () => Boolean(head && head.mode === 'items' && head.itemsHash === hash
+      && head.contentHash === contentHash(filesOf(published.items)));
+
+    if (!check) {
+      if (!baseMatches && !(published.errors.length === 0 && sameAsHead())) {
+        return { status: 'conflict', current: head };
+      }
+      if (published.errors.length) {
+        return { status: 'invalid', errors: published.errors, cubeMessage: null };
+      }
+      if (sameAsHead() && !folders) {
+        return { status: 'unchanged', head: head!, items: XcubeRuntime.refs(published.items, changed) };
+      }
+    }
+
+    const base: ItemsCheck = {
+      model,
+      valid: false,
+      errors: published.errors,
+      cubeMessage: null,
+      probes: [],
+      itemsHash: hash,
+      currentRevision: head?.revision ?? null,
+      items: XcubeRuntime.refs(published.items, changed),
+    };
+    if (published.errors.length) {
+      return base;
+    }
+
+    const files = checkedSnapshot(filesOf(published.items), this.settings.limits);
+    if (!check && sameAsHead()) {
+      // The same items with a new folder tree: stored without compiling again.
+      const same = await this.requireStore().importItems({
+        model, baseRevision: request.baseRevision, items: published.items, itemsHash: hash!, source: request.source, folders,
+      });
+      return 'current' in same
+        ? { status: same.outcome, current: same.current }
+        : { status: same.outcome, head: same.head, items: XcubeRuntime.refs(published.items, changed) };
+    }
+    const validation = await this.validate(
+      model,
+      files,
+      check ? Priority.DryRun : Priority.Import,
+      check?.securityContext ?? {},
+      check?.probes ?? [],
+    );
+    if (!validation.valid) {
+      const errors = XcubeRuntime.itemErrors(validation, published.items);
+      return check
+        ? { ...base, errors, cubeMessage: validation.cubeMessage }
+        : { status: 'invalid', errors, cubeMessage: validation.cubeMessage };
+    }
+    if (check) {
+      return { ...base, valid: true, probes: validation.probes };
+    }
+
+    const result = await this.requireStore().importItems({
+      model,
+      baseRevision: request.baseRevision,
+      items: published.items,
+      itemsHash: hash!,
+      source: request.source,
+      folders,
+    });
+    if ('current' in result) {
+      return { status: result.outcome, current: result.current };
+    }
+    this.announced(model, result.outcome);
+    return { status: result.outcome, head: result.head, items: XcubeRuntime.refs(published.items, changed) };
+  }
+
+  /** The current revision's items: full names, and what each short name they use is bound to. */
+  public async itemsOf(model: string) {
+    const head = await this.requireStore().head(model);
+    if (!head) {
+      return null;
+    }
+    const items = await this.itemsAt(head);
+    return {
+      model,
+      revision: head.revision,
+      mode: head.mode ?? 'files',
+      items: items.map(({ folderId, name, kind, fullName, bindings }) => ({ folderId, name, kind, fullName, bindings })),
+    };
+  }
+
+  /** What short names mean from a folder, nearest-first, in the current revision. */
+  public async resolveNames(model: string, folderId: string, names: string[]) {
+    const store = this.requireStore();
+    const head = await store.head(model);
+    const items = head ? await this.itemsAt(head) : [];
+    const tree = new FolderTree(await store.folders(model));
+    if (!tree.has(folderId)) {
+      throw new FolderTreeError([`Folder ${folderId} is not in the folder tree`]);
+    }
+    const byKey = new Map(items.map((item) => [`${item.folderId}/${item.name}`, item.fullName]));
+    const chain = tree.chain(folderId);
+    const resolved: Record<string, string | null> = {};
+    for (const name of names) {
+      const folder = chain.find((f) => byKey.has(`${f}/${name}`));
+      resolved[name] = folder ? byKey.get(`${folder}/${name}`)! : null;
+    }
+    return { model, revision: head?.revision ?? null, folderId, names: resolved };
   }
 }

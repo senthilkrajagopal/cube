@@ -53,6 +53,22 @@ class MemoryStore implements RevisionStore {
   public async import(_request: ImportRequest): Promise<ImportResult> {
     throw new Error('not used');
   }
+
+  public async importItems(): Promise<ImportResult> {
+    throw new Error('not used');
+  }
+
+  public async folders() {
+    return [];
+  }
+
+  public async putFolders(): Promise<string> {
+    throw new Error('not used');
+  }
+
+  public async items() {
+    return [];
+  }
 }
 
 /** A core whose compiles finish when a test says, or fail for content it is told to fail. */
