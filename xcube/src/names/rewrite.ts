@@ -24,6 +24,11 @@ export class Scope {
     defs: ItemDefinition[],
     /** Bindings items were published with; an item keeps its own until it is published again. */
     protected readonly bindingsOf: (def: ItemDefinition) => Record<string, string> | undefined = () => undefined,
+    /**
+     * An overlay's items by short name, which its own items' names resolve
+     * to first, before their folder path (a workspace, AC-281).
+     */
+    protected readonly overlay?: Map<string, ItemDefinition>,
   ) {
     for (const def of defs) {
       this.byKey.set(itemKey(def.folderId, def.name), def);
@@ -31,7 +36,16 @@ export class Scope {
     }
   }
 
-  public resolve(folderId: string, name: string): ItemDefinition | undefined {
+  /** The overlay item a name means to `from`, when `from` is in the overlay. */
+  protected inOverlay(from: ItemDefinition | undefined, name: string): ItemDefinition | undefined {
+    return from && this.overlay?.get(from.name) === from ? this.overlay.get(name) : undefined;
+  }
+
+  public resolve(folderId: string, name: string, from?: ItemDefinition): ItemDefinition | undefined {
+    const first = this.inOverlay(from, name);
+    if (first) {
+      return first;
+    }
     for (const folder of this.tree.chain(folderId)) {
       const def = this.byKey.get(itemKey(folder, name));
       if (def) {
@@ -62,6 +76,10 @@ export class Scope {
     const bound = this.bindingsOf(def)?.[def.extendsName];
     if (bound && this.byFullName.get(bound)) {
       return this.byFullName.get(bound);
+    }
+    const first = def.extendsName === def.name ? undefined : this.inOverlay(def, def.extendsName);
+    if (first) {
+      return first;
     }
     // An item never extends itself: its own name means an ancestor's namesake.
     const chain = this.tree.chain(def.folderId);
@@ -127,7 +145,7 @@ export function rewriteReferences(def: ItemDefinition, scope: Scope): {
   const at = { folderId: def.folderId, name: def.name };
 
   const bind = (name: string): ItemDefinition | undefined => {
-    const target = scope.resolve(def.folderId, name);
+    const target = scope.resolve(def.folderId, name, def);
     if (target) {
       bindings[name] = target.fullName;
     }

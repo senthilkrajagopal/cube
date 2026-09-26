@@ -52,12 +52,14 @@ const sign = (name, kid, payload) => {
 if (what === 'service') {
   console.log(sign('service', 'svc', { aud: 'xcube-admin', role: 'service' }));
 } else {
-  console.log(sign('user', 'user-1', { aud: 'xcube', role: 'user', groups: args[0].split(','), wechartRevision: Number(args[1]) }));
+  console.log(sign('user', 'user-1', {
+    aud: 'xcube', role: 'user', groups: args[0].split(','), wechartRevision: Number(args[1]), ...(args[2] ? { wechartOverlay: args[2] } : {}),
+  }));
 }
 JS
 node "$keys/tokens.js" init
 mkdir -p "$conf/model"
-echo "module.exports = require('xcube').config({ modelClaim: 'wechartModel', revisionClaim: 'wechartRevision' });" > "$conf/cube.js"
+echo "module.exports = require('xcube').config({ modelClaim: 'wechartModel', revisionClaim: 'wechartRevision', overlayClaim: 'wechartOverlay' });" > "$conf/cube.js"
 chmod -R a+rX "$conf"
 
 psql() {
@@ -168,3 +170,17 @@ status="$(query "$token")"
 status="$(signed GET /meta)"
 [ "$status" = 200 ] && grep -q '"name":"fsub__doubled"' /tmp/xcube-admin.json || { echo "the admin field list answered $status"; exit 1; }
 echo "Security check passed: keys and folder groups pushed with the service credential; the gate admits g_sub and refuses the rest."
+
+# Slice 5: a workspace's change pushed as an overlay, previewed by a token naming it.
+tripled_item='{"folderId": "fsub", "name": "doubled", "kind": "cube", "yaml": "cubes:\n  - name: doubled\n    sql: \"SELECT id, amount * 3 AS amount FROM {serving_check.sql()}\"\n    measures:\n      - name: total\n        sql: amount\n        type: sum\n"}'
+status="$(signed PUT /overlays/ws-check "{\"upserts\": [$tripled_item]}")"
+[ "$status" = 201 ] || { echo "overlay answered $status"; cat /tmp/xcube-admin.json; exit 1; }
+status="$(query "$(node "$keys/tokens.js" user g_sub "$revision" ws-check)")"
+[ "$status" = 200 ] && grep -q '"fsub__doubled.total":"126"' /tmp/xcube-query.json || { echo "the overlay's preview got $status"; cat /tmp/xcube-query.json; exit 1; }
+status="$(query "$(node "$keys/tokens.js" user g_sub "$revision")")"
+[ "$status" = 200 ] && grep -q '"fsub__doubled.total":"84"' /tmp/xcube-query.json || { echo "the published model got $status"; exit 1; }
+status="$(signed DELETE /overlays/ws-check)"
+[ "$status" = 204 ] || { echo "dropping the overlay answered $status"; exit 1; }
+status="$(query "$(node "$keys/tokens.js" user g_sub "$revision" ws-check)")"
+[ "$status" = 410 ] || { echo "a dropped overlay's preview got $status"; exit 1; }
+echo "Overlay check passed: a workspace's change previewed through its overlay, then dropped."

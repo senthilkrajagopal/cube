@@ -16,6 +16,12 @@ export interface XcubeConfigOptions {
   revisionClaim?: string;
   /** A context naming no model: Cube's own data model directory (`disk`, the default), or 403. */
   withoutModel?: 'disk' | 'refuse';
+  /**
+   * The claim naming the workspace or proposal overlay a request previews,
+   * signed into the token by the client for those it allows. Default
+   * `xcubeOverlay`.
+   */
+  overlayClaim?: string;
 }
 
 /** Cube options xcube sets itself; cube.js must not. */
@@ -57,6 +63,7 @@ export function createConfig(
     modelClaim: options.modelClaim ?? 'xcubeModel',
     revisionClaim: options.revisionClaim ?? 'xcubeRevision',
     withoutModel: options.withoutModel ?? 'disk',
+    overlayClaim: options.overlayClaim ?? 'xcubeOverlay',
   };
   if (serving.withoutModel !== 'disk' && serving.withoutModel !== 'refuse') {
     throw new Error('xcube.config(): withoutModel is \'disk\' or \'refuse\'');

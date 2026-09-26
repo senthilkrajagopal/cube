@@ -82,6 +82,22 @@ class MemoryStore implements RevisionStore {
     return null;
   }
 
+  public async putOverlay(): Promise<any> {
+    throw new Error('not used');
+  }
+
+  public async overlay() {
+    return null;
+  }
+
+  public async deleteOverlay() {
+    return false;
+  }
+
+  public async overlayCount() {
+    return 0;
+  }
+
   public async items() {
     return [];
   }

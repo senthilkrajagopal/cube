@@ -180,6 +180,28 @@ describeWithDatabase('permissions and keys across instances', () => {
     }
   });
 
+  test('an overlay dropped on one instance is gone on the others at once, not after their cache\'s 30 s', async () => {
+    const overlay = {
+      model: 'dev',
+      id: 'ws-x',
+      upserts: [],
+      deletes: [],
+      contentHash: 'a'.repeat(64),
+      validatedRevision: null,
+      validatedTree: null,
+      expiresAt: new Date(Date.now() + 60000),
+    };
+    const { overlay: stored } = await store.putOverlay(overlay, 100);
+    await eventually(async () => (await (b as any).overlayRecord('dev', 'ws-x'))?.version === stored!.version);
+    await store.deleteOverlay('dev', 'ws-x');
+    await eventually(async () => (await (b as any).overlayRecord('dev', 'ws-x')) === null, 2000);
+    // Pushed again, it has a newer version: nothing compiled for the dropped one is taken for it.
+    const { overlay: again } = await store.putOverlay({ ...overlay, contentHash: 'b'.repeat(64) }, 100);
+    expect(again!.version).toBeGreaterThan(stored!.version);
+    await eventually(async () => (await (b as any).overlayRecord('dev', 'ws-x'))?.version === again!.version, 2000);
+    await store.deleteOverlay('dev', 'ws-x');
+  });
+
   test('of two different sets pushed with one version at once, exactly one is kept', async () => {
     const other = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
     const results = await Promise.all([

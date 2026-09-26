@@ -15,8 +15,10 @@ import {
   type ProbeResult,
   type ValidationResult,
 } from '../model/validate';
+import { compileErrors } from '../model/errors';
 import {
   FolderTree,
+  fullNameOf,
   ROOT,
   type AuthoredItem,
   type Folder,
@@ -24,15 +26,19 @@ import {
   type PublishedItem,
 } from '../names/items';
 import { filesOf, itemsHash, publish } from '../names/publish';
+import { rollupsToStrip, withoutRollups } from '../overlays/rollups';
 import { createListenClient, createPool, type Logger } from '../store/db';
 import { migrate } from '../store/migrate';
 import {
   channelOf,
+  folderTreeHash,
   PgRevisionStore,
   type ModelHead,
+  type ModelMode,
   type ModelStatus,
   type RevisionStore,
   type StoredModule,
+  type StoredOverlay,
 } from '../store/revisions';
 import { COMMONS, groupModules } from '../modules/graph';
 import { admits, type Permissions } from '../security/gate';
@@ -41,7 +47,13 @@ import { KeyError, keySetOf, TokenError, tokenParts } from '../security/tokens';
 import { ROLE_KEY, TokenVerifier } from '../security/verifier';
 import { CompileLane, LaneBusyError, Priority } from './lane';
 import { RevisionListener, type ListenClient, type Notice } from './listener';
-import { DEFAULT_TOKENS, type TokenSettings, type XcubeSettings } from './settings';
+import {
+  DEFAULT_OVERLAYS,
+  DEFAULT_TOKENS,
+  type OverlaySettings,
+  type TokenSettings,
+  type XcubeSettings,
+} from './settings';
 
 /** What `config()` settles, with its defaults applied. */
 export interface ServingOptions {
@@ -51,6 +63,8 @@ export interface ServingOptions {
   revisionClaim: string;
   /** A context naming no model is served Cube's own data model directory (`disk`), or refused. */
   withoutModel: 'disk' | 'refuse';
+  /** The claim naming the overlay a request previews. */
+  overlayClaim?: string;
 }
 
 /** What xcube needs of Cube's server core. */
@@ -122,6 +136,32 @@ export interface ServedRevision {
   retireAfter?: number;
   /** Scheduled refresh runs using it; it is never retired while any do. */
   holds: number;
+  mode?: ModelMode;
+  /** An overlay applied to a published revision (`base`, its key): what previews of it are served. */
+  overlay?: { id: string; version: number; base: string };
+  /** For an overlay: when a request last used it, for idle retirement. */
+  lastUsed?: number;
+  /** For an overlay: its items as applied, to place compile errors on. */
+  items?: PublishedItem[];
+}
+
+/** An overlay id: what the client names a workspace or a proposal by. */
+export const OVERLAY_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
+/** What pushing an overlay came to. */
+export type OverlayOutcome =
+  | { status: 'unknown' | 'mode' | 'too_many' }
+  | { status: 'conflict'; current: number | null }
+  | { status: 'invalid'; errors: ItemError[]; cubeMessage: string | null }
+  | { status: 'created' | 'updated' | 'unchanged'; overlay: StoredOverlay; revision: number; items: ItemRef[] };
+
+function gone(model: string, id: string): CubejsHandlerError {
+  return new CubejsHandlerError(410, 'Gone', `Overlay "${id}" of model "${model}" is gone: it expired, or was dropped`);
+}
+
+function brokenOverlay(id: string, errors: ItemError[]): CubejsHandlerError {
+  const first = errors.slice(0, 3).map((e) => `${e.folderId ?? '?'}/${e.name ?? '?'}: ${e.message}`).join('; ');
+  return new CubejsHandlerError(409, 'Conflict', `Overlay "${id}" doesn't apply to what is published now: ${first}`);
 }
 
 /** A snapshot being checked, compiled once and never served. */
@@ -412,6 +452,7 @@ export class XcubeRuntime {
     this.verifier = new TokenVerifier(this.tokens, {
       modelClaim: () => this.options?.modelClaim ?? 'xcubeModel',
       revisionClaim: () => this.options?.revisionClaim ?? 'xcubeRevision',
+      overlayClaim: () => this.options?.overlayClaim ?? 'xcubeOverlay',
       missingKid: () => this.rereadKeys(),
     });
   }
@@ -493,7 +534,11 @@ export class XcubeRuntime {
         channel: channelOf(settings.schema),
         createClient: listenClient,
         onNotify: (model, notice) => this.notified(model, notice),
-        onConnect: () => this.syncAllQuietly(),
+        onConnect: () => {
+          // Anything announced while the listener was down was missed.
+          this.overlayRecords.clear();
+          this.syncAllQuietly();
+        },
         onDown: () => this.schedulePoll(),
         logger: (m, p) => this.log(m, p),
       });
@@ -664,6 +709,10 @@ export class XcubeRuntime {
       const pinned = this.served.get(pin.appId);
       if (pinned && pinned.model === model && pinned.state !== 'activating') {
         return pinned;
+      }
+      if (pin.appId.startsWith(`xcube:${model}:o:`)) {
+        // Never the published model in an overlay's place.
+        throw unavailable('The overlay this request was pinned to is no longer compiled here; try again');
       }
       this.warn('xcube: pinned revision retired; answering from the active one', { model, appId: pin.appId });
     }
@@ -1054,7 +1103,8 @@ export class XcubeRuntime {
     if (this.tokens.hs256 === 'off') {
       throw new CubejsHandlerError(403, 'Forbidden', 'Invalid token: only RS256 tokens are taken');
     }
-    const { [ROLE_KEY]: _role, ...rest } = context ?? {};
+    // Only xcube sets a role, and names the module a context is served from.
+    const { [ROLE_KEY]: _role, [MODULE_KEY]: _module, ...rest } = context ?? {};
     const model = this.modelOf(rest);
     if (model !== undefined ? this.verifier.hasKeys(model) : this.verifier.anyKeys()) {
       throw new CubejsHandlerError(403, 'Forbidden', model !== undefined
@@ -1072,6 +1122,344 @@ export class XcubeRuntime {
     } catch {
       return false;
     }
+  }
+
+  // ------------------------------------------------------------- overlays
+
+  public get overlaySettings(): OverlaySettings {
+    return this.settings.overlays ?? DEFAULT_OVERLAYS;
+  }
+
+  /** The overlay a security context previews: `undefined` when it names none. */
+  public overlayOf(securityContext: any): string | undefined {
+    const id = securityContext?.[this.servingOptions.overlayClaim ?? 'xcubeOverlay'];
+    if (id === undefined || id === null) {
+      return undefined;
+    }
+    if (typeof id !== 'string' || !OVERLAY_ID.test(id)) {
+      throw forbidden('Invalid overlay id in the security context');
+    }
+    return id;
+  }
+
+  protected readonly overlayRecords = new Map<string, { record: StoredOverlay | null; readAt: number }>();
+
+  protected readonly overlayReads = new Map<string, Promise<StoredOverlay | null>>();
+
+  /** Bumped whenever an overlay changes or goes, so a read begun before is read again. */
+  protected readonly overlayGenerations = new Map<string, number>();
+
+  protected readonly overlayBuilds = new Map<string, Promise<ServedRevision>>();
+
+  /**
+   * Overlays that don't apply to a published revision, by the key they would
+   * be served under: what the overlay's items make of it, never a passing
+   * failure.
+   */
+  protected readonly brokenOverlays = new Map<string, { id: string; errors: ItemError[]; cubeMessage: string | null; at: number }>();
+
+  /**
+   * An overlay as last read: again after 30 s (2 s when there was none), and
+   * at once when a notification says it changed.
+   */
+  protected async overlayRecord(model: string, id: string): Promise<StoredOverlay | null> {
+    const key = `${model}/${id}`;
+    const cached = this.overlayRecords.get(key);
+    if (cached && Date.now() - cached.readAt < (cached.record ? 30000 : 2000)) {
+      return cached.record && cached.record.expiresAt.getTime() > Date.now() ? cached.record : null;
+    }
+    let read = this.overlayReads.get(key);
+    if (!read) {
+      read = (async () => {
+        for (;;) {
+          const generation = this.overlayGenerations.get(key) ?? 0;
+          const record = await this.requireStore().overlay(model, id);
+          // Changed while it was read: what was read may be what changed.
+          if ((this.overlayGenerations.get(key) ?? 0) === generation) {
+            this.overlayRecords.set(key, { record, readAt: Date.now() });
+            while (this.overlayRecords.size > 10000) {
+              this.overlayRecords.delete(this.overlayRecords.keys().next().value!);
+            }
+            return record;
+          }
+        }
+      })().finally(() => this.overlayReads.delete(key));
+      this.overlayReads.set(key, read);
+    }
+    return read;
+  }
+
+  /**
+   * An overlay changed (to `version`) or went: read it again, and let what
+   * was compiled for another version of it go once in-flight requests end.
+   */
+  protected overlayChanged(model: string, id: string, version?: number) {
+    const key = `${model}/${id}`;
+    this.overlayGenerations.set(key, (this.overlayGenerations.get(key) ?? 0) + 1);
+    this.overlayRecords.delete(key);
+    for (const [served, broken] of [...this.brokenOverlays]) {
+      if (broken.id === id && served.startsWith(`xcube:${model}:o:`)) {
+        this.brokenOverlays.delete(served);
+      }
+    }
+    for (const revision of this.served.values()) {
+      if (revision.model === model && revision.overlay?.id === id && revision.overlay.version !== version
+        && revision.state !== 'retiring') {
+        revision.state = 'retiring';
+        revision.retireAfter = Date.now() + this.settings.retireGraceMs;
+      }
+    }
+  }
+
+  /** The key an overlay is served under: its version, over a published revision, with the folder tree it resolved in. */
+  protected overlayKey(base: ServedRevision, id: string, version: number): string {
+    return `xcube:${base.model}:o:${id}:${version}:t${this.permissions.get(base.model)?.version ?? 0}@${base.key}`;
+  }
+
+  /**
+   * An overlay applied to a published revision, as previews of it are
+   * served: built on first use and kept while used. Only the modules the
+   * overlay changes are compiled; the rest are the published ones.
+   */
+  protected async overlayRevision(base: ServedRevision, id: string): Promise<ServedRevision> {
+    const record = await this.overlayRecord(base.model, id);
+    if (!record) {
+      throw gone(base.model, id);
+    }
+    const key = this.overlayKey(base, id, record.version);
+    const known = this.served.get(key);
+    if (known && known.state !== 'activating') {
+      // Idle, or pushed again unchanged: the same version on the same revision, used again.
+      known.state = 'active';
+      known.retireAfter = undefined;
+      known.lastUsed = Date.now();
+      return known;
+    }
+    const broken = this.brokenOverlays.get(key);
+    if (broken) {
+      throw brokenOverlay(id, broken.errors);
+    }
+    // One build per key: requests arriving meanwhile wait for it.
+    let build = this.overlayBuilds.get(key);
+    if (!build) {
+      build = this.buildOverlay(base, record, key).finally(() => this.overlayBuilds.delete(key));
+      this.overlayBuilds.set(key, build);
+    }
+    return build;
+  }
+
+  protected async buildOverlay(base: ServedRevision, record: StoredOverlay, key: string): Promise<ServedRevision> {
+    if (base.mode !== 'items') {
+      throw new CubejsHandlerError(409, 'Conflict', `Model "${base.model}" holds a file set; overlays need items`);
+    }
+    let served = this.served.get(key);
+    if (!served) {
+      const head: ModelHead = {
+        model: base.model, generation: base.generation, revision: base.revision, contentHash: base.contentHash, mode: 'items',
+      };
+      const tree = new FolderTree(await this.requireStore().folders(base.model));
+      const applied = this.applyOverlay(tree, await this.itemsAt(head), record, base.data.modules);
+      if ('errors' in applied) {
+        this.brokenOverlays.set(key, { id: record.id, errors: applied.errors, cubeMessage: null, at: Date.now() });
+        throw brokenOverlay(record.id, applied.errors);
+      }
+      this.makeRoomForOverlay();
+      served = this.servedRevision(
+        { ...head, contentHash: contentHash(applied.files) },
+        { files: applied.files, modules: applied.modules },
+        { key, id: record.id, version: record.version, base: base.key },
+      );
+      served.items = applied.items;
+    }
+    served.lastUsed = Date.now();
+    try {
+      for (const resident of served.modules.values()) {
+        await this.ensureCompiled(resident);
+      }
+    } catch (e: any) {
+      if (e instanceof LaneBusyError) {
+        // What compiled stays: the next request carries on from there.
+        throw e;
+      }
+      const message = String(e?.message ?? e);
+      const placed = compileErrors(message, new Set(served.data.files.map((f) => f.path)));
+      const items = served.items ?? [];
+      this.served.delete(key);
+      this.retireUnused();
+      if (!placed.length) {
+        // Not Cube refusing what the overlay makes of the model: nothing to remember.
+        throw e;
+      }
+      const errors = XcubeRuntime.itemErrors({ valid: false, errors: placed, cubeMessage: message, probes: [] }, items);
+      this.brokenOverlays.set(key, { id: record.id, errors, cubeMessage: message, at: Date.now() });
+      throw brokenOverlay(record.id, errors);
+    }
+    if (served.state === 'activating') {
+      // Unless it changed or went meanwhile: then it only answers those that waited for it.
+      served.state = 'active';
+    }
+    served.lastUsed = Date.now();
+    this.log('xcube: serving an overlay', {
+      model: base.model,
+      overlay: record.id,
+      version: record.version,
+      revision: base.revision,
+      modules: served.modules.size,
+      changedModules: [...served.modules.values()].filter((r) => base.modules.get(r.moduleId) !== r).length,
+    });
+    return served;
+  }
+
+  /** At most `XCUBE_MAX_ACTIVE_OVERLAYS` overlays stay compiled here: the least recently used makes room. */
+  protected makeRoomForOverlay() {
+    const kept = [...this.served.values()]
+      .filter((r) => r.overlay && r.state === 'active')
+      .sort((a, b) => (a.lastUsed ?? 0) - (b.lastUsed ?? 0));
+    for (const revision of kept.slice(0, Math.max(0, kept.length - this.overlaySettings.maxActive + 1))) {
+      revision.state = 'retiring';
+      revision.retireAfter = Date.now() + this.settings.retireGraceMs;
+    }
+  }
+
+  /**
+   * An overlay's items over published ones, as Cube compiles them: names
+   * resolved in the overlay first, then along each item's folder path; the
+   * pre-aggregations of every item its changes reach left out (and of their
+   * ancestors, whose rollups they would inherit); modules kept from the
+   * published revision's where unchanged.
+   */
+  protected applyOverlay(
+    tree: FolderTree,
+    current: PublishedItem[],
+    overlay: { upserts: AuthoredItem[]; deletes: { folderId: string; name: string }[] },
+    previous: StoredModule[],
+  ): { items: PublishedItem[]; changed: string[]; files: SnapshotFile[]; modules: StoredModule[] } | { errors: ItemError[] } {
+    const published = publish({
+      tree, current, upserts: overlay.upserts, deletes: overlay.deletes, lenientDeletes: true, overlay: true,
+    });
+    if (published.errors.length) {
+      return { errors: published.errors };
+    }
+    const byKey = new Map(published.items.map((item) => [`${item.folderId}/${item.name}`, item.fullName]));
+    const changed = published.changed.map((key) => byKey.get(key)!);
+    const stripped = rollupsToStrip(published.items, new Set(changed));
+    const files = filesOf(published.items).map((f) => (stripped.has(f.path.slice(0, -'.yml'.length)) ? withoutRollups(f) : f));
+    return {
+      items: published.items,
+      changed: published.changed,
+      files,
+      modules: this.moduleGroups(previous, tree, published.items, files),
+    };
+  }
+
+  /**
+   * Stores a workspace's or a proposal's items as an overlay, once they apply
+   * to what is published now and every module they change compiles. A push
+   * that doesn't keeps the overlay as it was. With `baseVersion`, only over
+   * that version of it (`null`: only as a new one).
+   */
+  public async putOverlay(
+    model: string,
+    id: string,
+    body: {
+      upserts: AuthoredItem[];
+      deletes: { folderId: string; name: string }[];
+      ttlSeconds?: number;
+      baseVersion?: number | null;
+    },
+  ): Promise<OverlayOutcome> {
+    const store = this.requireStore();
+    const head = await store.head(model);
+    if (!head) {
+      return { status: 'unknown' };
+    }
+    if (head.mode !== 'items') {
+      return { status: 'mode' };
+    }
+    const settings = this.overlaySettings;
+    const known = await store.overlay(model, id);
+    if (body.baseVersion !== undefined && (known?.version ?? null) !== body.baseVersion) {
+      return { status: 'conflict', current: known?.version ?? null };
+    }
+    if (!known && await store.overlayCount(model) >= settings.max) {
+      return { status: 'too_many' };
+    }
+    const expiresAt = new Date(Date.now() + 1000 * Math.min(body.ttlSeconds ?? settings.ttlS, settings.maxTtlS));
+    const hash = crypto.createHash('sha256')
+      .update(JSON.stringify([itemsHash(body.upserts), [...body.deletes].map((d) => `${d.folderId}/${d.name}`).sort()]), 'utf8')
+      .digest('hex');
+    const folders = await store.folders(model);
+    const treeHash = folderTreeHash(folders);
+    const tree = new FolderTree(folders);
+    const current = await this.itemsAt(head);
+    const applied = this.applyOverlay(tree, current, body, await store.modules(model, head.revision));
+    if ('errors' in applied) {
+      return { status: 'invalid', errors: applied.errors, cubeMessage: null };
+    }
+    if (!(known && known.contentHash === hash && known.validatedRevision === head.revision && known.validatedTree === treeHash)) {
+      const validation = await this.validateModules(
+        model, head, checkedSnapshot(applied.files, this.settings.limits), applied.modules, Priority.DryRun, {}, [],
+      );
+      if (!validation.valid) {
+        return { status: 'invalid', errors: XcubeRuntime.itemErrors(validation, applied.items), cubeMessage: validation.cubeMessage };
+      }
+    }
+    const result = await store.putOverlay({
+      model,
+      id,
+      upserts: body.upserts,
+      deletes: body.deletes,
+      contentHash: hash,
+      validatedRevision: head.revision,
+      validatedTree: treeHash,
+      expiresAt,
+    }, settings.max, body.baseVersion);
+    if (result.outcome === 'too_many') {
+      return { status: 'too_many' };
+    }
+    if (result.outcome === 'conflict') {
+      return { status: 'conflict', current: result.overlay?.version ?? null };
+    }
+    this.overlayChanged(model, id, result.overlay!.version);
+    return {
+      status: result.outcome,
+      overlay: result.overlay!,
+      revision: head.revision,
+      items: XcubeRuntime.refs(applied.items, new Set(applied.changed)),
+    };
+  }
+
+  /** A stored overlay, and whether it applies to what this instance serves now. */
+  public async overlayStatus(model: string, id: string) {
+    const record = await this.requireStore().overlay(model, id);
+    if (!record) {
+      return null;
+    }
+    const active = this.models.get(model)?.active;
+    const key = active ? this.overlayKey(active, id, record.version) : undefined;
+    const broken = key ? this.brokenOverlays.get(key) : undefined;
+    let instance: Record<string, unknown> = { state: 'idle' };
+    if (broken) {
+      instance = { state: 'broken', errors: broken.errors, cubeMessage: broken.cubeMessage };
+    } else if (key && this.served.get(key)?.state === 'active') {
+      instance = { state: 'serving' };
+    }
+    return {
+      model,
+      id,
+      version: record.version,
+      expiresAt: record.expiresAt.toISOString(),
+      validatedRevision: record.validatedRevision,
+      upserts: record.upserts.map(({ folderId, name, kind }) => ({ folderId, name, kind })),
+      deletes: record.deletes,
+      instance: { revision: active?.revision ?? null, ...instance },
+    };
+  }
+
+  public async deleteOverlay(model: string, id: string): Promise<boolean> {
+    const dropped = await this.requireStore().deleteOverlay(model, id);
+    this.overlayChanged(model, id);
+    return dropped;
   }
 
   /** A context for xcube's own reads of a model, pinned to its active revision. */
@@ -1110,6 +1498,19 @@ export class XcubeRuntime {
     }
     setHeader(res, 'x-xcube-revision', `${model}@${revision.revision}`);
     setHeader(res, 'x-xcube-generation', revision.generation);
+    const overlayId = this.overlayOf(securityContext);
+    if (overlayId !== undefined) {
+      try {
+        revision = await this.overlayRevision(revision, overlayId);
+      } catch (e: any) {
+        if (e instanceof LaneBusyError) {
+          setHeader(res, 'Retry-After', String(Math.ceil(e.retryAfterMs / 1000)));
+          throw unavailable('Cube is busy compiling; try again');
+        }
+        throw e;
+      }
+      setHeader(res, 'x-xcube-overlay', `${overlayId}@${revision.overlay!.version}`);
+    }
     const module = this.moduleForQuery(revision, queryOf(req));
     if (!revision.single && module?.startsWith(UNION_PREFIX)) {
       // A union is compiled in the compile lane, not on the request path. (Requests without
@@ -1305,6 +1706,12 @@ export class XcubeRuntime {
   // ------------------------------------------------------------ following
 
   protected notified(model: string, notice: Notice = {}) {
+    if (notice.overlay !== undefined) {
+      if (MODEL_ID.test(model) && OVERLAY_ID.test(notice.overlay)) {
+        this.overlayChanged(model, notice.overlay, notice.version);
+      }
+      return;
+    }
     if (notice.permissions !== undefined || notice.keys !== undefined) {
       if (!MODEL_ID.test(model)) {
         this.warn('xcube: ignored a notification for an invalid model id', {});
@@ -1531,8 +1938,12 @@ export class XcubeRuntime {
   }
 
   /** How a revision is served: its modules' compiled models, shared with other revisions where unchanged. */
-  protected servedRevision(head: ModelHead, data: RevisionData): ServedRevision {
-    const key = appIdOf(head);
+  protected servedRevision(
+    head: ModelHead,
+    data: RevisionData,
+    overlay?: { key: string; id: string; version: number; base: string },
+  ): ServedRevision {
+    const key = overlay?.key ?? appIdOf(head);
     const existing = this.served.get(key);
     if (existing) {
       return existing;
@@ -1578,6 +1989,8 @@ export class XcubeRuntime {
       unions: new Map(),
       state: 'activating',
       holds: 0,
+      mode: head.mode,
+      ...(overlay ? { overlay: { id: overlay.id, version: overlay.version, base: overlay.base }, lastUsed: Date.now() } : {}),
     };
     this.served.set(key, revision);
     return revision;
@@ -1737,6 +2150,19 @@ export class XcubeRuntime {
   protected retireDue() {
     const now = Date.now();
     const idle = (r?: Resident) => Boolean(r && (r.lastUsed ?? 0) + this.settings.retireGraceMs <= now);
+    for (const revision of this.served.values()) {
+      // An overlay no query has used for a while: compiled again when one does.
+      if (revision.overlay && revision.state !== 'retiring' && !this.overlayBuilds.has(revision.key)
+        && (revision.lastUsed ?? 0) + this.overlaySettings.idleMs <= now) {
+        revision.state = 'retiring';
+        revision.retireAfter = now;
+      }
+    }
+    for (const [key, broken] of [...this.brokenOverlays]) {
+      if (broken.at + this.overlaySettings.idleMs <= now) {
+        this.brokenOverlays.delete(key);
+      }
+    }
     for (const revision of this.served.values()) {
       for (const [key, union] of [...revision.unions]) {
         if (idle(union)) {
@@ -2200,6 +2626,11 @@ export class XcubeRuntime {
    */
   protected async modulesFor(head: ModelHead | null, tree: FolderTree, items: PublishedItem[]): Promise<StoredModule[]> {
     const previous = head?.mode === 'items' ? await this.requireStore().modules(head.model, head.revision) : [];
+    return this.moduleGroups(previous, tree, items, filesOf(items));
+  }
+
+  /** `modulesFor`, from the previous modules given, versioned by the files given (an overlay's differ). */
+  protected moduleGroups(previous: StoredModule[], tree: FolderTree, items: PublishedItem[], files: SnapshotFile[]): StoredModule[] {
     const zoneOf = (folderId: string) => {
       const chain = tree.chain(folderId);
       return chain.length >= 2 ? chain[chain.length - 2] : ROOT;
@@ -2210,7 +2641,7 @@ export class XcubeRuntime {
       kind: item.kind,
       references: [...new Set(Object.values(item.bindings))].filter((n) => n !== item.fullName),
     })), zoneOf, previous, this.settings.modules);
-    const byPath = new Map(filesOf(items).map((f) => [f.path, f]));
+    const byPath = new Map(files.map((f) => [f.path, f]));
     return grouped.map((m) => ({
       id: m.id,
       members: m.members,
@@ -2300,8 +2731,11 @@ export class XcubeRuntime {
     };
   }
 
-  /** What short names mean from a folder, nearest-first, in the current revision. */
-  public async resolveNames(model: string, folderId: string, names: string[]) {
+  /**
+   * What short names mean from a folder, nearest-first, in the current
+   * revision; with an overlay, in the overlay first (a workspace, AC-281).
+   */
+  public async resolveNames(model: string, folderId: string, names: string[], overlayId?: string) {
     const store = this.requireStore();
     const head = await store.head(model);
     const items = head ? await this.itemsAt(head) : [];
@@ -2310,12 +2744,26 @@ export class XcubeRuntime {
       throw new FolderTreeError([`Folder ${folderId} is not in the folder tree`]);
     }
     const byKey = new Map(items.map((item) => [`${item.folderId}/${item.name}`, item.fullName]));
+    const first = new Map<string, string>();
+    if (overlayId !== undefined) {
+      const overlay = await store.overlay(model, overlayId);
+      if (!overlay) {
+        throw gone(model, overlayId);
+      }
+      overlay.deletes.forEach(({ folderId: f, name }) => byKey.delete(`${f}/${name}`));
+      for (const item of overlay.upserts) {
+        byKey.set(`${item.folderId}/${item.name}`, fullNameOf(item.folderId, item.name));
+        first.set(item.name, fullNameOf(item.folderId, item.name));
+      }
+    }
     const chain = tree.chain(folderId);
     const resolved: Record<string, string | null> = {};
     for (const name of names) {
       const folder = chain.find((f) => byKey.has(`${f}/${name}`));
-      resolved[name] = folder ? byKey.get(`${folder}/${name}`)! : null;
+      resolved[name] = first.get(name) ?? (folder ? byKey.get(`${folder}/${name}`)! : null);
     }
-    return { model, revision: head?.revision ?? null, folderId, names: resolved };
+    return {
+      model, revision: head?.revision ?? null, folderId, ...(overlayId !== undefined ? { overlay: overlayId } : {}), names: resolved,
+    };
   }
 }

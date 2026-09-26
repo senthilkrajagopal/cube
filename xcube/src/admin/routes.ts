@@ -11,7 +11,14 @@ import { getEnv } from '@cubejs-backend/shared';
 import { CubejsHandlerError } from '@cubejs-backend/api-gateway';
 
 import { LaneBusyError } from '../runtime/lane';
-import { FolderTreeError, KeySetError, MAX_MODEL_KEYS, type ItemsOutcome, type XcubeRuntime } from '../runtime/runtime';
+import {
+  FolderTreeError,
+  KeySetError,
+  MAX_MODEL_KEYS,
+  OVERLAY_ID,
+  type ItemsOutcome,
+  type XcubeRuntime,
+} from '../runtime/runtime';
 import {
   FolderInUseError,
   OlderInstancesError,
@@ -140,6 +147,14 @@ const changesetCheckSchema = changesetSchema.keys({
 const resolveSchema = Joi.object({
   folderId: Joi.string().max(64).required(),
   names: Joi.array().max(1000).items(Joi.string().max(64)).required(),
+  overlay: Joi.string().pattern(OVERLAY_ID),
+});
+
+const overlaySchema = Joi.object({
+  upserts: Joi.array().max(2000).items(itemSchema).default([]),
+  deletes: Joi.array().max(2000).items(itemRefSchema).default([]),
+  ttlSeconds: Joi.number().integer().min(1),
+  baseVersion: Joi.number().integer().min(1).allow(null),
 });
 
 class AdminError extends Error {
@@ -466,6 +481,66 @@ export function initAdminRoutes(
   app.post(`${base}/resolve`, auth, json, handle('resolve', async (req, res) => {
     const model = modelOf(req);
     const body = valid<any>(resolveSchema, req.body);
-    res.json(await runtime.resolveNames(model, body.folderId, body.names));
+    res.json(await runtime.resolveNames(model, body.folderId, body.names, body.overlay));
+  }));
+
+  const overlayIdOf = (req: Request) => {
+    if (!OVERLAY_ID.test(req.params.id)) {
+      throw new AdminError(400, 'invalid_overlay_id', 'An overlay id is 1 to 64 of A-Z, a-z, 0-9, _ and -');
+    }
+    return req.params.id;
+  };
+
+  app.put(`${base}/overlays/:id`, auth, json, handle('overlays', async (req, res) => {
+    const model = modelOf(req);
+    const id = overlayIdOf(req);
+    const body = valid<any>(overlaySchema, req.body);
+    const started = Date.now();
+    const outcome = await runtime.putOverlay(model, id, body);
+    logger('xcube: overlay pushed', {
+      model, overlay: id, upserts: body.upserts.length, deletes: body.deletes.length, status: outcome.status, durationMs: Date.now() - started,
+    });
+    switch (outcome.status) {
+      case 'unknown':
+        throw new AdminError(404, 'unknown_model', `Unknown model "${model}"`);
+      case 'mode':
+        throw new AdminError(409, 'mode', `Model "${model}" holds a file set; overlays need items`);
+      case 'too_many':
+        throw new AdminError(409, 'too_many_overlays', `Model "${model}" holds as many overlays as it may (XCUBE_MAX_OVERLAYS)`);
+      case 'conflict':
+        throw new AdminError(409, 'conflict', `Overlay "${id}" isn't at the push's baseVersion`, { currentVersion: outcome.current });
+      case 'invalid':
+        throw new AdminError(422, 'invalid_items', 'The overlay doesn\'t apply to what is published now', {
+          errors: outcome.errors,
+          cubeMessage: outcome.cubeMessage,
+        });
+      default:
+        res.status(outcome.status === 'created' ? 201 : 200).json({
+          model,
+          id,
+          version: outcome.overlay.version,
+          created: outcome.status === 'created',
+          revision: outcome.revision,
+          expiresAt: outcome.overlay.expiresAt.toISOString(),
+          items: outcome.items,
+        });
+    }
+  }));
+
+  app.get(`${base}/overlays/:id`, auth, handle('overlays', async (req, res) => {
+    const model = modelOf(req);
+    const status = await runtime.overlayStatus(model, overlayIdOf(req));
+    if (!status) {
+      throw new AdminError(404, 'unknown_overlay', 'No such overlay: it expired, was dropped, or never was');
+    }
+    res.json(status);
+  }));
+
+  app.delete(`${base}/overlays/:id`, auth, handle('overlays', async (req, res) => {
+    const model = modelOf(req);
+    const id = overlayIdOf(req);
+    const dropped = await runtime.deleteOverlay(model, id);
+    logger('xcube: overlay dropped', { model, overlay: id, existed: dropped });
+    res.status(204).end();
   }));
 }

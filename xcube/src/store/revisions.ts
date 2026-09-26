@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import type { Pool, PoolClient } from 'pg';
 
 import { contentHash, fileHash, snapshotBytes, type SnapshotFile } from '../model/snapshot';
-import type { Folder, PublishedItem } from '../names/items';
+import type { AuthoredItem, Folder, PublishedItem } from '../names/items';
 import { filesOf } from '../names/publish';
 import { assertSchemaName, inTransaction } from './db';
 
@@ -90,6 +90,27 @@ export type PutKeysResult =
   | { outcome: 'replaced' | 'unchanged'; current: StoredKeySet }
   | { outcome: 'stale' | 'conflict'; current: StoredKeySet };
 
+/** A workspace's or a proposal's unpublished items, as stored. */
+export interface StoredOverlay {
+  model: string;
+  id: string;
+  version: number;
+  upserts: AuthoredItem[];
+  deletes: { folderId: string; name: string }[];
+  /** SHA-256 of the upserts and deletes: a push of the same content changes nothing but the expiry. */
+  contentHash: string;
+  /** The published revision it was last checked against. */
+  validatedRevision: number | null;
+  /** The folder tree it was checked against (`folderTreeHash`). */
+  validatedTree: string | null;
+  expiresAt: Date;
+}
+
+export type PutOverlayResult = {
+  outcome: 'created' | 'updated' | 'unchanged' | 'too_many' | 'conflict';
+  overlay: StoredOverlay | null;
+};
+
 /** What each model's permissions and keys are at, for an instance to tell it is behind. */
 export interface ModelVersions {
   model: string;
@@ -156,6 +177,17 @@ export interface RevisionStore {
   versions(): Promise<ModelVersions[]>;
   putKeys(model: string, set: StoredKeySet): Promise<PutKeysResult>;
   keys(model: string): Promise<StoredKeySet | null>;
+  /**
+   * Stores an overlay's new content, or only extends its life when the
+   * content is the same; with `baseVersion`, only over that version
+   * (`null`: only as a new overlay).
+   */
+  putOverlay(overlay: Omit<StoredOverlay, 'version'>, maxOverlays: number, baseVersion?: number | null): Promise<PutOverlayResult>;
+  /** An overlay that hasn't expired. */
+  overlay(model: string, id: string): Promise<StoredOverlay | null>;
+  /** How many live overlays a model holds. */
+  overlayCount(model: string): Promise<number>;
+  deleteOverlay(model: string, id: string): Promise<boolean>;
   /** A revision's items, with their authored and resolved YAML. */
   items(model: string, revision: number): Promise<PublishedItem[]>;
   /** A revision's modules; empty when it is served whole. */
@@ -378,8 +410,9 @@ export class PgRevisionStore implements RevisionStore {
         throw new PermissionsError(problems);
       }
     }
+    // Parents too: a moved folder changes how an overlay's names resolve.
     const hash = crypto.createHash('sha256')
-      .update(JSON.stringify([row.security, folders.map((f) => [f.id, f.groups])]), 'utf8')
+      .update(JSON.stringify([row.security, folders.map((f) => [f.id, f.parentId, f.groups])]), 'utf8')
       .digest('hex');
     if (hash === row.permissions_hash) {
       return versionOf(row.permissions_version);
@@ -461,6 +494,92 @@ export class PgRevisionStore implements RevisionStore {
       );
       await client.query('SELECT pg_notify($1, $2)', [channelOf(s), JSON.stringify({ model, keys: set.version })]);
       return { outcome: 'replaced', current: (await this.keysIn(client, model))! };
+    });
+  }
+
+  protected overlayOf(row: any): StoredOverlay {
+    return {
+      model: row.model,
+      id: row.id,
+      version: versionOf(row.version),
+      upserts: row.upserts,
+      deletes: row.deletes,
+      contentHash: row.content_hash,
+      validatedRevision: row.validated_rev,
+      validatedTree: row.validated_tree,
+      expiresAt: new Date(row.expires_at),
+    };
+  }
+
+  public async putOverlay(
+    overlay: Omit<StoredOverlay, 'version'>,
+    maxOverlays: number,
+    baseVersion?: number | null,
+  ): Promise<PutOverlayResult> {
+    const { s } = this;
+    return inTransaction(this.pool, async (client) => {
+      await client.query("SET LOCAL lock_timeout = '10s'");
+      await client.query(`SELECT 1 FROM ${s}.models WHERE id = $1 FOR UPDATE`, [overlay.model]);
+      await client.query(`DELETE FROM ${s}.overlays WHERE model = $1 AND expires_at < now()`, [overlay.model]);
+      const { rows: [known] } = await client.query(
+        `SELECT * FROM ${s}.overlays WHERE model = $1 AND id = $2`,
+        [overlay.model, overlay.id]
+      );
+      if (baseVersion !== undefined && (known ? versionOf(known.version) : null) !== baseVersion) {
+        return { outcome: 'conflict', overlay: known ? this.overlayOf(known) : null };
+      }
+      if (!known) {
+        const { rows: [{ n }] } = await client.query(`SELECT count(*)::int AS n FROM ${s}.overlays WHERE model = $1`, [overlay.model]);
+        if (n >= maxOverlays) {
+          return { outcome: 'too_many', overlay: null };
+        }
+      }
+      const same = known && known.content_hash === overlay.contentHash;
+      const { rows: [row] } = await client.query(
+        `INSERT INTO ${s}.overlays (model, id, version, upserts, deletes, content_hash, validated_rev, validated_tree, expires_at)
+         VALUES ($1, $2, nextval('${s}.overlay_versions'), $3::jsonb, $4::jsonb, $5, $6, $7, $8)
+         ON CONFLICT (model, id) DO UPDATE SET
+           version = CASE WHEN ${s}.overlays.content_hash = EXCLUDED.content_hash THEN ${s}.overlays.version ELSE EXCLUDED.version END,
+           upserts = EXCLUDED.upserts, deletes = EXCLUDED.deletes, content_hash = EXCLUDED.content_hash,
+           validated_rev = EXCLUDED.validated_rev, validated_tree = EXCLUDED.validated_tree,
+           expires_at = EXCLUDED.expires_at, updated_at = now()
+         RETURNING *`,
+        [overlay.model, overlay.id, JSON.stringify(overlay.upserts), JSON.stringify(overlay.deletes), overlay.contentHash,
+          overlay.validatedRevision, overlay.validatedTree, overlay.expiresAt]
+      );
+      const stored = this.overlayOf(row);
+      await client.query('SELECT pg_notify($1, $2)', [
+        channelOf(s), JSON.stringify({ model: overlay.model, overlay: overlay.id, version: stored.version }),
+      ]);
+      let outcome: 'created' | 'updated' | 'unchanged' = 'created';
+      if (known) {
+        outcome = same ? 'unchanged' : 'updated';
+      }
+      return { outcome, overlay: stored };
+    });
+  }
+
+  public async overlay(model: string, id: string): Promise<StoredOverlay | null> {
+    const { rows: [row] } = await this.pool.query(
+      `SELECT * FROM ${this.s}.overlays WHERE model = $1 AND id = $2 AND expires_at > now()`,
+      [model, id]
+    );
+    return row ? this.overlayOf(row) : null;
+  }
+
+  public async overlayCount(model: string): Promise<number> {
+    const { rows: [{ n }] } = await this.pool.query(
+      `SELECT count(*)::int AS n FROM ${this.s}.overlays WHERE model = $1 AND expires_at > now()`,
+      [model]
+    );
+    return n;
+  }
+
+  public async deleteOverlay(model: string, id: string): Promise<boolean> {
+    return inTransaction(this.pool, async (client) => {
+      const { rowCount } = await client.query(`DELETE FROM ${this.s}.overlays WHERE model = $1 AND id = $2`, [model, id]);
+      await client.query('SELECT pg_notify($1, $2)', [channelOf(this.s), JSON.stringify({ model, overlay: id })]);
+      return Boolean(rowCount);
     });
   }
 

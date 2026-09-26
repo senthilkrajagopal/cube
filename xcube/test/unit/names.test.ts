@@ -538,6 +538,35 @@ describe('review findings', () => {
   });
 });
 
+describe('overlays', () => {
+  const published = publish({ tree, current: [], upserts: [customers, orders('fsales')], deletes: [] }).items;
+
+  test('an overlay item\'s names resolve in the overlay first, then along its folder path (AC-281)', () => {
+    // A copy of customers from fops, which isn't on feu's path, and a new item targeting feu.
+    const copied = { ...customers, folderId: 'fops' };
+    const { items, errors, changed } = publish({
+      tree, current: published, upserts: [copied, orders('feu')], deletes: [], overlay: true,
+    });
+    expect(errors).toEqual([]);
+    expect(changed.sort()).toEqual(['feu/orders', 'fops/customers']);
+    expect(byName(items, 'feu__orders').bindings).toMatchObject({ customers: 'fops__customers' });
+    // Published items keep their own bindings.
+    expect(byName(items, 'fsales__orders').bindings).toMatchObject({ customers: 'customers' });
+  });
+
+  test('without the overlay, the same items resolve nearest-first as ever', () => {
+    const { items } = publish({ tree, current: published, upserts: [{ ...customers, folderId: 'fops' }, orders('feu')], deletes: [] });
+    expect(byName(items, 'feu__orders').bindings).toMatchObject({ customers: 'customers' });
+  });
+
+  test('an overlay may not hold two items of one name', () => {
+    const { errors } = publish({
+      tree, current: published, upserts: [{ ...customers, folderId: 'fops' }, { ...customers, folderId: 'feu' }], deletes: [], overlay: true,
+    });
+    expect(errors[0].message).toMatch(/holds two items named "customers"/);
+  });
+});
+
 describe('titles match Cube\'s own', () => {
   test('for names with digit words, ids and single letters', async () => {
     const names = ['orders', 'order_items', 'sales_2023', 'q3_sales', 'user_id', 'user_ids', 'a2b_c', 'v1', 'x_2_y', 'id', 'kpi_2023_q4'];

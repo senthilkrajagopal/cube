@@ -118,7 +118,12 @@ describe('TokenVerifier', () => {
   const missing: string[] = [];
   const verifier = new TokenVerifier(
     { ...DEFAULT_TOKENS, serviceKeys: JSON.stringify({ keys: [jwkOf(service.publicKey, 'svc')] }) },
-    { modelClaim: () => 'wechartModel', revisionClaim: () => 'wechartRevision', missingKid: async (kid) => { missing.push(kid); } },
+    {
+      modelClaim: () => 'wechartModel',
+      revisionClaim: () => 'wechartRevision',
+      overlayClaim: () => 'wechartOverlay',
+      missingKid: async (kid) => { missing.push(kid); },
+    },
   );
   verifier.loadServiceKeys();
   verifier.setModelKeys('dev', { version: 1, issuer: 'wechart-dev', keys: [jwkOf(user.publicKey, 'u1')] });
@@ -132,6 +137,9 @@ describe('TokenVerifier', () => {
     })));
     expect(role).toBe('user');
     expect(securityContext).toEqual({ wechartModel: 'dev', groups: ['a', 'b'], wechartRevision: 12, [ROLE_KEY]: 'user' });
+    // The overlay it previews, signed in for those the client allows.
+    const preview = await verifier.verify(sign(user.privateKey, 'u1', claims({ iss: 'wechart-dev', wechartOverlay: 'ws-1' })));
+    expect(preview.securityContext.wechartOverlay).toBe('ws-1');
   });
 
   test('a token is bound to the model whose key signed it', async () => {

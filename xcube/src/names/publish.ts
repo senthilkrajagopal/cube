@@ -59,6 +59,12 @@ export interface PublishInput {
   replaceAll?: boolean;
   /** Deleting an item that isn't there is no error (checking whether a retry is already in). */
   lenientDeletes?: boolean;
+  /**
+   * The upserts are an overlay's (a workspace's or a proposal's): their names
+   * resolve among themselves first, then along their folder's path, and no
+   * two may share a short name.
+   */
+  overlay?: boolean;
 }
 
 export interface PublishResult {
@@ -201,7 +207,7 @@ function checkAliases(entries: { def: ItemDefinition; doc: Record<string, any>; 
  * other item as it was published (no rebinding), and refuses to remove an
  * item another still refers to.
  */
-export function publish({ tree, current, upserts, deletes, replaceAll, lenientDeletes }: PublishInput): PublishResult {
+export function publish({ tree, current, upserts, deletes, replaceAll, lenientDeletes, overlay }: PublishInput): PublishResult {
   const errors: ItemError[] = [];
 
   for (const item of [...upserts, ...deletes]) {
@@ -216,6 +222,21 @@ export function publish({ tree, current, upserts, deletes, replaceAll, lenientDe
       errors.push({ folderId: item.folderId, name: item.name, kind: 'item', message: 'The item is in the changeset twice' });
     }
     upserted.set(key, item);
+  }
+  if (overlay) {
+    const byName = new Map<string, AuthoredItem>();
+    for (const item of upserts) {
+      const other = byName.get(item.name);
+      if (other && other.folderId !== item.folderId) {
+        errors.push({
+          folderId: item.folderId,
+          name: item.name,
+          kind: 'item',
+          message: `The overlay holds two items named "${item.name}" (in ${other.folderId} and ${item.folderId}); names in it resolve to its own items first, so they must differ`,
+        });
+      }
+      byName.set(item.name, item);
+    }
   }
   if (errors.length) {
     return { items: current, changed: [], errors };
@@ -246,7 +267,10 @@ export function publish({ tree, current, upserts, deletes, replaceAll, lenientDe
   }
 
   const keptBindings = new Map([...kept].map(([key, item]) => [key, item.bindings]));
-  const scope = new Scope(tree, [...defs.values()], (def) => keptBindings.get(itemKey(def.folderId, def.name)));
+  const overlayNames = overlay
+    ? new Map([...upserted.keys()].map((key) => [defs.get(key)!.name, defs.get(key)!]))
+    : undefined;
+  const scope = new Scope(tree, [...defs.values()], (def) => keptBindings.get(itemKey(def.folderId, def.name)), overlayNames);
 
   // Nothing kept may lose what it is bound to.
   const fullNames = new Set([...defs.values()].map((d) => d.fullName));

@@ -30,7 +30,31 @@ export interface XcubeSettings {
   modules: { packMin: number; packMax: number };
   /** `DEFAULT_TOKENS` when absent. */
   tokens?: TokenSettings;
+  /** `DEFAULT_OVERLAYS` when absent. */
+  overlays?: OverlaySettings;
 }
+
+/** Workspace and proposal overlays. */
+export interface OverlaySettings {
+  /** How long an overlay lives when its push names no `ttlSeconds`. */
+  ttlS: number;
+  /** The longest an overlay may live; a push extends it. */
+  maxTtlS: number;
+  /** The most overlays one model may hold. */
+  max: number;
+  /** How long an overlay's compiled modules stay once no query uses them. */
+  idleMs: number;
+  /** The most overlays kept compiled on one instance; the least recently used goes first. */
+  maxActive: number;
+}
+
+export const DEFAULT_OVERLAYS: OverlaySettings = {
+  ttlS: 24 * 3600,
+  maxTtlS: 7 * 24 * 3600,
+  max: 1000,
+  idleMs: 10 * 60 * 1000,
+  maxActive: 50,
+};
 
 /** How tokens are verified: RS256 user tokens against each model's pushed keys, service tokens against configured ones. */
 export interface TokenSettings {
@@ -130,6 +154,13 @@ export function settingsFromEnv(env: NodeJS.ProcessEnv = process.env): XcubeSett
     modules: {
       packMin: number(env, 'XCUBE_MODULE_PACK_MIN', 50),
       packMax: Math.max(1, number(env, 'XCUBE_MODULE_PACK_MAX', 300)),
+    },
+    overlays: {
+      ttlS: Math.max(1, number(env, 'XCUBE_OVERLAY_TTL_S', DEFAULT_OVERLAYS.ttlS)),
+      maxTtlS: Math.max(1, number(env, 'XCUBE_OVERLAY_MAX_TTL_S', DEFAULT_OVERLAYS.maxTtlS)),
+      max: number(env, 'XCUBE_MAX_OVERLAYS', DEFAULT_OVERLAYS.max),
+      idleMs: number(env, 'XCUBE_OVERLAY_IDLE_MS', DEFAULT_OVERLAYS.idleMs),
+      maxActive: Math.max(1, number(env, 'XCUBE_MAX_ACTIVE_OVERLAYS', DEFAULT_OVERLAYS.maxActive)),
     },
     tokens: {
       audience: env.XCUBE_TOKEN_AUDIENCE || DEFAULT_TOKENS.audience,

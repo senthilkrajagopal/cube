@@ -5,6 +5,9 @@ export interface Notice {
   rev?: number;
   permissions?: number;
   keys?: number;
+  /** An overlay changed or went: its id, and its version when it changed. */
+  overlay?: string;
+  version?: number;
 }
 
 /** What the listener needs of a `pg.Client`. */
@@ -90,7 +93,9 @@ export class RevisionListener {
         return;
       }
       try {
-        const { model, rev, permissions, keys } = JSON.parse(message.payload || '{}');
+        const {
+          model, rev, permissions, keys, overlay, version,
+        } = JSON.parse(message.payload || '{}');
         if (typeof model === 'string') {
           const notice: Notice = {};
           if (typeof rev === 'number') {
@@ -101,6 +106,12 @@ export class RevisionListener {
           }
           if (typeof keys === 'number') {
             notice.keys = keys;
+          }
+          if (typeof overlay === 'string') {
+            notice.overlay = overlay;
+            if (typeof version === 'number') {
+              notice.version = version;
+            }
           }
           this.options.onNotify(model, notice);
           return;

@@ -160,6 +160,36 @@ export const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    version: 5,
+    name: 'overlays',
+    // Additive: older code has no overlays and never reads the table.
+    minReader: 2,
+    sql: (s) => `
+      -- A workspace's or a proposal's unpublished items: a changeset, as the
+      -- client wrote it, applied to whatever is published when a query
+      -- names it. Its version goes up with each change; it is gone once it
+      -- expires.
+      -- Versions only go up, across drops too: an id dropped and pushed
+      -- again is never taken for what it was.
+      CREATE SEQUENCE ${s}.overlay_versions;
+      CREATE TABLE ${s}.overlays (
+        model          text        NOT NULL REFERENCES ${s}.models (id) ON DELETE CASCADE,
+        id             text        NOT NULL CHECK (id ~ '^[A-Za-z0-9_-]{1,64}$'),
+        version        bigint      NOT NULL,
+        upserts        jsonb       NOT NULL,
+        deletes        jsonb       NOT NULL,
+        content_hash   char(64)    NOT NULL,
+        validated_rev  integer,
+        validated_tree char(64),
+        expires_at     timestamptz NOT NULL,
+        created_at    timestamptz NOT NULL DEFAULT now(),
+        updated_at    timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (model, id)
+      );
+      CREATE INDEX overlays_expires_idx ON ${s}.overlays (expires_at);
+    `,
+  },
 ];
 
 /** The newest schema version this code knows. */

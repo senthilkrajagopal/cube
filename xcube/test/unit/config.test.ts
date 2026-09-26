@@ -34,7 +34,9 @@ describe('config', () => {
     const r = runtime();
     setGlobalRuntime(r);
     expect(runtimeOf(config())).toBe(r);
-    expect(r.servingOptions).toEqual({ modelClaim: 'xcubeModel', revisionClaim: 'xcubeRevision', withoutModel: 'disk' });
+    expect(r.servingOptions).toEqual({
+      modelClaim: 'xcubeModel', revisionClaim: 'xcubeRevision', withoutModel: 'disk', overlayClaim: 'xcubeOverlay',
+    });
   });
 
   test('refuses the hooks xcube owns', () => {

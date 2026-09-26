@@ -126,6 +126,7 @@ In both modes:
    | `modelClaim` | `xcubeModel` | The security-context claim naming the model |
    | `revisionClaim` | `xcubeRevision` | The claim naming the oldest revision the request may be answered from |
    | `withoutModel` | `disk` | A context naming no model: Cube's own `schemaPath`, or `refuse` (403) |
+   | `overlayClaim` | `xcubeOverlay` | The claim naming the overlay a request previews |
 
    `contextToAppId`, `repositoryFactory` and `schemaVersion` belong to xcube;
    `config()` refuses them. `extendContext` and `scheduledRefreshContexts`
@@ -148,6 +149,11 @@ In both modes:
 | `XCUBE_TOKEN_CLOCK_TOLERANCE_S` | `60` | Clock skew allowed on `exp`, `iat` and `nbf` |
 | `XCUBE_TOKEN_MAX_LIFETIME_S` | `3600` | The longest a token may live (`exp - iat`) |
 | `XCUBE_HS256` | `until-keys` | Tokens signed with `CUBEJS_API_SECRET`: taken for a model until it has keys, or `off` |
+| `XCUBE_OVERLAY_TTL_S` | `86400` | How long an overlay lives when its push names no `ttlSeconds` |
+| `XCUBE_OVERLAY_MAX_TTL_S` | `604800` | The longest an overlay may live; each push extends it |
+| `XCUBE_MAX_OVERLAYS` | `1000` | The most overlays one model holds |
+| `XCUBE_OVERLAY_IDLE_MS` | `600000` | How long an overlay's compiled modules stay once no query uses them |
+| `XCUBE_MAX_ACTIVE_OVERLAYS` | `50` | The most overlays kept compiled on one instance; the least recently used makes room |
 | `XCUBE_ADMIN_TOKENS` | unset | Static bearer tokens the admin routes also accept, comma-separated, each at least 32 characters and none equal to `CUBEJS_API_SECRET`: for bootstrap and development. With neither these nor service keys, the admin routes are off (the refresh worker) |
 | `XCUBE_MIGRATE` | `true` | `false` only checks the schema is up to date |
 | `XCUBE_POLL_INTERVAL_MS` | `60000` | How often each model's current revision is re-read |
@@ -303,6 +309,34 @@ policies still apply within:
 - **The playground secret.** `CUBEJS_PLAYGROUND_AUTH_SECRET` is ignored while xcube serves models. With it, Cube takes any security context it signs, on every route.
 - **Logs.** A refused token is logged as `sha256:<16 hex>`, never the token.
 
+### Overlays
+
+A workspace's or a proposal's unpublished items reach Cube as an
+**overlay**: a changeset xcube stores beside the published model, which a
+query previews when its token names it.
+
+- **Naming.** The client signs the overlay's id into the token
+  (`overlayClaim`, e.g. `wechartOverlay`), and only for those it may show it
+  to: a workspace's owner, a proposal's author and deciders. A token naming an
+  overlay that expired or was dropped is answered `410`. Responses carry
+  `x-xcube-overlay: <id>@<version>`.
+- **Live.** An overlay is applied to whatever is published when it is
+  queried, so a preview is today's model plus the overlay's changes. If a
+  publish leaves it not applying (it deletes a cube the overlay uses), its
+  queries answer `409`, naming the item, until a fixed overlay is pushed.
+- **Names** in an overlay's items resolve among the overlay's items first,
+  then along each item's folder path (its origin or target). An overlay item
+  in a folder replaces the published item of that name there.
+- **Only what changes compiles.** The overlay's items are grouped into
+  modules as a publish would group them. A module whose files are unchanged is
+  the published one, already compiled; the rest compile on the overlay's
+  first query, in the compile lane, and are kept while queries use them.
+- **Rollups.** Nothing builds an overlay's pre-aggregations. So the items an
+  overlay changes, and every item bound to one of them, are compiled without
+  theirs: their previews read the source. The rest keep their built rollups.
+- **Everything else applies:** the folder gate by each item's folder, `/v1/meta`
+  merged across the overlay's modules, unions for queries spanning modules.
+
 ### Admin API
 
 For the client's server alone. The routes are under
@@ -443,6 +477,55 @@ It answers `{ model, version, issuer, kids, applied }`.
 The stored set: `{ model, version, issuer, keys }`, public keys only. `404
 no_keys` when the model has none.
 
+#### `PUT …/overlays/{id}`
+
+Stores a workspace's or a proposal's items as an overlay:
+
+```json
+{ "upserts": [{ "folderId": "fsales", "name": "orders", "kind": "cube", "yaml": "…" }], "deletes": [], "ttlSeconds": 86400, "baseVersion": 41 }
+```
+
+- **The id** is 1 to 64 of `A-Z`, `a-z`, `0-9`, `_` and `-`.
+- **Items** are as in a changeset, at most 2,000 of each; each sits in the folder it
+  comes from or targets. No two may share a short name.
+- **It is taken only if it applies to what is published now and every module it
+  changes compiles.** Otherwise `422 invalid_items`, with `errors`, and the
+  overlay stays as it was.
+- **The same content again** changes nothing but the expiry.
+- **Lifetime.** `ttlSeconds` (default `XCUBE_OVERLAY_TTL_S`, at most
+  `XCUBE_OVERLAY_MAX_TTL_S`) counts from this push.
+- **`baseVersion`** (optional) takes the push only over that version of the
+  overlay, or, as `null`, only as a new one: two saves racing, or a save racing
+  a drop, can't land out of order. Otherwise `409 conflict`, with
+  `currentVersion`.
+- **Versions only go up,** across drops too: an id dropped and pushed again
+  gets a newer version, and nothing compiled for what was dropped answers it.
+
+It answers `201` (created) or `200` with
+`{ model, id, version, created, revision, expiresAt, items }`, where
+`revision` is the published revision it was checked against.
+
+| Status | When |
+| --- | --- |
+| `404` | `unknown_model` |
+| `409` | `mode`: a model holding a file set |
+| `409` | `too_many_overlays` |
+
+#### `GET …/overlays/{id}`
+
+`{ model, id, version, expiresAt, validatedRevision, upserts, deletes, instance }`.
+
+- `upserts` lists `{ folderId, name, kind }`.
+- `instance` is what the answering instance makes of the overlay over its
+  current revision: `serving`, `idle` (not compiled now), or `broken` with its
+  `errors`.
+- `404` once it expired or was dropped.
+
+#### `DELETE …/overlays/{id}`
+
+Drops the overlay (`204`, whether or not it was there). Its queries answer `410`
+from then on: at once on this instance, and on the others as soon as they hear.
+
 #### `GET …/meta`
 
 The model's field list for the client's own reads (jobs, schedules):
@@ -504,7 +587,9 @@ Every item of the current revision:
 
 `{ "folderId": "f7k2", "names": ["orders", "customers"] }` →
 `{ "names": { "orders": "f7k2__orders", "customers": "customers" } }`, or
-`null` for a name nothing on the folder's path holds.
+`null` for a name nothing on the folder's path holds. With
+`"overlay": "<id>"`, names resolve in the overlay's items first (a workspace's
+pickers, AC-281).
 
 #### `GET …/revision`
 

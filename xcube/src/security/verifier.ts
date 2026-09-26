@@ -26,6 +26,8 @@ export interface VerifiedToken {
 export interface VerifierOptions {
   modelClaim: () => string;
   revisionClaim: () => string;
+  /** The claim naming the overlay a user's token previews. */
+  overlayClaim?: () => string;
   /** Asked once when a token names a kid no key has: reads the keys again, in case a push hasn't arrived here yet. */
   missingKid: (kid: string) => Promise<void>;
 }
@@ -164,6 +166,7 @@ export class TokenVerifier {
       throw new TokenError('A model\'s key signs user tokens only (role: user)');
     }
     const revisionClaim = this.options.revisionClaim();
+    const overlayClaim = this.options.overlayClaim?.();
     const groups = Array.isArray(claims.groups) ? claims.groups.filter((g): g is string => typeof g === 'string') : [];
     return {
       role: 'user',
@@ -171,6 +174,8 @@ export class TokenVerifier {
         [modelClaim]: model,
         groups,
         ...(claims[revisionClaim] !== undefined ? { [revisionClaim]: claims[revisionClaim] } : {}),
+        // The overlay it previews: the client signs one only for those it allows (AC-323).
+        ...(overlayClaim && claims[overlayClaim] !== undefined ? { [overlayClaim]: claims[overlayClaim] } : {}),
         [ROLE_KEY]: 'user',
       },
     };
