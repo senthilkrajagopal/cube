@@ -199,6 +199,7 @@ describeWithDatabase('xcube items and changesets', () => {
       kind: 'cube',
       fullName: 'fsales__orders',
       bindings: { customers: 'customers' },
+      dataSource: 'default',
     });
 
     const fromSales = await admin.post('/resolve', { folderId: 'fsales', names: ['orders', 'customers', 'nope'] }).expect(200);

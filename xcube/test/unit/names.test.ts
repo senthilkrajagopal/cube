@@ -613,6 +613,24 @@ describe('data sources', () => {
     const { items } = publish({ tree, current: [], deletes: [], upserts: [cubeWith('feu', 'a', '    data_source: anything\n')] });
     expect(dataSourceOf(items, 'feu__a')).toBe('anything');
   });
+
+  test('a cube\'s alias names the data source it is bound to, so another binding is another SQL and another rollup table', () => {
+    const aliasOfItem = (items: PublishedItem[], fullName: string) => doc(byName(items, fullName)).sql_alias;
+    const onRoot = publish({ tree, current: [], deletes: [], dataSources: sources, upserts: [cubeWith('fops', 'a'), cubeWith('froot', 'r')] });
+    // Cube's default, as before: the plain alias, or none at the root.
+    expect(aliasOfItem(onRoot.items, 'fops__a')).toBe('fops__a');
+    expect(aliasOfItem(onRoot.items, 'r')).toBeUndefined();
+    const nearer = publish({ tree, current: [], deletes: [], dataSources: sources, upserts: [cubeWith('feu', 'a')] });
+    const named = publish({ tree, current: [], deletes: [], dataSources: sources, upserts: [cubeWith('feu', 'a', '    data_source: warehouse\n')] });
+    const [onDefault, onWarehouse] = [aliasOfItem(nearer.items, 'feu__a'), aliasOfItem(named.items, 'feu__a')];
+    expect(onDefault).toBe(aliasOf('feu__a', 'fsales__default'));
+    expect(onWarehouse).toBe(aliasOf('feu__a', 'fsales__warehouse'));
+    expect(new Set([onDefault, onWarehouse, 'feu__a']).size).toBe(3);
+    // A root cube on a data source of its own is aliased by it too; an alias the author wrote is kept.
+    const rooted = publish({ tree, current: [], deletes: [], upserts: [cubeWith('froot', 'r', '    data_source: lake\n'), cubeWith('feu', 'b', '    sql_alias: mine\n    data_source: lake\n')] });
+    expect(aliasOfItem(rooted.items, 'r')).toBe(aliasOf('r', 'lake'));
+    expect(aliasOfItem(rooted.items, 'feu__b')).toBe('mine');
+  });
 });
 
 describe('titles match Cube\'s own', () => {

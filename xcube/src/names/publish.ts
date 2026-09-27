@@ -46,8 +46,24 @@ export function titleOf(name: string): string {
 }
 
 /** The alias xcube gives a prefixed cube or view without one: short names stay, long ones become a stable hash. */
-export function aliasOf(fullName: string): string {
-  return fullName.length <= MAX_PLAIN_ALIAS ? fullName : `x${base32(fullName, 7)}`;
+export function aliasOf(fullName: string, dataSource?: string): string {
+  if (dataSource === undefined) {
+    return fullName.length <= MAX_PLAIN_ALIAS ? fullName : `x${base32(fullName, 7)}`;
+  }
+  const plain = `${fullName}_${base32(dataSource, 4)}`;
+  return plain.length <= MAX_PLAIN_ALIAS ? plain : `x${base32(`${fullName}@${dataSource}`, 7)}`;
+}
+
+/**
+ * The data source a cube's alias names: its own, as bound (or written), unless
+ * it is Cube's default. Cube keys cached results by their SQL and names rollup
+ * tables by the alias, neither by data source: a cube bound to another data
+ * source must be another SQL alias, or it would be answered from what the old
+ * one gave.
+ */
+function aliasedDataSource(doc: Record<string, any>): string | undefined {
+  const named = doc.data_source ?? doc.dataSource;
+  return typeof named === 'string' && named !== 'default' ? named : undefined;
 }
 
 export interface PublishInput {
@@ -101,19 +117,19 @@ function preAggregationsOf(doc: Record<string, any>): any[] {
  */
 function finish(def: ItemDefinition, doc: Record<string, any>) {
   const prefixed = def.folderId !== ROOT;
-  if (prefixed) {
-    if (doc.title === undefined) {
-      doc.title = titleOf(def.name);
+  if (prefixed && doc.title === undefined) {
+    doc.title = titleOf(def.name);
+  }
+  // A cube on a data source of its own is aliased by it too, root cubes included.
+  const dataSource = def.kind === 'cube' ? aliasedDataSource(doc) : undefined;
+  if ((prefixed || dataSource !== undefined) && doc.sql_alias === undefined && doc.sqlAlias === undefined) {
+    let alias = aliasOf(def.fullName, dataSource);
+    // A rollup table is named <alias>_<pre-aggregation>: when that would be too long, the short hash alias.
+    const tooLong = preAggregationsOf(doc).some((pa) => `${alias}_${pa.sql_alias ?? pa.sqlAlias ?? pa.name}`.length > MAX_TABLE_STEM);
+    if (tooLong) {
+      alias = `x${base32(dataSource === undefined ? def.fullName : `${def.fullName}@${dataSource}`, 7)}`;
     }
-    if (doc.sql_alias === undefined && doc.sqlAlias === undefined) {
-      let alias = aliasOf(def.fullName);
-      // A rollup table is named <alias>_<pre-aggregation>: when that would be too long, the short hash alias.
-      const tooLong = preAggregationsOf(doc).some((pa) => `${alias}_${pa.sql_alias ?? pa.sqlAlias ?? pa.name}`.length > MAX_TABLE_STEM);
-      if (tooLong) {
-        alias = `x${base32(def.fullName, 7)}`;
-      }
-      doc.sql_alias = alias;
-    }
+    doc.sql_alias = alias;
   }
   if (def.kind === 'view' && Array.isArray(def.doc.cubes)) {
     // A view prefixes or splits by each cube's name; keep it the short one (CubeSymbols.ts:946, 1018).

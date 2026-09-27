@@ -532,5 +532,36 @@ describeWithDatabase('connections: data sources served from sealed credentials',
       await expect(core.resolveDriver(gone)).rejects.toThrow(/no longer compiled here/);
       expect((await load().expect(200)).body.data[0]['orders.total']).toBe('42');
     });
+
+    test('a cube published again onto a nearer data source answers from it at once, never from the old one\'s cache (AC-273)', async () => {
+      await admin('put', '/folders', {
+        folders: [{ id: 'froot', parentId: null }, { id: 'fa', parentId: 'froot' }, { id: 'fab', parentId: 'fa' }],
+      }).expect(200);
+      await admin('put', '/connections/fa__warehouse', { ...connection(role, 'second-password'), folderId: 'fa' }).expect(200);
+      const where = {
+        folderId: 'fab',
+        name: 'where',
+        kind: 'cube',
+        yaml: 'cubes:\n  - name: where\n    data_source: warehouse\n    sql: SELECT current_database() AS db\n    dimensions:\n      - name: db\n        sql: db\n        type: string\n        primary_key: true\n        public: true\n',
+      };
+      // As a client does that takes what is cached and has it renewed behind (or Cube with background renewal on).
+      const ask = () => request(server).get('/cubejs-api/v1/load')
+        .query({ query: JSON.stringify({ dimensions: ['fab__where.db'], cacheMode: 'stale-while-revalidate' }) })
+        .set('Authorization', jwt.sign({ wechartModel: 'dev', wechartRevision: revision }, API_SECRET));
+      revision = (await admin('post', '/changesets', { baseRevision: revision, upserts: [where] }).expect(201)).body.revision;
+      expect((await ask().expect(200)).body.data[0]['fab__where.db']).toBe(target.database);
+      let { items } = (await admin('get', '/items').expect(200)).body;
+      expect(items.find((i: any) => i.fullName === 'fab__where')).toMatchObject({ kind: 'cube', dataSource: 'fa__warehouse' });
+      expect(items.find((i: any) => i.fullName === 'orders')).toMatchObject({ dataSource: 'default' });
+
+      // fab gets its own warehouse, on the other database; the cube, published again, binds to it.
+      const { name: _name, ...onOther } = copy();
+      await admin('put', '/connections/fab__warehouse', { ...onOther, folderId: 'fab' }).expect(200);
+      revision = (await admin('post', '/changesets', { baseRevision: revision, upserts: [where] }).expect(201)).body.revision;
+      // Straight after, well within Postgres's 10-second refresh key: the same query, from the new database.
+      expect((await ask().expect(200)).body.data[0]['fab__where.db']).toBe(workspaceDb);
+      ({ items } = (await admin('get', '/items').expect(200)).body);
+      expect(items.find((i: any) => i.fullName === 'fab__where').dataSource).toBe('fab__warehouse');
+    });
   });
 });

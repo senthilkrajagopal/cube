@@ -483,6 +483,19 @@ descendant's.
   again.
 - A connection a published cube uses can't be dropped (`409 in_use`, naming
   the cubes). For the root's `default`, that is every cube naming none.
+- **Another binding is another alias.** Cube keys cached results by their SQL
+  and names rollup tables by the cube's alias, neither by data source. So a
+  cube bound to a data source other than Cube's default gets an SQL alias that
+  names it, and a cube published again onto another data source is answered
+  from it at once, and builds its rollups there, never serving the old one's.
+  - A cube on the root's `default` keeps its alias as before. An alias the
+    author wrote is kept, and so is its caching.
+  - A cube that `extends` another takes its alias from its own binding: when
+    only its parent is published onto another data source, publish the child
+    again too.
+  - A connection changed in place, the same name aimed elsewhere, keeps its
+    cubes' aliases. Their cached results and rollups renew on their refresh
+    keys, as in Cube itself.
 - **Dropping and publishing don't interleave.** A drop checks its users at the
   current revision, and is taken only while that revision is still current. A
   publish is stored only while every connection its changed cubes bind to
@@ -843,7 +856,10 @@ column.
 #### `GET …/items`
 
 Every item of the current revision:
-`{ folderId, name, kind, fullName, bindings: { shortName: fullName } }`.
+`{ folderId, name, kind, fullName, bindings: { shortName: fullName }, dataSource? }`.
+A cube's `dataSource` is the one it is bound to: `default` when it names none,
+or `null` when it inherits its parent's. It is what a data source's "cubes that
+use it" lists (AC-157).
 
 #### `POST …/resolve`
 

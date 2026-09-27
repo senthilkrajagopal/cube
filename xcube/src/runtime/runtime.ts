@@ -3208,7 +3208,10 @@ export class XcubeRuntime {
     return result;
   }
 
-  /** The current revision's items: full names, and what each short name they use is bound to. */
+  /**
+   * The current revision's items: full names, what each short name they use is
+   * bound to, and each cube's data source as bound (`null`: its parent's).
+   */
   public async itemsOf(model: string) {
     const head = await this.requireStore().head(model);
     if (!head) {
@@ -3219,7 +3222,7 @@ export class XcubeRuntime {
       model,
       revision: head.revision,
       mode: head.mode ?? 'files',
-      items: items.map(({ folderId, name, kind, fullName, bindings }) => ({ folderId, name, kind, fullName, bindings })),
+      items: items.map((item) => ({ kind: item.kind, ...XcubeRuntime.refOf(item) })),
     };
   }
 
