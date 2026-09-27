@@ -22,6 +22,8 @@ export interface XcubeSettings {
   compileWaitMs: number;
   /** How long a request naming a newer revision may wait for this instance to switch to it. */
   catchUpMs: number;
+  /** How often each instance re-writes its report of each connection it holds a live driver for. */
+  connectionHeartbeatMs?: number;
   /** Bearer tokens the admin routes accept. */
   adminTokens: string[];
   /** Most models one process keeps state for; a model beyond it is refused. */
@@ -102,6 +104,16 @@ function number(env: NodeJS.ProcessEnv, name: string, fallback: number): number 
   return value;
 }
 
+/** Every 10 minutes: a report within the hour then means an instance running. */
+export const DEFAULT_CONNECTION_HEARTBEAT_MS = 10 * 60 * 1000;
+
+function heartbeat(ms: number): number {
+  if (ms < 10000 || ms > 30 * 60 * 1000) {
+    throw new Error('XCUBE_CONNECTION_HEARTBEAT_MS must be from 10000 to 1800000: well within the hour a report counts for');
+  }
+  return ms;
+}
+
 function credentialSettings(env: NodeJS.ProcessEnv): XcubeSettings['credentials'] {
   const kids = (env.XCUBE_CREDENTIAL_KEY_IDS || '').split(',').map((k) => k.trim()).filter(Boolean);
   if (!kids.length) {
@@ -163,6 +175,7 @@ export function settingsFromEnv(env: NodeJS.ProcessEnv = process.env): XcubeSett
     compileQueue: number(env, 'XCUBE_COMPILE_QUEUE', 4),
     compileWaitMs: number(env, 'XCUBE_COMPILE_WAIT_MS', 120000),
     catchUpMs: number(env, 'XCUBE_CATCH_UP_MS', 10000),
+    connectionHeartbeatMs: heartbeat(number(env, 'XCUBE_CONNECTION_HEARTBEAT_MS', DEFAULT_CONNECTION_HEARTBEAT_MS)),
     adminTokens,
     maxModels: number(env, 'XCUBE_MAX_MODELS', 1000),
     modules: {

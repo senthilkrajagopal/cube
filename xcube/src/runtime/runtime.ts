@@ -56,6 +56,7 @@ import { ROLE_KEY, TokenVerifier } from '../security/verifier';
 import { CompileLane, LaneBusyError, Priority } from './lane';
 import { RevisionListener, type ListenClient, type Notice } from './listener';
 import {
+  DEFAULT_CONNECTION_HEARTBEAT_MS,
   DEFAULT_OVERLAYS,
   DEFAULT_TOKENS,
   type OverlaySettings,
@@ -479,6 +480,8 @@ export class XcubeRuntime {
 
   protected retireTimer: NodeJS.Timeout | null = null;
 
+  protected heartbeatTimer: NodeJS.Timeout | null = null;
+
   protected readyResolve!: () => void;
 
   /** Resolves once a core is attached and every model's current revision was tried. */
@@ -603,6 +606,10 @@ export class XcubeRuntime {
     this.schedulePoll();
     this.retireTimer = setInterval(() => this.retireDue(), 30000);
     this.retireTimer.unref?.();
+    this.heartbeatTimer = setInterval(() => {
+      this.connections.heartbeat().catch((e) => this.warn('xcube: could not report connections', { error: e.message }));
+    }, this.settings.connectionHeartbeatMs ?? DEFAULT_CONNECTION_HEARTBEAT_MS);
+    this.heartbeatTimer.unref?.();
   }
 
   public async stop(): Promise<void> {
@@ -612,6 +619,9 @@ export class XcubeRuntime {
     }
     if (this.retireTimer) {
       clearInterval(this.retireTimer);
+    }
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
     }
     await this.listener?.stop();
     await this.pool?.end().catch(() => undefined);

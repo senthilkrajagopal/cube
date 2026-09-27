@@ -133,6 +133,12 @@ export class Connections {
 
   protected refreshing: Promise<void> | null = null;
 
+  /** `<model>/<name>` → what this instance last reported of it, re-written by the heartbeat. */
+  protected readonly lastReports = new Map<string, { model: string; name: string; version: number | null; state: string; error: string | null }>();
+
+  /** One report write at a time per connection, each writing the latest. */
+  protected readonly reportWrites = new Map<string, Promise<void>>();
+
   public constructor(
     protected readonly store: () => RevisionStore,
     /** Set once they are loaded, at start. */
@@ -279,8 +285,48 @@ export class Connections {
   }
 
   protected report(model: string, name: string, version: number | null, state: string, error: string | null = null) {
-    this.store().reportConnection(model, name, this.instanceId, version, state, error)
-      .catch((e) => this.log('xcube: could not report a connection', { model, connection: name, error: e.message }));
+    const key = `${model}/${name}`;
+    this.lastReports.set(key, { model, name, version, state, error });
+    this.writeReport(key);
+  }
+
+  /**
+   * Writes what this instance last reported of a connection. Writes queue per
+   * connection and each writes the latest, so a heartbeat never lands after a
+   * newer report with an older one.
+   */
+  protected writeReport(key: string): Promise<void> {
+    const next = (this.reportWrites.get(key) ?? Promise.resolve()).then(async () => {
+      const last = this.lastReports.get(key);
+      if (last) {
+        await this.store().reportConnection(last.model, last.name, this.instanceId, last.version, last.state, last.error);
+      }
+    }).catch((e) => this.log('xcube: could not report a connection', { connection: key, error: e.message }));
+    this.reportWrites.set(key, next);
+    next.finally(() => {
+      if (this.reportWrites.get(key) === next) {
+        this.reportWrites.delete(key);
+      }
+    }).catch(() => undefined);
+    return next;
+  }
+
+  /**
+   * Re-writes this instance's report of every connection it holds a live
+   * driver for, as it stands (version, state and error kept), so that a
+   * report within the hour means an instance running (AC-161). One it no
+   * longer holds one for is left to age out, as a stopped instance's are.
+   */
+  public async heartbeat(): Promise<void> {
+    const writes: Promise<void>[] = [];
+    for (const key of [...this.lastReports.keys()]) {
+      if ([...(this.live.get(key) ?? [])].some((entry) => !entry.switchable.isRemoved)) {
+        writes.push(this.writeReport(key));
+      } else {
+        this.lastReports.delete(key);
+      }
+    }
+    await Promise.all(writes);
   }
 
   /** Builds and tests a connection's driver; errors are redacted of its secrets. */

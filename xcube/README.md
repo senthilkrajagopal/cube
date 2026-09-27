@@ -175,6 +175,7 @@ In both modes:
 | `XCUBE_COMPILE_QUEUE` | `4` | Imports and checks that may wait to compile; more answer `503` |
 | `XCUBE_COMPILE_WAIT_MS` | `120000` | How long one may wait |
 | `XCUBE_CATCH_UP_MS` | `10000` | How long a request naming a newer revision waits for it |
+| `XCUBE_CONNECTION_HEARTBEAT_MS` | `600000` | How often an instance re-writes its report of each connection it holds a driver for (10 s to 30 min), so a report within the hour means an instance running |
 | `CUBEJS_TRANSPILATION_WORKER_THREADS_COUNT` | `2` | Cube's; the image sets it when unset, as unset a compile can take gigabytes |
 
 ### Folders and names
@@ -736,6 +737,12 @@ dropped (`409 in_use`).
 - Each instance that built a driver for the connection reports it: `live`,
   or `failed` with a redacted error.
 - `current` says it serves the stored version.
+- **Kept fresh.** While an instance holds a driver for the connection, it
+  re-writes its report every `XCUBE_CONNECTION_HEARTBEAT_MS` (10 minutes),
+  with the same version, state and error. A report within the hour therefore
+  means a running instance; a stopped one's ages out.
+  - An instance whose first driver for it failed holds none, so its `failed`
+    report ages out too. Its next query tries again, and reports again.
 
 #### `POST …/connections/test`
 

@@ -158,6 +158,7 @@ describe('settingsFromEnv', () => {
       keepRevisions: 50,
       compileQueue: 4,
       catchUpMs: 10000,
+      connectionHeartbeatMs: 600000,
       adminTokens: [TOKEN, OLD_TOKEN],
     });
   });
@@ -169,5 +170,8 @@ describe('settingsFromEnv', () => {
     expect(() => settingsFromEnv({ ...env, XCUBE_POLL_INTERVAL_MS: 'soon' })).toThrow(/whole number/);
     expect(() => settingsFromEnv({ ...env, XCUBE_DATABASE_SCHEMA: 'Bad-Name' })).toThrow(/schema name/);
     expect(settingsFromEnv({ ...env, XCUBE_MIGRATE: 'false' })!.migrate).toBe(false);
+    // A report counts for an hour: the heartbeat must come well within it.
+    expect(() => settingsFromEnv({ ...env, XCUBE_CONNECTION_HEARTBEAT_MS: '3600000' })).toThrow(/well within the hour/);
+    expect(() => settingsFromEnv({ ...env, XCUBE_CONNECTION_HEARTBEAT_MS: '100' })).toThrow(/10000 to 1800000/);
   });
 });

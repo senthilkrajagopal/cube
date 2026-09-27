@@ -226,6 +226,15 @@ describeWithDatabase('connections: data sources served from sealed credentials',
     expect((await load().expect(200)).body.data[0]['orders.total']).toBe('42');
   });
 
+  test('an instance re-reports the connections it holds, keeping what it reported, so a report within the hour means running', async () => {
+    const before = (await reported('default', (i) => i.state === 'live')).instances[0];
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await runtime.connections.heartbeat();
+    const after = (await admin('get', '/connections/default/health').expect(200)).body.instances[0];
+    expect(new Date(after.reportedAt).getTime()).toBeGreaterThan(new Date(before.reportedAt).getTime());
+    expect(after).toMatchObject({ instance: before.instance, version: before.version, state: 'live', current: true });
+  });
+
   test('the test route connects as Cube would, and never echoes a secret', async () => {
     const good = await admin('post', '/connections/test', { driver: 'postgres', authMethod: 'password', fields: { ...target, user: role }, sealed: { password: seal('second-password') } }).expect(200);
     expect(good.body.ok).toBe(true);
@@ -268,6 +277,16 @@ describeWithDatabase('connections: data sources served from sealed credentials',
     revision = res.body.revision;
     await admin('delete', '/connections/default').expect(204);
     await admin('get', '/connections/default/health').expect(404);
+    // The heartbeat doesn't bring back the reports of a connection that is gone.
+    await runtime.connections.heartbeat();
+    const client = new Client({ connectionString: DATABASE_URL });
+    await client.connect();
+    try {
+      const { rows: [{ n }] } = await client.query(`SELECT count(*)::int AS n FROM ${schema}.connection_reports WHERE model = 'dev' AND name = 'default'`);
+      expect(n).toBe(0);
+    } finally {
+      await client.end();
+    }
   });
 
   test('a dropped connection pushed again serves again, with no restart', async () => {
