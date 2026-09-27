@@ -225,6 +225,12 @@ describeWithDatabase('overlays: previews of unpublished items', () => {
     expect(res.body.items.map((i: any) => i.fullName).sort()).toEqual(['fa__orders', 'fb__report', 'fc__widgets']);
     const status = await admin('get', '/overlays/ws1').expect(200);
     expect(status.body).toMatchObject({ id: 'ws1', version: 1, validatedRevision: revision, instance: { state: 'idle' } });
+    // Each item bound as its previews bind it: the report's `widgets` is the workspace's copy from
+    // fc, found in the overlay first although fc isn't on fb's path; landed, it would not be.
+    expect(status.body.boundRevision).toBe(revision);
+    const report = status.body.upserts.find((u: any) => u.name === 'report');
+    expect(report).toMatchObject({ folderId: 'fb', fullName: 'fb__report', bindings: expect.objectContaining({ widgets: 'fc__widgets' }) });
+    expect(res.body.items.find((i: any) => i.name === 'report').bindings).toEqual(report.bindings);
   });
 
   test('a query whose token names the overlay is answered from it; others from what is published', async () => {

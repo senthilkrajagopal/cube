@@ -222,6 +222,10 @@ export interface ItemRef {
   folderId: string;
   name: string;
   fullName: string;
+  /** What each short name it uses is bound to: `{ shortName: fullName }`, as `GET …/items` gives them. */
+  bindings: Record<string, string>;
+  /** A cube's data source as bound (`default` when it names none), or `null` when it inherits its parent's. */
+  dataSource?: string | null;
 }
 
 export type ItemsOutcome =
@@ -1402,21 +1406,7 @@ export class XcubeRuntime {
     previous: StoredModule[],
     dataSources?: { folderId: string; name: string }[],
   ): { items: PublishedItem[]; changed: string[]; files: SnapshotFile[]; modules: StoredModule[] } | { errors: ItemError[] } {
-    const brought = overlay.connections ?? [];
-    const own = new Map(brought.map((c) => [fullNameOf(c.folderId, c.name), DRIVERS[c.driver as keyof typeof DRIVERS].cubeType]));
-    const sources = [
-      ...(dataSources ?? []).filter((d) => !own.has(fullNameOf(d.folderId, d.name))),
-      ...brought.map(({ folderId, name }) => ({ folderId, name })),
-    ];
-    const published = publish({
-      tree,
-      current,
-      upserts: overlay.upserts,
-      deletes: overlay.deletes,
-      lenientDeletes: true,
-      overlay: true,
-      dataSources: sources.length ? sources : undefined,
-    });
+    const { published, own } = XcubeRuntime.publishOverlay(tree, current, overlay, dataSources);
     if (published.errors.length) {
       return { errors: published.errors };
     }
@@ -1442,6 +1432,31 @@ export class XcubeRuntime {
       files,
       modules: this.moduleGroups(previous, tree, published.items, files),
     };
+  }
+
+  /** An overlay's items over published ones, resolved and bound, with the data sources it brings by full name → driver type. */
+  protected static publishOverlay(
+    tree: FolderTree,
+    current: PublishedItem[],
+    overlay: { upserts: AuthoredItem[]; deletes: { folderId: string; name: string }[]; connections?: OverlayConnection[] },
+    dataSources?: { folderId: string; name: string }[],
+  ) {
+    const brought = overlay.connections ?? [];
+    const own = new Map(brought.map((c) => [fullNameOf(c.folderId, c.name), DRIVERS[c.driver as keyof typeof DRIVERS].cubeType]));
+    const sources = [
+      ...(dataSources ?? []).filter((d) => !own.has(fullNameOf(d.folderId, d.name))),
+      ...brought.map(({ folderId, name }) => ({ folderId, name })),
+    ];
+    const published = publish({
+      tree,
+      current,
+      upserts: overlay.upserts,
+      deletes: overlay.deletes,
+      lenientDeletes: true,
+      overlay: true,
+      dataSources: sources.length ? sources : undefined,
+    });
+    return { published, own };
   }
 
   /**
@@ -1532,9 +1547,21 @@ export class XcubeRuntime {
 
   /** A stored overlay, and whether it applies to what this instance serves now. */
   public async overlayStatus(model: string, id: string) {
-    const record = await this.requireStore().overlay(model, id);
+    const store = this.requireStore();
+    const record = await store.overlay(model, id);
     if (!record) {
       return null;
+    }
+    // Its items as previews of it bind them over what is published now.
+    const head = await store.head(model);
+    let bound: Map<string, ItemRef> | undefined;
+    if (head?.mode === 'items') {
+      const { published } = XcubeRuntime.publishOverlay(
+        new FolderTree(await store.folders(model)), await this.itemsAt(head), record, await this.dataSourcesOf(model),
+      );
+      if (!published.errors.length) {
+        bound = new Map(published.items.map((item) => [`${item.folderId}/${item.name}`, XcubeRuntime.refOf(item)]));
+      }
     }
     const active = this.models.get(model)?.active;
     const key = active ? this.overlayKey(active, id, record.version) : undefined;
@@ -1551,7 +1578,12 @@ export class XcubeRuntime {
       version: record.version,
       expiresAt: record.expiresAt.toISOString(),
       validatedRevision: record.validatedRevision,
-      upserts: record.upserts.map(({ folderId, name, kind }) => ({ folderId, name, kind })),
+      upserts: record.upserts.map(({ folderId, name, kind }) => {
+        const ref = bound?.get(`${folderId}/${name}`);
+        return { folderId, name, kind, ...(ref ? { fullName: ref.fullName, bindings: ref.bindings, ...('dataSource' in ref ? { dataSource: ref.dataSource } : {}) } : {}) };
+      }),
+      // The published revision the upserts' bindings are over; null when it doesn't apply to it.
+      boundRevision: bound ? head!.revision : null,
       deletes: record.deletes,
       connections: record.connections.map((c) => ({
         folderId: c.folderId,
@@ -1825,10 +1857,16 @@ export class XcubeRuntime {
     });
   }
 
-  /** A context for xcube's own reads of a model, pinned to its active revision. */
-  public async adminContext(model: string): Promise<Record<string, any>> {
-    const securityContext = { [this.servingOptions.modelClaim]: model };
-    const pin = await this.pinFor({ securityContext });
+  /**
+   * A context for xcube's own reads of a model, pinned to its active
+   * revision; with `revision`, once this instance serves that one or a newer,
+   * waiting as a user token's request does (`503` if it can't). With `res`,
+   * the answer says which revision it is from.
+   */
+  public async adminContext(model: string, { revision, res }: { revision?: number; res?: any } = {}): Promise<Record<string, any>> {
+    const { modelClaim, revisionClaim } = this.servingOptions;
+    const securityContext = { [modelClaim]: model, ...(revision !== undefined ? { [revisionClaim]: revision } : {}) };
+    const pin = await this.pinFor({ securityContext, res });
     return { securityContext, requestId: `xcube-admin-${crypto.randomUUID()}`, ...pin };
   }
 
@@ -2814,7 +2852,17 @@ export class XcubeRuntime {
   protected static refs(items: PublishedItem[], keys?: Set<string>): ItemRef[] {
     return items
       .filter((item) => !keys || keys.has(`${item.folderId}/${item.name}`))
-      .map(({ folderId, name, fullName }) => ({ folderId, name, fullName }));
+      .map((item) => XcubeRuntime.refOf(item));
+  }
+
+  protected static refOf(item: PublishedItem): ItemRef {
+    return {
+      folderId: item.folderId,
+      name: item.name,
+      fullName: item.fullName,
+      bindings: item.bindings,
+      ...(item.kind === 'cube' ? { dataSource: boundDataSource(item) } : {}),
+    };
   }
 
   /**

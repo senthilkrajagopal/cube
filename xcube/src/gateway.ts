@@ -122,7 +122,7 @@ export class XcubeApiGateway extends ApiGateway {
     const runtime = this.xcubeRuntime();
     if (runtime) {
       initAdminRoutes(app, this.basePath, runtime, (type, params) => this.log({ type, ...params }), {
-        meta: (model, extended) => this.ownMeta(model, extended),
+        meta: (model, extended, options) => this.ownMeta(model, extended, options),
         partitions: (model, query) => this.ownPartitions(model, query),
       });
       // Before Cube's jobs route: each job's context names the module its pre-aggregations are in.
@@ -412,9 +412,13 @@ export class XcubeApiGateway extends ApiGateway {
    * filtered by any group's policies, as it asks for no one. Behind the
    * admin routes' authentication; Cube's own routes have no such bypass.
    */
-  public async ownMeta(model: string, extended: boolean): Promise<{ status: number; body: any }> {
+  public async ownMeta(
+    model: string,
+    extended: boolean,
+    least: { revision?: number; res?: any } = {},
+  ): Promise<{ status: number; body: any }> {
     const runtime = this.xcubeRuntime()!;
-    const context: any = await runtime.adminContext(model);
+    const context: any = await runtime.adminContext(model, least);
     const modules = runtime.metaModules(context) ?? ['all'];
     let answer: { status: number; body: any } = { status: 500, body: null };
     await this.mergedMeta(modules, context, (body, options) => {

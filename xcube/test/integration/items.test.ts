@@ -217,13 +217,19 @@ describeWithDatabase('xcube items and changesets', () => {
     const check = await admin.post('/changesets?dryRun=true', { upserts: [broken] }).expect(200);
     expect(check.body.valid).toBe(false);
     expect(check.body.errors[0]).toMatchObject({ folderId: 'fops', name: 'returns', kind: 'compile' });
-    expect(check.body.items).toEqual([{ folderId: 'fops', name: 'returns', fullName: 'fops__returns' }]);
+    expect(check.body.items).toEqual([{
+      folderId: 'fops', name: 'returns', fullName: 'fops__returns', bindings: {}, dataSource: 'default',
+    }]);
 
     const good = await admin.post('/changesets?dryRun=true', {
       upserts: [orders('fops')],
       probes: [{ id: 'p', query: { measures: ['fops__orders.count'], dimensions: ['customers.name'] } }],
     }).expect(200);
     expect(good.body).toMatchObject({ valid: true, probes: [{ id: 'p', candidate: { status: 200 } }], currentRevision: 2 });
+    // Each item with its bindings as the changeset would land it: `customers` nearest-first, from the root.
+    expect(good.body.items).toEqual([expect.objectContaining({
+      folderId: 'fops', name: 'orders', fullName: 'fops__orders', bindings: expect.objectContaining({ customers: 'customers' }),
+    })]);
 
     const status = await admin.get('/revision').expect(200);
     expect(status.body.current.revision).toBe(2);

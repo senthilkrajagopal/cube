@@ -372,4 +372,20 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
     await client.end();
     expect(rows[0].min_reader).toBe(4);
   });
+
+  test('the field list waits for the revision it is asked for, as a user token\'s request does', async () => {
+    const at = await admin('get', `/meta?revision=${revision}`).expect(200);
+    expect(at.headers['x-xcube-revision']).toBe(`dev@${revision}`);
+    await admin('get', '/meta?revision=0').expect(400);
+    await admin('get', '/meta?revision=two').expect(400);
+    // Read-your-writes: asked for right after a publish, never answered from before it.
+    const res = await admin('post', '/changesets', {
+      baseRevision: revision,
+      upserts: [{ folderId: 'froot', name: 'late', kind: 'cube', yaml: 'cubes:\n  - name: late\n    sql: select 1 as id\n    measures:\n      - name: count\n        type: count\n' }],
+    }).expect(201);
+    revision = res.body.revision;
+    const after = await admin('get', `/meta?revision=${revision}`).expect(200);
+    expect(after.headers['x-xcube-revision']).toBe(`dev@${revision}`);
+    expect(after.body.cubes.map((c: any) => c.name)).toContain('late');
+  });
 });

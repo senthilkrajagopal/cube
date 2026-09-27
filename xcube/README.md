@@ -671,11 +671,14 @@ It answers `201` (created) or `200` with
 
 #### `GET …/overlays/{id}`
 
-`{ model, id, version, expiresAt, validatedRevision, upserts, deletes, connections, instance }`.
+`{ model, id, version, expiresAt, validatedRevision, upserts, boundRevision, deletes, connections, instance }`.
 
 - `upserts` lists `{ folderId, name, kind }`.
 - `connections` lists `{ folderId, name, fullName, driver, authMethod, fields, secrets }`,
   `secrets` naming the sealed fields; never an envelope.
+- **Bindings as previews have them.** Each upsert also has `fullName`, `bindings` and a cube's `dataSource`, as its previews bind it over the published revision `boundRevision`.
+  - Names resolve among the overlay's items first, so they may differ from what the same items would bind to once landed. Compare them with a `POST …/changesets?dryRun=true` of the same items.
+  - `boundRevision` is `null`, and the bindings are left out, when the overlay no longer applies.
 - `instance` is what the answering instance makes of the overlay over its
   current revision: `serving`, `idle` (not compiled now), or `broken` with its
   `errors`.
@@ -768,6 +771,11 @@ The model's field list for the client's own reads (jobs, schedules):
 Its public members only. `403`/`503` as queries for an unknown or not yet
 loaded model.
 
+- **Read-your-writes.** `?revision=<n>` answers from that revision or a newer
+  one. The instance waits for it as it does for a user token naming it
+  (`XCUBE_CATCH_UP_MS`), else answers `503` with `Retry-After`.
+- **Which revision.** Every answer names its revision in `x-xcube-revision`.
+
 #### `POST …/changesets`
 
 ```json
@@ -785,7 +793,11 @@ like the snapshot import: `201` created, `200` the same items as now (a
 retry), `409 conflict` on a stale base, `409 mode` for a model still in
 files mode, `422 invalid_items` with `errors` of the form
 `{ folderId, name, line?, column?, kind, message }`. Each changed item comes
-back with its full name in `items`.
+back in `items` as `{ folderId, name, fullName, bindings, dataSource? }`:
+- `bindings` is what each short name it uses is bound to, `{ shortName: fullName }`, as `GET …/items` gives them;
+- a cube's `dataSource` is its data source as bound: `default` when it names none, `null` when it inherits its parent's.
+
+The overlay push and the snapshot import answer the same way.
 
 With `?dryRun=true` it only checks, and takes slice 2's `securityContext`
 and `probes` (queries use full names); it answers `200` with `{ valid,

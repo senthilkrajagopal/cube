@@ -259,8 +259,11 @@ type Handler = (req: Request, res: Response) => Promise<void>;
  * don't apply.
  */
 export interface AdminReads {
-  /** A model's field list, unfiltered, merged across modules (`extended`: as `/v1/meta?extended`). */
-  meta(model: string, extended: boolean): Promise<{ status: number; body: any }>;
+  /**
+   * A model's field list, unfiltered, merged across modules (`extended`: as
+   * `/v1/meta?extended`); with `revision`, from that revision or a newer.
+   */
+  meta(model: string, extended: boolean, options?: { revision?: number; res?: any }): Promise<{ status: number; body: any }>;
   /** A model's pre-aggregation partitions and their build state, as Cube's system route answers. */
   partitions(model: string, query: any): Promise<{ status: number; body: any }>;
 }
@@ -482,7 +485,14 @@ export function initAdminRoutes(
     if (req.query.extended !== undefined && req.query.extended !== 'true' && req.query.extended !== 'false') {
       throw new AdminError(400, 'bad_request', 'extended is true or false');
     }
-    const { status, body } = await reads.meta(model, req.query.extended === 'true');
+    const least = req.query.revision;
+    if (least !== undefined && (typeof least !== 'string' || !/^[1-9]\d{0,9}$/.test(least))) {
+      throw new AdminError(400, 'bad_request', 'revision is a revision number');
+    }
+    const { status, body } = await reads.meta(model, req.query.extended === 'true', {
+      revision: least === undefined ? undefined : Number(least),
+      res,
+    });
     res.status(status).json(body);
   }));
 
