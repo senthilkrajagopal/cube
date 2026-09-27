@@ -490,9 +490,14 @@ descendant's.
   from it at once, and builds its rollups there, never serving the old one's.
   - A cube on the root's `default` keeps its alias as before. An alias the
     author wrote is kept, and so is its caching.
-  - A cube that `extends` another takes its alias from its own binding: when
-    only its parent is published onto another data source, publish the child
-    again too.
+  - A cube that `extends` another is aliased by the data source it inherits,
+    and always has an alias of its own: otherwise Cube gives it its parent's.
+    When a parent is published onto another data source, each child that
+    isn't published with it gets its new alias in the same publish, and
+    nothing else: its bindings stay as published.
+  - Aliases are worked out for every item at each publish, so a cube from
+    before this that is due another alias gets it at the model's next publish.
+    Its rollups rebuild once then.
   - A connection changed in place, the same name aimed elsewhere, keeps its
     cubes' aliases. Their cached results and rollups renew on their refresh
     keys, as in Cube itself.
@@ -819,7 +824,7 @@ files mode, `422 invalid_items` with `errors` of the form
 `{ folderId, name, line?, column?, kind, message }`. Each changed item comes
 back in `items` as `{ folderId, name, fullName, bindings, dataSource? }`:
 - `bindings` is what each short name it uses is bound to, `{ shortName: fullName }`, as `GET …/items` gives them;
-- a cube's `dataSource` is its data source as bound: `default` when it names none, `null` when it inherits its parent's.
+- a cube's `dataSource` is the data source it queries, as in `GET …/items`, with `extends` naming the cube it extends.
 
 The overlay push and the snapshot import answer the same way.
 
@@ -856,10 +861,14 @@ column.
 #### `GET …/items`
 
 Every item of the current revision:
-`{ folderId, name, kind, fullName, bindings: { shortName: fullName }, dataSource? }`.
-A cube's `dataSource` is the one it is bound to: `default` when it names none,
-or `null` when it inherits its parent's. It is what a data source's "cubes that
-use it" lists (AC-157).
+`{ folderId, name, kind, fullName, bindings: { shortName: fullName }, dataSource?, extends? }`.
+A cube's `dataSource` is the one it queries, and what a data source's "cubes
+that use it" lists (AC-157):
+- the one it is bound to, with `default` when it names none;
+- for a cube that `extends` another, the one it inherits, however far up, with
+  `extends` naming its parent by full name.
+
+It is `null` only when that can't be found.
 
 #### `POST …/resolve`
 

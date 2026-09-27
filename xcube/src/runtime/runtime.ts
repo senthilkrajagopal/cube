@@ -27,9 +27,9 @@ import {
   type PublishedItem,
 } from '../names/items';
 import { filesOf, itemsHash, publish } from '../names/publish';
-import { rollupsToStrip, withoutRollups } from '../overlays/rollups';
+import { parentOf, rollupsToStrip, withoutRollups } from '../overlays/rollups';
 import {
-  boundDataSource, MAX_OVERLAY_ORCHESTRATORS, overlayOfAppId, withDataSourceMark,
+  boundDataSource, effectiveDataSource, MAX_OVERLAY_ORCHESTRATORS, overlayOfAppId, withDataSourceMark,
 } from '../overlays/connections';
 import { Connections, ConnectionError, type ConnectionInput } from '../connections/connections';
 import { CredentialError, CredentialKeys, type SealedV1 } from '../credentials/credentials';
@@ -225,8 +225,13 @@ export interface ItemRef {
   fullName: string;
   /** What each short name it uses is bound to: `{ shortName: fullName }`, as `GET …/items` gives them. */
   bindings: Record<string, string>;
-  /** A cube's data source as bound (`default` when it names none), or `null` when it inherits its parent's. */
+  /**
+   * A cube's data source: as bound (`default` when it names none), else the
+   * one it inherits through `extends`; `null` only when that can't be found.
+   */
   dataSource?: string | null;
+  /** The cube it extends, by full name. */
+  extends?: string;
 }
 
 export type ItemsOutcome =
@@ -1570,7 +1575,8 @@ export class XcubeRuntime {
         new FolderTree(await store.folders(model)), await this.itemsAt(head), record, await this.dataSourcesOf(model),
       );
       if (!published.errors.length) {
-        bound = new Map(published.items.map((item) => [`${item.folderId}/${item.name}`, XcubeRuntime.refOf(item)]));
+        const byFullName = new Map(published.items.map((item) => [item.fullName, item]));
+        bound = new Map(published.items.map((item) => [`${item.folderId}/${item.name}`, XcubeRuntime.refOf(item, byFullName)]));
       }
     }
     const active = this.models.get(model)?.active;
@@ -1590,7 +1596,7 @@ export class XcubeRuntime {
       validatedRevision: record.validatedRevision,
       upserts: record.upserts.map(({ folderId, name, kind }) => {
         const ref = bound?.get(`${folderId}/${name}`);
-        return { folderId, name, kind, ...(ref ? { fullName: ref.fullName, bindings: ref.bindings, ...('dataSource' in ref ? { dataSource: ref.dataSource } : {}) } : {}) };
+        return { folderId, name, kind, ...(ref ? { ...ref, folderId, name } : {}) };
       }),
       // The published revision the upserts' bindings are over; null when it doesn't apply to it.
       boundRevision: bound ? head!.revision : null,
@@ -2871,9 +2877,10 @@ export class XcubeRuntime {
   }
 
   protected static refs(items: PublishedItem[], keys?: Set<string>): ItemRef[] {
+    const byFullName = new Map(items.map((item) => [item.fullName, item]));
     return items
       .filter((item) => !keys || keys.has(`${item.folderId}/${item.name}`))
-      .map((item) => XcubeRuntime.refOf(item));
+      .map((item) => XcubeRuntime.refOf(item, byFullName));
   }
 
   /** The connections changed cubes are bound to (the root's `default` may be Cube's own, so it isn't one). */
@@ -2888,13 +2895,16 @@ export class XcubeRuntime {
     return [...names].sort();
   }
 
-  protected static refOf(item: PublishedItem): ItemRef {
+  /** An item as answers name it; `byFullName` (the revision's items) resolves what a cube inherits. */
+  protected static refOf(item: PublishedItem, byFullName: Map<string, PublishedItem>): ItemRef {
+    const parent = item.kind === 'cube' ? parentOf(item) : undefined;
     return {
       folderId: item.folderId,
       name: item.name,
       fullName: item.fullName,
       bindings: item.bindings,
-      ...(item.kind === 'cube' ? { dataSource: boundDataSource(item) } : {}),
+      ...(item.kind === 'cube' ? { dataSource: effectiveDataSource(item, byFullName) } : {}),
+      ...(parent !== undefined ? { extends: parent } : {}),
     };
   }
 
@@ -3222,7 +3232,7 @@ export class XcubeRuntime {
       model,
       revision: head.revision,
       mode: head.mode ?? 'files',
-      items: items.map((item) => ({ kind: item.kind, ...XcubeRuntime.refOf(item) })),
+      items: XcubeRuntime.refs(items).map((ref, i) => ({ kind: items[i].kind, ...ref })),
     };
   }
 

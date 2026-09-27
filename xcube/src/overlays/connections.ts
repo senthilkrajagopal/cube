@@ -1,5 +1,6 @@
 import type { SnapshotFile } from '../model/snapshot';
 import type { PublishedItem } from '../names/items';
+import { parentOf } from './rollups';
 
 /**
  * The data source a published cube is bound to: its `data_source` as
@@ -12,6 +13,25 @@ export function boundDataSource(item: PublishedItem): string | null {
     return bound;
   }
   return /^(?: {4}| {2}- )extends:/m.test(item.resolvedYaml) ? null : 'default';
+}
+
+/**
+ * The data source a cube queries: its own as bound, else, through `extends`,
+ * its parent's, however far up. `null` when no cube of the chain is among
+ * `byFullName`.
+ */
+export function effectiveDataSource(item: PublishedItem, byFullName: Map<string, PublishedItem>): string | null {
+  const seen = new Set<string>();
+  for (let at: PublishedItem | undefined = item; at && !seen.has(at.fullName);) {
+    seen.add(at.fullName);
+    const own = boundDataSource(at);
+    if (own !== null) {
+      return own;
+    }
+    const parent = parentOf(at);
+    at = parent === undefined ? undefined : byFullName.get(parent);
+  }
+  return null;
 }
 
 /**

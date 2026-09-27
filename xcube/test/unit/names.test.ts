@@ -631,6 +631,47 @@ describe('data sources', () => {
     expect(aliasOfItem(rooted.items, 'r')).toBe(aliasOf('r', 'lake'));
     expect(aliasOfItem(rooted.items, 'feu__b')).toBe('mine');
   });
+
+  test('a cube that extends another is aliased by the data source it inherits, and never shares its parent\'s alias', () => {
+    const aliasOfItem = (items: PublishedItem[], fullName: string) => doc(byName(items, fullName)).sql_alias;
+    const withRootLake = [...sources, { folderId: 'froot', name: 'lake' }];
+    const first = publish({
+      tree,
+      current: [],
+      deletes: [],
+      dataSources: withRootLake,
+      upserts: [
+        cubeWith('feu', 'base', '    data_source: warehouse\n'),
+        cube('feu', 'child', '    extends: base\n'),
+        cubeWith('froot', 'rbase', '    data_source: lake\n'),
+        cube('froot', 'rchild', '    extends: rbase\n'),
+        cubeWith('froot', 'abase', '    sql_alias: ab\n'),
+        cube('froot', 'achild', '    extends: abase\n'),
+      ],
+    });
+    expect(first.errors).toEqual([]);
+    // Children are aliased by the data source they inherit, never sharing their parent's alias.
+    expect(aliasOfItem(first.items, 'feu__child')).toBe(aliasOf('feu__child', 'fsales__warehouse'));
+    expect(aliasOfItem(first.items, 'rbase')).toBe(aliasOf('rbase', 'lake'));
+    expect(aliasOfItem(first.items, 'rchild')).toBe(aliasOf('rchild', 'lake'));
+    // On Cube's default, a root child under an authored alias has its own name, not the parent's `ab`.
+    expect(aliasOfItem(first.items, 'abase')).toBe('ab');
+    expect(aliasOfItem(first.items, 'achild')).toBe('achild');
+
+    // The parent alone published onto another data source: the kept child follows, its alias only.
+    const again = publish({
+      tree, current: first.items, deletes: [], dataSources: withRootLake, upserts: [cubeWith('feu', 'base')],
+    });
+    expect(again.errors).toEqual([]);
+    expect(aliasOfItem(again.items, 'feu__base')).toBe(aliasOf('feu__base', 'fsales__default'));
+    expect(aliasOfItem(again.items, 'feu__child')).toBe(aliasOf('feu__child', 'fsales__default'));
+    expect(again.changed).toEqual(expect.arrayContaining(['feu/base', 'feu/child']));
+    expect(byName(again.items, 'feu__child').bindings).toEqual(byName(first.items, 'feu__child').bindings);
+    // What doesn't change isn't touched.
+    expect(again.changed).not.toContain('froot/rchild');
+    expect(byName(again.items, 'rchild')).toBe(byName(first.items, 'rchild'));
+    expect(byName(again.items, 'achild')).toBe(byName(first.items, 'achild'));
+  });
 });
 
 describe('titles match Cube\'s own', () => {

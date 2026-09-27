@@ -544,12 +544,21 @@ describeWithDatabase('connections: data sources served from sealed credentials',
         kind: 'cube',
         yaml: 'cubes:\n  - name: where\n    data_source: warehouse\n    sql: SELECT current_database() AS db\n    dimensions:\n      - name: db\n        sql: db\n        type: string\n        primary_key: true\n        public: true\n',
       };
+      // A cube extending it, published once and then left alone.
+      const twin = { folderId: 'fab', name: 'twin', kind: 'cube', yaml: 'cubes:\n  - name: twin\n    extends: where\n' };
       // As a client does that takes what is cached and has it renewed behind (or Cube with background renewal on).
-      const ask = () => request(server).get('/cubejs-api/v1/load')
-        .query({ query: JSON.stringify({ dimensions: ['fab__where.db'], cacheMode: 'stale-while-revalidate' }) })
+      const ask = (cube = 'fab__where') => request(server).get('/cubejs-api/v1/load')
+        .query({ query: JSON.stringify({ dimensions: [`${cube}.db`], cacheMode: 'stale-while-revalidate' }) })
         .set('Authorization', jwt.sign({ wechartModel: 'dev', wechartRevision: revision }, API_SECRET));
-      revision = (await admin('post', '/changesets', { baseRevision: revision, upserts: [where] }).expect(201)).body.revision;
+      // The SQL Cube keys its cached results by.
+      const sqlOf = async (cube: string) => (await request(server).get('/cubejs-api/v1/sql')
+        .query({ query: JSON.stringify({ dimensions: [`${cube}.db`] }) })
+        .set('Authorization', jwt.sign({ wechartModel: 'dev', wechartRevision: revision }, API_SECRET))
+        .expect(200)).body.sql.sql[0];
+      revision = (await admin('post', '/changesets', { baseRevision: revision, upserts: [where, twin] }).expect(201)).body.revision;
       expect((await ask().expect(200)).body.data[0]['fab__where.db']).toBe(target.database);
+      expect((await ask('fab__twin').expect(200)).body.data[0]['fab__twin.db']).toBe(target.database);
+      const [whereBefore, twinBefore] = [await sqlOf('fab__where'), await sqlOf('fab__twin')];
       let { items } = (await admin('get', '/items').expect(200)).body;
       expect(items.find((i: any) => i.fullName === 'fab__where')).toMatchObject({ kind: 'cube', dataSource: 'fa__warehouse' });
       expect(items.find((i: any) => i.fullName === 'orders')).toMatchObject({ dataSource: 'default' });
@@ -560,8 +569,14 @@ describeWithDatabase('connections: data sources served from sealed credentials',
       revision = (await admin('post', '/changesets', { baseRevision: revision, upserts: [where] }).expect(201)).body.revision;
       // Straight after, well within Postgres's 10-second refresh key: the same query, from the new database.
       expect((await ask().expect(200)).body.data[0]['fab__where.db']).toBe(workspaceDb);
+      // The twin, never published again, follows its parent onto it too: another SQL, so no cached answer of the old one's.
+      expect(await sqlOf('fab__where')).not.toBe(whereBefore);
+      expect(await sqlOf('fab__twin')).not.toBe(twinBefore);
+      expect((await ask('fab__twin').expect(200)).body.data[0]['fab__twin.db']).toBe(workspaceDb);
       ({ items } = (await admin('get', '/items').expect(200)).body);
       expect(items.find((i: any) => i.fullName === 'fab__where').dataSource).toBe('fab__warehouse');
+      // What the twin queries, and where it gets it.
+      expect(items.find((i: any) => i.fullName === 'fab__twin')).toMatchObject({ dataSource: 'fab__warehouse', extends: 'fab__where' });
     });
   });
 });

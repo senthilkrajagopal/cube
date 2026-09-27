@@ -31,7 +31,7 @@ export function reachedBy(items: PublishedItem[], changed: Set<string>): Set<str
 }
 
 /** The item an item extends, from its resolved YAML (xcube's own dump, so one line). */
-function parentOf(item: PublishedItem): string | undefined {
+export function parentOf(item: PublishedItem): string | undefined {
   if (!item.resolvedYaml.includes('extends:')) {
     return undefined;
   }

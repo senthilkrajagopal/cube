@@ -54,18 +54,6 @@ export function aliasOf(fullName: string, dataSource?: string): string {
   return plain.length <= MAX_PLAIN_ALIAS ? plain : `x${base32(`${fullName}@${dataSource}`, 7)}`;
 }
 
-/**
- * The data source a cube's alias names: its own, as bound (or written), unless
- * it is Cube's default. Cube keys cached results by their SQL and names rollup
- * tables by the alias, neither by data source: a cube bound to another data
- * source must be another SQL alias, or it would be answered from what the old
- * one gave.
- */
-function aliasedDataSource(doc: Record<string, any>): string | undefined {
-  const named = doc.data_source ?? doc.dataSource;
-  return typeof named === 'string' && named !== 'default' ? named : undefined;
-}
-
 export interface PublishInput {
   tree: FolderTree;
   /** The current revision's items. */
@@ -110,6 +98,78 @@ function preAggregationsOf(doc: Record<string, any>): any[] {
   return Array.isArray(list) ? list.filter((pa) => pa && typeof pa.name === 'string') : [];
 }
 
+type Entry = { def: ItemDefinition; doc: Record<string, any>; resolved: boolean };
+
+/**
+ * The data source a cube's alias names: its own as bound (or written), else
+ * the one it inherits through `extends`, unless that is Cube's default. Cube
+ * keys cached results by their SQL and names rollup tables by the alias,
+ * neither by data source: a cube on another data source must be another SQL
+ * alias, or it would be answered from what the old one gave.
+ */
+function aliasedDataSource(entry: Entry, byFullName: Map<string, Entry>): string | undefined {
+  const seen = new Set<string>();
+  for (let at: Entry | undefined = entry; at && !seen.has(at.def.fullName);) {
+    seen.add(at.def.fullName);
+    const named = at.doc.data_source ?? at.doc.dataSource;
+    if (typeof named === 'string') {
+      return named !== 'default' ? named : undefined;
+    }
+    at = typeof at.doc.extends === 'string' ? byFullName.get(at.doc.extends.trim()) : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * The SQL alias xcube gives a cube whose author wrote none:
+ * - a prefixed cube's names it; so does any cube's on a data source of its
+ *   own, inherited ones included;
+ * - a cube that extends another has one of its own, or Cube would give it its
+ *   parent's (`CubeSymbols` sets the parent as its prototype);
+ * - any other root cube has none, and is its name.
+ */
+function generatedAlias(entry: Entry, byFullName: Map<string, Entry>): string | undefined {
+  const { def, doc } = entry;
+  const dataSource = aliasedDataSource(entry, byFullName);
+  if (def.folderId === ROOT && dataSource === undefined) {
+    return typeof doc.extends === 'string' ? def.fullName : undefined;
+  }
+  const alias = aliasOf(def.fullName, dataSource);
+  // A rollup table is named <alias>_<pre-aggregation>: when that would be too long, the short hash alias.
+  const tooLong = preAggregationsOf(doc).some((pa) => `${alias}_${pa.sql_alias ?? pa.sqlAlias ?? pa.name}`.length > MAX_TABLE_STEM);
+  return tooLong ? `x${base32(dataSource === undefined ? def.fullName : `${def.fullName}@${dataSource}`, 7)}` : alias;
+}
+
+/**
+ * Each cube's SQL alias, once every item of the publish is resolved. A kept
+ * cube whose alias that changes (its parent published onto another data
+ * source) is re-dumped with the new alias, and nothing else: its bindings
+ * stay as published. Returns the keys of those.
+ */
+function assignAliases(entries: Entry[]): Set<string> {
+  const byFullName = new Map(entries.map((entry) => [entry.def.fullName, entry]));
+  const realiased = new Set<string>();
+  entries
+    .filter(({ def }) => def.kind === 'cube' && def.doc.sql_alias === undefined && def.doc.sqlAlias === undefined)
+    .forEach((entry) => {
+      const { def, doc } = entry;
+      const alias = generatedAlias(entry, byFullName);
+      if (alias !== (doc.sql_alias ?? doc.sqlAlias)) {
+        delete doc.sqlAlias;
+        if (alias === undefined) {
+          delete doc.sql_alias;
+        } else {
+          doc.sql_alias = alias;
+        }
+        if (!entry.resolved) {
+          realiased.add(itemKey(def.folderId, def.name));
+          entry.resolved = true;
+        }
+      }
+    });
+  return realiased;
+}
+
 /**
  * What xcube adds to a resolved item: its title and alias when prefixed,
  * aliases for the cubes of a view that prefix or split by them, and where
@@ -119,17 +179,6 @@ function finish(def: ItemDefinition, doc: Record<string, any>) {
   const prefixed = def.folderId !== ROOT;
   if (prefixed && doc.title === undefined) {
     doc.title = titleOf(def.name);
-  }
-  // A cube on a data source of its own is aliased by it too, root cubes included.
-  const dataSource = def.kind === 'cube' ? aliasedDataSource(doc) : undefined;
-  if ((prefixed || dataSource !== undefined) && doc.sql_alias === undefined && doc.sqlAlias === undefined) {
-    let alias = aliasOf(def.fullName, dataSource);
-    // A rollup table is named <alias>_<pre-aggregation>: when that would be too long, the short hash alias.
-    const tooLong = preAggregationsOf(doc).some((pa) => `${alias}_${pa.sql_alias ?? pa.sqlAlias ?? pa.name}`.length > MAX_TABLE_STEM);
-    if (tooLong) {
-      alias = `x${base32(dataSource === undefined ? def.fullName : `${def.fullName}@${dataSource}`, 7)}`;
-    }
-    doc.sql_alias = alias;
   }
   if (def.kind === 'view' && Array.isArray(def.doc.cubes)) {
     // A view prefixes or splits by each cube's name; keep it the short one (CubeSymbols.ts:946, 1018).
@@ -167,7 +216,7 @@ function viewMemberNames(doc: Record<string, any>): string[] {
  * identifier too long. Pre-aggregations of prefixed cubes whose table stem
  * would be too long get a short stable alias.
  */
-function checkAliases(entries: { def: ItemDefinition; doc: Record<string, any>; resolved: boolean }[]): ItemError[] {
+function checkAliases(entries: Entry[]): ItemError[] {
   const errors: ItemError[] = [];
   const cubeAliases = new Map<string, string>();
   const tables = new Map<string, string>();
@@ -377,11 +426,12 @@ export function publish({
     newBindings.set(key, bindings);
   }
 
-  const entries = [...defs].map(([key, def]) => ({
+  const entries: Entry[] = [...defs].map(([key, def]) => ({
     def,
     doc: resolvedDocs.get(key) ?? (yaml.load(kept.get(key)!.resolvedYaml) as any)[listKeyOf(def.kind)][0],
     resolved: resolvedDocs.has(key),
   }));
+  const realiased = assignAliases(entries);
   errors.push(...checkAliases(entries));
   if (errors.length) {
     return { items: current, changed: [], errors };
@@ -392,6 +442,9 @@ export function publish({
     if (!resolved) {
       return kept.get(key)!;
     }
+    if (realiased.has(key)) {
+      return { ...kept.get(key)!, resolvedYaml: dump(def.kind, doc) };
+    }
     const authored = upserted.get(key)!;
     return {
       ...authored,
@@ -401,7 +454,7 @@ export function publish({
     };
   }).sort((a, b) => (a.fullName < b.fullName ? -1 : 1));
 
-  return { items, changed: [...upserted.keys()], errors: [] };
+  return { items, changed: [...upserted.keys(), ...realiased], errors: [] };
 }
 
 /** The files Cube compiles: one per item, named by its full name. */
