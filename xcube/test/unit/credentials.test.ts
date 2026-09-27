@@ -120,3 +120,41 @@ describe('credential sealing, scheme v1', () => {
       .toBe('-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----');
   });
 });
+
+// wechart's golden vectors (test/fixtures/wechart-golden-v1): its sealer and xcube's opener agree byte for byte.
+describe('wechart\'s golden vectors, scheme v1', () => {
+  const fixtures = path.join(__dirname, '..', 'fixtures', 'wechart-golden-v1');
+  const golden = JSON.parse(fs.readFileSync(path.join(fixtures, 'golden-v1.json'), 'utf8'));
+
+  test('every binding is the one xcube computes, byte for byte', () => {
+    expect(golden.aad.length).toBe(8);
+    for (const vector of golden.aad) {
+      expect({ driver: vector.driver, aad: secretAadV1(vector.driver, vector.field, vector.fields).toString('utf8') })
+        .toEqual({ driver: vector.driver, aad: vector.aad });
+    }
+  });
+
+  test('every envelope opens with the development key for exactly its fields, and for no others', () => {
+    const key = generateCredentialKey(fs.readFileSync(path.join(fixtures, 'dev-credential-key.pem'), 'utf8'));
+    expect(key.jwk).toEqual(JSON.parse(fs.readFileSync(path.join(fixtures, 'dev-credential-key.pub.jwk'), 'utf8')));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xcube-golden-'));
+    try {
+      fs.writeFileSync(path.join(dir, `${key.kid}.pem`), key.pem);
+      fs.writeFileSync(path.join(dir, `${key.kid}.check`), key.check);
+      const keys = new CredentialKeys(dir, [key.kid], key.kid);
+      expect(golden.envelopes.length).toBe(7);
+      for (const vector of golden.envelopes) {
+        expect(vector.envelope.kid).toBe(key.kid);
+        expect({ driver: vector.driver, secret: keys.open(vector.envelope, vector.driver, vector.field, vector.fields) })
+          .toEqual({ driver: vector.driver, secret: vector.secret });
+        // Bound: another value of a target field, and the secret doesn't open.
+        const [targetKey] = Object.keys(vector.fields).filter((k) => secretAadV1(vector.driver, vector.field, { ...vector.fields, [k]: 'elsewhere' })
+          .toString() !== secretAadV1(vector.driver, vector.field, vector.fields).toString());
+        expect(() => keys.open(vector.envelope, vector.driver, vector.field, { ...vector.fields, [targetKey]: 'elsewhere' })).toThrow(CredentialError);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+

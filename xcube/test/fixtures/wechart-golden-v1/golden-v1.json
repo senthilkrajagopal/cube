@@ -1,0 +1,190 @@
+{
+  "about": "Credential sealing, scheme v1 (T441): golden vectors both wechart's and xcube's tests check, so their two copies of the binding can't drift apart. `aad`: each binding's exact bytes, as UTF-8 text. `envelopes`: secrets sealed to the development key (infra/xcube/dev-credential-key.pub.jwk), which its private half opens for exactly these fields. Development values only.",
+  "aad": [
+    {
+      "driver": "postgres",
+      "field": "password",
+      "fields": { "host": "db.example.com", "port": 5432, "database": "sales" },
+      "aad": "[\"wechart/data-source-secret/v1\",\"postgres\",\"password\",[[\"host\",\"db.example.com\"],[\"port\",\"5432\"],[\"ssl\",\"\"],[\"sslCa\",\"\"],[\"sslRejectUnauthorized\",\"\"]]]"
+    },
+    {
+      "driver": "mysql",
+      "field": "password",
+      "fields": {
+        "host": "h",
+        "port": 3306,
+        "ssl": true,
+        "sslRejectUnauthorized": false,
+        "sslCa": "PEM"
+      },
+      "aad": "[\"wechart/data-source-secret/v1\",\"mysql\",\"password\",[[\"host\",\"h\"],[\"port\",\"3306\"],[\"ssl\",\"true\"],[\"sslCa\",\"PEM\"],[\"sslRejectUnauthorized\",\"false\"]]]"
+    },
+    {
+      "driver": "mssql",
+      "field": "password",
+      "fields": { "host": "h", "encrypt": true },
+      "aad": "[\"wechart/data-source-secret/v1\",\"mssql\",\"password\",[[\"encrypt\",\"true\"],[\"host\",\"h\"],[\"port\",\"\"],[\"trustServerCertificate\",\"\"]]]"
+    },
+    {
+      "driver": "oracle",
+      "field": "password",
+      "fields": { "host": "h" },
+      "aad": "[\"wechart/data-source-secret/v1\",\"oracle\",\"password\",[[\"connectString\",\"\"],[\"database\",\"\"],[\"host\",\"h\"],[\"port\",\"\"]]]"
+    },
+    {
+      "driver": "dremio",
+      "field": "token",
+      "fields": { "url": "https://api.dremio.cloud/v0/projects/p" },
+      "aad": "[\"wechart/data-source-secret/v1\",\"dremio\",\"token\",[[\"host\",\"\"],[\"port\",\"\"],[\"ssl\",\"\"],[\"url\",\"https://api.dremio.cloud/v0/projects/p\"]]]"
+    },
+    {
+      "driver": "redshift",
+      "field": "password",
+      "fields": {
+        "host": "cluster.abc.us-east-1.redshift.amazonaws.com",
+        "port": 5439,
+        "database": "dev",
+        "user": "awsuser",
+        "ssl": true
+      },
+      "aad": "[\"wechart/data-source-secret/v1\",\"redshift\",\"password\",[[\"host\",\"cluster.abc.us-east-1.redshift.amazonaws.com\"],[\"port\",\"5439\"],[\"ssl\",\"true\"],[\"sslCa\",\"\"],[\"sslRejectUnauthorized\",\"\"]]]"
+    },
+    {
+      "driver": "snowflake",
+      "field": "privateKey",
+      "fields": {
+        "account": "xy12345",
+        "warehouse": "COMPUTE_WH",
+        "database": "SALES",
+        "username": "CUBE"
+      },
+      "aad": "[\"wechart/data-source-secret/v1\",\"snowflake\",\"privateKey\",[[\"account\",\"xy12345\"],[\"region\",\"\"],[\"warehouse\",\"COMPUTE_WH\"]]]"
+    },
+    {
+      "driver": "bigquery",
+      "field": "credentials",
+      "fields": { "projectId": "golden-project", "location": "US" },
+      "aad": "[\"wechart/data-source-secret/v1\",\"bigquery\",\"credentials\",[[\"projectId\",\"golden-project\"]]]"
+    }
+  ],
+  "envelopes": [
+    {
+      "driver": "postgres",
+      "field": "password",
+      "fields": {
+        "host": "db.example.com",
+        "port": 5432,
+        "database": "sales",
+        "user": "cube",
+        "ssl": true,
+        "sslRejectUnauthorized": true
+      },
+      "secret": "golden-postgres-password",
+      "envelope": {
+        "v": 1,
+        "kid": "uYWeMx6i173fsiolFp1xi-qiav50k52AGinM56Y8JEw",
+        "enc": "5XthfEpMnPmR1TnVH9rpfomJnACPwhp9EtHX_p9m7hc",
+        "ct": "lt09GorDAtlT7T8XTJdGOw4DLQJCtE5LvOflffJ7-Ie9dttZTtTBtwZyRWE1MxGkPeTloSsMdm0HkY_u_vjBYlLGOx8NGTz9aqKGhQh42cFAUSJUbOnNQdy5nFghNj2oOsNfNiluqO04zCSE49Q3x3N41d4fKpEUHMf3LFm2xX5C-F05EkTs-FhQJBaBy7Al_iJg0w-gK22knHPf29Uny0Kg2k4PI3itt6rQZhEqc9u_itoC63LJNN4s80e92WtC5JETqOPCEKuQrCXzjeOdnj9mSbXzCbMqNAhygL6awGZbhCNDXHgEXOhtle9Gl72dJr3Ks_sP0YNou_QDE9WJPQ1lEB7llcmgwk82w-8r2e0"
+      }
+    },
+    {
+      "driver": "mysql",
+      "field": "sslKey",
+      "fields": {
+        "host": "h",
+        "port": 3306,
+        "database": "d",
+        "user": "u",
+        "ssl": true,
+        "sslRejectUnauthorized": false,
+        "sslCa": "PEM",
+        "sslCert": "CERT"
+      },
+      "secret": "-----BEGIN PRIVATE KEY-----\ngolden\n-----END PRIVATE KEY-----",
+      "envelope": {
+        "v": 1,
+        "kid": "uYWeMx6i173fsiolFp1xi-qiav50k52AGinM56Y8JEw",
+        "enc": "YFmjQuzt2VOalcWnn1fsiZkEcZ-U4myeAOcC87lzFyw",
+        "ct": "DSF3evQq-3T8PNenCsESwJi9tW-Z64bl7A8IR1w7evDRhChzpQv0SE0OVpgoUNcf3RWCyI16qMcPgUL32k72LHTINbzPV4nv5nB-gn9yu4F749b7rJDhVFoKngqULS6tw1D_zk2eeZh4TEHmBV_0jGeCtFlUaYsImbDwl135EdJn6Dwhxc0pkEC7_ww8HzUGWM29OdsCXxAieJUM6C4eAOGWQf3AvtzUqoJORC8Srcbna-b4az7HeU_l6OfbGamOy4CM-gMJ-CQ-xcAiQGfU89RXucbv6AhTgvUSbKPqcOHUGCZNdtX3oxcfVdP93oPOgZxkwyPkDcGvYlTOQ8EQNj8Dn719e3oEfmrHMo9MD_Q"
+      }
+    },
+    {
+      "driver": "dremio",
+      "field": "token",
+      "fields": { "url": "https://api.dremio.cloud/v0/projects/p" },
+      "secret": "golden-dremio-token",
+      "envelope": {
+        "v": 1,
+        "kid": "uYWeMx6i173fsiolFp1xi-qiav50k52AGinM56Y8JEw",
+        "enc": "_DibiGXjo5T3hDM_qNBbERIDgRS5v8fEouc8PwzHE0k",
+        "ct": "u7cyaxcijkq7aCdgl1hLRrQ-3UWCM_T6EyjamLk-QldSkzkUw0Z3NAOBdNI_RMu4qWeqYlwI_CGTz6Sy6pzzFI9f7hcjssYRa9d6jLuvzKdWkg8FRstyUSNNhlo_zo2XjBy5t5cpV2veqFxLLm2ZO5646b95k9VgJ1TB2Zw9ebR9-tzTo7lAxk_1sZ8FpTkTWQHn3JyCXYfnYPzU4843kArmAcRsn1JfYEsK9dBujL74_oqmqmaRJ7rDYKbQG7D6FjLY6KocJE52WuNjLKWstatn8G3xGZVOLBzg4Vzo1xcEXvSVWRdmfHnWDr8316wt1Mrt0vlADtvitU009dH6zrWLwFJS9Cple81t34EahZw"
+      }
+    },
+    {
+      "driver": "mssql",
+      "field": "password",
+      "fields": {
+        "host": "sql",
+        "port": 1433,
+        "database": "d",
+        "user": "u",
+        "encrypt": true,
+        "trustServerCertificate": false
+      },
+      "secret": "gölden-ünicode",
+      "envelope": {
+        "v": 1,
+        "kid": "uYWeMx6i173fsiolFp1xi-qiav50k52AGinM56Y8JEw",
+        "enc": "oZY2nfz9L3NDsU2b_NStHFpwOTmnxWG1qq_cNSVcnBM",
+        "ct": "I0INX0vQbpSY3PYRo2m71disOtVbpTIO4ZqTsOuhTjLs-M9Iie26b_EPOExc_c6S_8LeUncVRmHv31bwQLCY0_7u4R28mIDPDVnxpFyKTKaO1rK5H9OxHO-AuGPsgCPNwkJei36Wpp_63nWmXhd8pCxPq2g3Fn5cL02GeQYmWhNrivGlabYvVtI3FChi3iY5-2DyTyRgWH-ydV83P4_98y5yBl-j7LBg6-LZQovYxtEIbuBYVEvggzWsplwhOK_UEVgEuqksT35IXc0XzZSUJ8zN-fcxTmzrpR0gEOJpP7uiwwUe3Xvzq58dpwXXInKa1tTIJnBATopmgP41bZhE4RHgepErvqDjREaIc9h3_HM"
+      }
+    },
+    {
+      "driver": "redshift",
+      "field": "password",
+      "fields": {
+        "host": "cluster.abc.us-east-1.redshift.amazonaws.com",
+        "port": 5439,
+        "database": "dev",
+        "user": "awsuser",
+        "ssl": true
+      },
+      "secret": "golden-redshift-password",
+      "envelope": {
+        "v": 1,
+        "kid": "uYWeMx6i173fsiolFp1xi-qiav50k52AGinM56Y8JEw",
+        "enc": "bHJDaSzQLtkmsy_SduchTK7c8cRZqPGNnKQrS9Q2wHE",
+        "ct": "36IIQQzpKByKBS1Vqq0B4YUKrXWC5uKl_XWJc0pi_vmgffL0eOU-pEbe59zHb9RakDOZddM3jIbdKC7QuH_8BuJcwQxdVk79rJaEcNYTwSQzhzrtDrxCJvnAWPG1rOWdf_LpkNDRXmBnJpxabeSJIbnYNUOdrHEmozwYkWsB5ed-Ka2NgKpSwhYvXUcSPaOufJnJb_Tr9EzM163YOrFK_6zYcC7WggjsFMKPpR5VbIVxn9cibpI7DgPf37UmWVnnHCtuafIvZQ5Mjw0V77dLKB6gtexit74BpkMEknYEdieF68rWnd83TF4o_RBuLL_vV92hPc7XwU2ZNr8QbU5td5onozMGv1C3CgNI9mDtJ84"
+      }
+    },
+    {
+      "driver": "snowflake",
+      "field": "privateKey",
+      "fields": {
+        "account": "xy12345",
+        "warehouse": "COMPUTE_WH",
+        "database": "SALES",
+        "username": "CUBE"
+      },
+      "secret": "-----BEGIN ENCRYPTED PRIVATE KEY-----\ngolden-snowflake\n-----END ENCRYPTED PRIVATE KEY-----",
+      "envelope": {
+        "v": 1,
+        "kid": "uYWeMx6i173fsiolFp1xi-qiav50k52AGinM56Y8JEw",
+        "enc": "ztcVx5xvKPxY8HXXHpmKf0RmIQ7u1Ozk6J9xUgaL7gc",
+        "ct": "5juC96c_wvwFTMLnb2N3JM2lR0dStDlz3Fnhc9slxHE5NhmLRiPuXWZBwpvLR73JVVAeO5VKNySPYBl0MKu10mTbMlo0kJXPbgnz0O-Hja-_N9kz4ma0cijvy88cPpIHFGnlogiFK4JKJbFh-KIskgBcEQggDGfgclK2KIBCiPWuJgMGxnPuJmE-VxpxL-DFA4M547KxJAI-fMeYVEVM3qRIHlEiWqG4BjacyfY9fJNOd4pmwbjQQjUNiABU-sNQJo3ahCja8bknEfIzYXawQWXCGP0FwsWHGTI5oO9INyskggAVT4Al6_7ngrblSI2iLWWse-8q105K6woTu-zaBUps_-_weyXDaUlWjD1ivkc"
+      }
+    },
+    {
+      "driver": "bigquery",
+      "field": "credentials",
+      "fields": { "projectId": "golden-project", "location": "US" },
+      "secret": "{\"type\":\"service_account\",\"project_id\":\"golden-project\",\"private_key_id\":\"golden\",\"client_email\":\"cube@golden-project.iam.gserviceaccount.com\"}",
+      "envelope": {
+        "v": 1,
+        "kid": "uYWeMx6i173fsiolFp1xi-qiav50k52AGinM56Y8JEw",
+        "enc": "UrvIf6gZ4ocyiPNjDiwTL9T9WW0VytX16y0OeFexaVc",
+        "ct": "b_s8mBaRAHIPddLZ8gdIC87GJOTGXYte9XXbT0w9WXn41vPY27EPS4Ci3M5rHIY73sBjmgpKeRJDf-QPUsN83o4Xbf28AUGI98rQn-phgEqdNBWSTiHp3JbLYSlN-9lQ4S-94BrrddwJnjlfIoFF4iDgtSz8a3W8ohU2acUyTmw3LEpXUDDZkE-GPi--ABIUi4gdhdSqOtRkAc61B28akUiMN0VyCSqSYYqZb-4IYbSAvW5IxBJlOyuEvweGu4jTqRbgMz-UK4LJPbOZGBi57H4B_fO7fmnDMZKUsDF1kwnV6Yw7Ku7e3b3lvhGXVtGxkWh-1hMfsSuMKzdUd7ydW-2vyLwogT1KTbGiWF6j_fc"
+      }
+    }
+  ]
+}
