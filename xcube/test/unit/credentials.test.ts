@@ -157,4 +157,3 @@ describe('wechart\'s golden vectors, scheme v1', () => {
     }
   });
 });
-
