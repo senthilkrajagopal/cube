@@ -483,6 +483,10 @@ descendant's.
   again.
 - A connection a published cube uses can't be dropped (`409 in_use`, naming
   the cubes). For the root's `default`, that is every cube naming none.
+- **Dropping and publishing don't interleave.** A drop checks its users at the
+  current revision, and is taken only while that revision is still current. A
+  publish is stored only while every connection its changed cubes bind to
+  still exists; otherwise it answers `409 conflict`, to be sent again.
 - In a model without connections, `data_source` is left as written.
 - **Introspection** lists a model's connections, so a data source can be
   browsed before any cube uses it.
@@ -809,6 +813,13 @@ The overlay push and the snapshot import answer the same way.
 With `?dryRun=true` it only checks, and takes slice 2's `securityContext`
 and `probes` (queries use full names); it answers `200` with `{ valid,
 errors, probes, items, itemsHash, currentRevision }`.
+
+**Another writer in between.** A check is made against the revision the
+changeset came in on. If it fails while the model moved on meanwhile (for
+example, another folder's cube and then its data source were removed), a
+publish answers `409 conflict`, for the client to send again. A dry run is
+checked once more against what is published now. Neither is refused over a
+data source only a superseded revision used.
 
 #### `PUT …/snapshot` with items
 

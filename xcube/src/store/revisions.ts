@@ -56,6 +56,12 @@ export interface ItemsImportRequest {
   /** Replaces the folder tree in the same transaction (a snapshot). */
   folders?: Folder[];
   modules?: StoredModule[];
+  /**
+   * The connections the changed items are bound to: stored only while every
+   * one of them still exists, checked under the model's lock that a
+   * connection's removal takes too.
+   */
+  dataSources?: string[];
 }
 
 export interface ImportRequest {
@@ -223,7 +229,12 @@ export interface RevisionStore {
   overlayCount(model: string): Promise<number>;
   connections(model: string): Promise<StoredConnection[]>;
   putConnection(connection: Omit<StoredConnection, 'version' | 'updatedAt'>): Promise<StoredConnection>;
-  deleteConnection(model: string, name: string): Promise<boolean>;
+  /**
+   * Removes a connection once nothing published uses it, as checked at
+   * `atRevision`: `moved` if the model has another revision by then, to be
+   * checked again.
+   */
+  deleteConnection(model: string, name: string, atRevision: number | null): Promise<boolean | 'moved'>;
   reportConnection(model: string, name: string, instance: string, version: number | null, state: string, error: string | null): Promise<void>;
   connectionReports(model: string, name: string): Promise<{ instance: string; version: number | null; state: string; error: string | null; reportedAt: Date }[]>;
   deleteOverlay(model: string, id: string): Promise<boolean>;
@@ -661,8 +672,14 @@ export class PgRevisionStore implements RevisionStore {
     });
   }
 
-  public async deleteConnection(model: string, name: string): Promise<boolean> {
+  public async deleteConnection(model: string, name: string, atRevision: number | null): Promise<boolean | 'moved'> {
     return inTransaction(this.pool, async (client) => {
+      await client.query("SET LOCAL lock_timeout = '10s'");
+      // The lock a publish takes: none lands between the check of the users and the removal.
+      const { rows: [locked] } = await client.query(`SELECT current_rev FROM ${this.s}.models WHERE id = $1 FOR UPDATE`, [model]);
+      if ((locked?.current_rev ?? null) !== atRevision) {
+        return 'moved';
+      }
       const { rowCount } = await client.query(`DELETE FROM ${this.s}.connections WHERE model = $1 AND name = $2`, [model, name]);
       await client.query(`DELETE FROM ${this.s}.connection_reports WHERE model = $1 AND name = $2`, [model, name]);
       await client.query('SELECT pg_notify($1, $2)', [channelOf(this.s), JSON.stringify({ model, connection: name })]);
@@ -833,6 +850,7 @@ export class PgRevisionStore implements RevisionStore {
       itemsHash: request.itemsHash,
       folders: request.folders,
       modules: request.modules,
+      dataSources: request.dataSources,
     });
   }
 
@@ -846,8 +864,9 @@ export class PgRevisionStore implements RevisionStore {
     itemsHash?: string;
     folders?: Folder[];
     modules?: StoredModule[];
+    dataSources?: string[];
   }): Promise<ImportResult> {
-    const { model, baseRevision, files, source, mode, items, itemsHash, folders, modules } = request;
+    const { model, baseRevision, files, source, mode, items, itemsHash, folders, modules, dataSources } = request;
     const hash = contentHash(files);
     const { s } = this;
 
@@ -880,6 +899,16 @@ export class PgRevisionStore implements RevisionStore {
         : current!.contentHash === hash);
       if (!same && (current?.revision ?? null) !== baseRevision) {
         return { outcome: 'conflict', current };
+      }
+      if (!same && dataSources?.length) {
+        // A connection they were bound to was removed meanwhile: checked again, they bind otherwise, or not at all.
+        const { rows } = await client.query(
+          `SELECT name FROM ${s}.connections WHERE model = $1 AND name = ANY($2::text[])`,
+          [model, dataSources]
+        );
+        if (rows.length !== new Set(dataSources).size) {
+          return { outcome: 'conflict', current };
+        }
       }
       if (folders) {
         await this.replaceFolders(client, model, folders, items);

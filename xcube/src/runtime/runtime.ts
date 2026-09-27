@@ -1799,9 +1799,8 @@ export class XcubeRuntime {
       : undefined;
   }
 
-  /** The published cubes using a data source: bound to it, or, for the root's `default`, naming none. */
-  protected async usersOf(model: string, name: string): Promise<string[]> {
-    const head = await this.requireStore().head(model);
+  /** The published cubes using a data source at `head`: bound to it, or, for the root's `default`, naming none. */
+  protected async usersOf(head: ModelHead | null, name: string): Promise<string[]> {
     if (!head || head.mode !== 'items') {
       return [];
     }
@@ -1814,16 +1813,28 @@ export class XcubeRuntime {
     return users.sort();
   }
 
+  /**
+   * Removes a data source nothing published uses. Its users are read at the
+   * current revision, and the removal is taken only while that is still the
+   * current one: a publish binding to it can't land in between.
+   */
   public async deleteConnection(model: string, name: string): Promise<boolean> {
-    const users = await this.usersOf(model, name);
-    if (users.length) {
-      throw new ConnectionError(`Connection "${name}" is used by what is published`, [
-        `${users.slice(0, 20).join(', ')}${users.length > 20 ? `, and ${users.length - 20} more` : ''} use${users.length === 1 ? 's' : ''} it`,
-      ], 'in_use');
+    const store = this.requireStore();
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const head = await store.head(model);
+      const users = await this.usersOf(head, name);
+      if (users.length) {
+        throw new ConnectionError(`Connection "${name}" is used by what is published`, [
+          `${users.slice(0, 20).join(', ')}${users.length > 20 ? `, and ${users.length - 20} more` : ''} use${users.length === 1 ? 's' : ''} it`,
+        ], 'in_use');
+      }
+      const dropped = await store.deleteConnection(model, name, head?.revision ?? null);
+      if (dropped !== 'moved') {
+        this.persistently('a connection', model, () => this.connections.changed(model, name));
+        return dropped;
+      }
     }
-    const dropped = await this.requireStore().deleteConnection(model, name);
-    this.persistently('a connection', model, () => this.connections.changed(model, name));
-    return dropped;
+    throw unavailable(`Model "${model}" kept changing while connection "${name}" was removed; try again`);
   }
 
   /** What each instance's driver for a connection is doing: which version it serves, or why it failed. */
@@ -2865,6 +2876,18 @@ export class XcubeRuntime {
       .map((item) => XcubeRuntime.refOf(item));
   }
 
+  /** The connections changed cubes are bound to (the root's `default` may be Cube's own, so it isn't one). */
+  protected static boundConnections(items: PublishedItem[], changed: Set<string>): string[] {
+    const names = new Set<string>();
+    for (const item of items) {
+      const bound = item.kind === 'cube' && changed.has(`${item.folderId}/${item.name}`) ? boundDataSource(item) : null;
+      if (bound !== null && bound !== 'default') {
+        names.add(bound);
+      }
+    }
+    return [...names].sort();
+  }
+
   protected static refOf(item: PublishedItem): ItemRef {
     return {
       folderId: item.folderId,
@@ -2946,6 +2969,7 @@ export class XcubeRuntime {
       source: Record<string, unknown>;
     },
     check?: { securityContext: Record<string, unknown>; probes: Probe[] },
+    again = false,
   ): Promise<ItemsOutcome | ItemsCheck> {
     const store = this.requireStore();
     const head = await store.head(model);
@@ -2957,9 +2981,19 @@ export class XcubeRuntime {
     if (!tree.has(ROOT)) {
       throw new FolderTreeError([`Model "${model}" has no folder tree yet: put its folders first`]);
     }
-    return this.publishItems(model, head, {
+    const result = await this.publishItems(model, head, {
       tree, current, upserts: changeset.upserts, deletes: changeset.deletes, dataSources: await this.dataSourcesOf(model),
     }, changeset, check);
+    if (check && !again && 'valid' in result && !result.valid && await this.movedSince(model, head)) {
+      // Checked against what is no longer published (a connection it used may be gone): once more, against what is.
+      return this.applyChangeset(model, changeset, check, true);
+    }
+    return result;
+  }
+
+  /** Whether the model has another revision than `head` now. */
+  protected async movedSince(model: string, head: ModelHead | null): Promise<boolean> {
+    return ((await this.requireStore().head(model))?.revision ?? null) !== (head?.revision ?? null);
   }
 
   /** Replaces the model's whole folder tree and item set: a first import, or a recovery. */
@@ -3045,6 +3079,11 @@ export class XcubeRuntime {
       check?.probes ?? [],
     );
     if (!validation.valid) {
+      if (!check && await this.movedSince(model, head)) {
+        // Refused over what is no longer published, maybe a connection only
+        // that used: the base is stale, and the client sends again.
+        return { status: 'conflict', current: await this.requireStore().head(model) };
+      }
       const errors = XcubeRuntime.itemErrors(validation, published.items);
       return check
         ? { ...base, errors, cubeMessage: validation.cubeMessage }
@@ -3062,6 +3101,8 @@ export class XcubeRuntime {
       source: request.source,
       folders,
       modules,
+      // Bound at publish to connections: stored only while they still exist.
+      dataSources: input.dataSources ? XcubeRuntime.boundConnections(published.items, changed) : undefined,
     });
     if ('current' in result) {
       return { status: result.outcome, current: result.current };

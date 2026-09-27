@@ -20,6 +20,10 @@ import { Client } from 'pg';
 import {
   createConfig, generateCredentialKey, sealSecretV1, XcubeRuntime, XcubeServerCore, type XcubeSettings,
 } from '../../src';
+import type { SnapshotFile } from '../../src/model/snapshot';
+import type { Probe } from '../../src/model/validate';
+import type { Priority } from '../../src/runtime/lane';
+import type { ModelHead, StoredModule } from '../../src/store/revisions';
 
 const DATABASE_URL = process.env.XCUBE_TEST_DATABASE_URL;
 const describeWithDatabase = DATABASE_URL ? describe : describe.skip;
@@ -41,6 +45,30 @@ class TestRuntime extends XcubeRuntime {
 
   public overlayOrchestratorIds() {
     return [...this.overlayOrchestrators.values()].flatMap((ids) => [...ids]);
+  }
+
+  /** Runs once, as the next check of a publish begins: another writer, just then. */
+  public beforeValidate: (() => Promise<void>) | null = null;
+
+  protected override async validateModules(
+    model: string,
+    head: ModelHead | null,
+    files: SnapshotFile[],
+    modules: StoredModule[],
+    priority: Priority,
+    securityContext: Record<string, unknown>,
+    probes: Probe[],
+  ) {
+    const hook = this.beforeValidate;
+    this.beforeValidate = null;
+    await hook?.();
+    return super.validateModules(model, head, files, modules, priority, securityContext, probes);
+  }
+
+  public async storeAt(model: string) {
+    const store = this.requireStore();
+    const head = await store.head(model);
+    return { store, head, items: head ? await this.itemsAt(head) : [] };
   }
 }
 const ADMIN_TOKEN = 'admin-token-0123456789abcdef-connections';
@@ -341,6 +369,54 @@ describeWithDatabase('connections: data sources served from sealed credentials',
       { dataSource: 'default', dbType: 'postgres' }, { dataSource: 'fa__warehouse', dbType: 'postgres' },
     ]));
     expect((await admin('delete', '/connections/fa__warehouse').expect(409)).body.problems).toEqual(['fa/sales uses it']);
+  });
+
+  test('a publish checked while another folder\'s data source goes is told its base moved, never refused over it', async () => {
+    // Another writer, just as this publish is checked: removes fa's sales, then the data source it alone used.
+    let moved = 0;
+    const other = async () => {
+      const gone = await admin('post', '/changesets', { baseRevision: revision, deletes: [{ folderId: 'fa', name: 'sales' }] }).expect(201);
+      await admin('delete', '/connections/fa__warehouse').expect(204);
+      moved = gone.body.revision;
+    };
+    // It joins fa's sales, so its check compiles sales, bound to that data source.
+    const joined = {
+      folderId: 'fa',
+      name: 'joined',
+      kind: 'cube',
+      yaml: `cubes:\n  - name: joined\n    sql_table: ${warehouse}.orders\n    joins:\n      - name: sales\n        relationship: many_to_one\n        sql: "{CUBE}.id = {sales}.id"\n    measures:\n      - name: count\n        type: count\n`,
+    };
+
+    runtime.beforeValidate = other;
+    const dry = await admin('post', '/changesets?dryRun=true', { baseRevision: revision, upserts: [joined] }).expect(200);
+    // Checked again against what is published now: refused for what it names, not for a data source it never did.
+    expect(dry.body).toMatchObject({ valid: false, currentRevision: moved });
+    expect(JSON.stringify(dry.body.errors)).not.toMatch(/has no connection/);
+    revision = moved;
+
+    // Once more for a publish: sales and its data source back, then gone again during the check.
+    await admin('put', '/connections/fa__warehouse', { ...connection(role, 'second-password'), folderId: 'fa' }).expect(200);
+    const back = await admin('post', '/changesets', {
+      baseRevision: revision,
+      upserts: [{ folderId: 'fa', name: 'sales', kind: 'cube', yaml: `cubes:\n  - name: sales\n    data_source: warehouse\n    sql_table: ${warehouse}.orders\n    measures:\n      - name: total\n        sql: amount\n        type: sum\n` }],
+    }).expect(201);
+    revision = back.body.revision;
+    runtime.beforeValidate = other;
+    const refused = await admin('post', '/changesets', { baseRevision: revision, upserts: [joined] }).expect(409);
+    expect(refused.body).toMatchObject({ code: 'conflict', currentRevision: moved });
+    revision = moved;
+  });
+
+  test('a publish binding to a data source removed after its check is not stored; a removal waits out a publish', async () => {
+    const { store, head, items } = await runtime.storeAt('dev');
+    const stored = await store.importItems({
+      model: 'dev', baseRevision: head!.revision, items, itemsHash: 'f'.repeat(64), source: {}, dataSources: ['fa__gone'],
+    });
+    expect(stored).toMatchObject({ outcome: 'conflict' });
+    expect((await store.head('dev'))!.revision).toBe(head!.revision);
+    // A removal checked at a revision since replaced is checked again.
+    expect(await store.deleteConnection('dev', 'default', head!.revision - 1)).toBe('moved');
+    await admin('get', '/connections/default/health').expect(200);
   });
 
   describe('an overlay\'s own data sources (AC-280)', () => {
