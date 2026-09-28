@@ -4,9 +4,11 @@ import os from 'os';
 import path from 'path';
 
 import { Connections, redact } from '../../src/connections/connections';
+import { identityOf, withIdentityAliases } from '../../src/connections/aliases';
 import { DRIVERS } from '../../src/connections/drivers';
 import { SwitchableDriver } from '../../src/connections/switchable';
 import { modelSchema } from '../../src/config';
+import { aliasOf } from '../../src/names/publish';
 import { CredentialKeys, generateCredentialKey, sealSecretV1 } from '../../src/credentials/credentials';
 import { open } from '../../src/credentials/hpke';
 
@@ -158,5 +160,35 @@ describe('HPKE, low-order points', () => {
   test('an all-zero enc (a low-order point) is refused, not opened with an all-zero secret', () => {
     const { privateKey } = crypto.generateKeyPairSync('x25519');
     expect(() => open(privateKey, Buffer.alloc(32), Buffer.alloc(272), Buffer.from('i'), Buffer.from('a'))).toThrow(/Malformed envelope|doesn't open/);
+  });
+});
+
+describe('connection identities', () => {
+  const pg = { driver: 'postgres', authMethod: 'password', fields: { host: 'db', port: 5432, database: 'sales', user: 'cube' } };
+
+  test('what a connection reaches: its settings, never its secrets', () => {
+    expect(identityOf(pg)).toBe(identityOf({ ...pg, fields: { user: 'cube', database: 'sales', port: 5432, host: 'db' } }));
+    expect(identityOf({ ...pg, sealed: { password: { v: 1 } } } as any)).toBe(identityOf(pg));
+    expect(identityOf({ ...pg, fields: { ...pg.fields, database: 'other' } })).not.toBe(identityOf(pg));
+    expect(identityOf({ ...pg, authMethod: 'client-certificate' })).not.toBe(identityOf(pg));
+  });
+
+  test('a cube on a connection, its own or inherited, is served aliased by its identity; others and marks stay', () => {
+    const files = [
+      { path: 'fa__base.yml', content: 'cubes:\n  - name: fa__base\n    data_source: fa__warehouse\n    sql_alias: fa__base_abcd\n    sql_table: t\n' },
+      { path: 'fa__child.yml', content: '# xcube: overlay data source fa__warehouse (postgres)\ncubes:\n  - name: fa__child\n    extends: fa__base\n' },
+      { path: 'plain.yml', content: 'cubes:\n  - name: plain\n    sql_table: t\n' },
+      { path: 'script.js', content: 'cube(`x`, {});' },
+    ];
+    const served = withIdentityAliases(files, new Map([['fa__warehouse', 'id1']]));
+    expect([...served.salts]).toEqual([['fa__base.yml', 'fa__warehouse@id1'], ['fa__child.yml', 'fa__warehouse@id1']]);
+    expect(served.files[0].content).toContain(`sql_alias: ${aliasOf('fa__base', 'fa__warehouse@id1')}`);
+    expect(served.files[1].content.startsWith('# xcube: overlay data source fa__warehouse (postgres)\n')).toBe(true);
+    expect(served.files[1].content).toContain(`sql_alias: ${aliasOf('fa__child', 'fa__warehouse@id1')}`);
+    expect(served.files.slice(2)).toEqual(files.slice(2));
+    // Another identity: other aliases. None: the files as they are.
+    const moved = withIdentityAliases(files, new Map([['fa__warehouse', 'id2']]));
+    expect(moved.files[0].content).not.toBe(served.files[0].content);
+    expect(withIdentityAliases(files, new Map()).files).toBe(files);
   });
 });

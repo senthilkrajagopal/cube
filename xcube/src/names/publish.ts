@@ -89,7 +89,7 @@ function listKeyOf(kind: 'cube' | 'view') {
   return kind === 'cube' ? 'cubes' : 'views';
 }
 
-function dump(kind: 'cube' | 'view', doc: Record<string, any>): string {
+export function dump(kind: 'cube' | 'view', doc: Record<string, any>): string {
   return yaml.dump({ [listKeyOf(kind)]: [doc] }, { lineWidth: -1, noRefs: true, quotingType: '"' });
 }
 
@@ -121,6 +121,18 @@ function aliasedDataSource(entry: Entry, byFullName: Map<string, Entry>): string
 }
 
 /**
+ * A cube's alias naming `salt` (its data source, or, as served, its
+ * connection's identity), or its full name alone without one. A rollup table
+ * is named `<alias>_<pre-aggregation>`: when that would be too long, the
+ * short hash alias.
+ */
+export function saltedAlias(fullName: string, doc: Record<string, any>, salt: string | undefined): string {
+  const alias = aliasOf(fullName, salt);
+  const tooLong = preAggregationsOf(doc).some((pa) => `${alias}_${pa.sql_alias ?? pa.sqlAlias ?? pa.name}`.length > MAX_TABLE_STEM);
+  return tooLong ? `x${base32(salt === undefined ? fullName : `${fullName}@${salt}`, 7)}` : alias;
+}
+
+/**
  * The SQL alias xcube gives an item whose author wrote none:
  * - a prefixed view's is its full name, or a short hash when that is long;
  * - a prefixed cube's names it too, and the data source it is on unless that is
@@ -139,10 +151,7 @@ function generatedAlias(entry: Entry, byFullName: Map<string, Entry>): string | 
   if (def.folderId === ROOT && dataSource === undefined) {
     return typeof doc.extends === 'string' ? def.fullName : undefined;
   }
-  const alias = aliasOf(def.fullName, dataSource);
-  // A rollup table is named <alias>_<pre-aggregation>: when that would be too long, the short hash alias.
-  const tooLong = preAggregationsOf(doc).some((pa) => `${alias}_${pa.sql_alias ?? pa.sqlAlias ?? pa.name}`.length > MAX_TABLE_STEM);
-  return tooLong ? `x${base32(dataSource === undefined ? def.fullName : `${def.fullName}@${dataSource}`, 7)}` : alias;
+  return saltedAlias(def.fullName, doc, dataSource);
 }
 
 /**

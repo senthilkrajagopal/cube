@@ -34,6 +34,7 @@ import {
 import { Connections, ConnectionError, type ConnectionInput } from '../connections/connections';
 import { CredentialError, CredentialKeys, type SealedV1 } from '../credentials/credentials';
 import { DRIVERS, isDriverType } from '../connections/drivers';
+import { identityOf, withIdentityAliases } from '../connections/aliases';
 import { createListenClient, createPool, type Logger } from '../store/db';
 import { migrate } from '../store/migrate';
 import {
@@ -154,7 +155,18 @@ export interface ServedRevision {
   lastUsed?: number;
   /** For an overlay: its items as applied, to place compile errors on. */
   items?: PublishedItem[];
+  /**
+   * The identity of each of the model's connections it is served over: its
+   * cubes on one are aliased by it (`withIdentityAliases`), and their drivers
+   * must be of it.
+   */
+  identities: ReadonlyMap<string, string>;
 }
+
+const NO_IDENTITIES: ReadonlyMap<string, string> = new Map();
+
+/** Marks the key of a revision kept only for requests already on it (`supersede`). */
+const SUPERSEDED = '#superseded:';
 
 /** An overlay id: what the client names a workspace or a proposal by. */
 export const OVERLAY_ID = /^[A-Za-z0-9_-]{1,64}$/;
@@ -504,6 +516,8 @@ export class XcubeRuntime {
       this.instanceId,
       (m, p) => this.log(m, p),
     );
+    // A connection changed: the model's sync serves it (`followIdentities`). A model not followed here serves nothing.
+    this.connections.onChanged = (model) => this.sync(model).catch(() => this.connections.settle(model));
     this.verifier = new TokenVerifier(this.tokens, {
       modelClaim: () => this.options?.modelClaim ?? 'xcubeModel',
       revisionClaim: () => this.options?.revisionClaim ?? 'xcubeRevision',
@@ -1302,7 +1316,13 @@ export class XcubeRuntime {
       throw gone(base.model, id);
     }
     const key = this.overlayKey(base, id, record.version);
-    const known = this.served.get(key);
+    let known = this.served.get(key);
+    if (known && known.identities !== base.identities && known.state !== 'activating') {
+      // Built over its base's previous connection settings.
+      this.served.delete(key);
+      this.retireUnused();
+      known = undefined;
+    }
     if (known && known.state !== 'activating') {
       // Idle, or pushed again unchanged: the same version on the same revision, used again.
       known.state = 'active';
@@ -1343,6 +1363,7 @@ export class XcubeRuntime {
         { ...head, contentHash: contentHash(applied.files) },
         { files: applied.files, modules: applied.modules },
         { key, id: record.id, version: record.version, base: base.key },
+        base.identities,
       );
       served.items = applied.items;
       if (record.connections.length) {
@@ -2364,15 +2385,103 @@ export class XcubeRuntime {
     }
 
     const appId = appIdOf(head);
-    if (state.active?.key === appId) {
-      return;
-    }
-    if (state.failed?.appId === appId && Date.now() < state.failed.retryAt) {
-      return;
-    }
-    if (!await this.activateHead(head) && !state.active) {
+    const retryLater = state.failed?.appId === appId && Date.now() < state.failed.retryAt;
+    if (state.active?.key !== appId && !retryLater && !await this.activateHead(head) && !state.active) {
       await this.fallBack(head, state);
     }
+    await this.followIdentities(model, state);
+  }
+
+  /** The identity of each of a model's connections now. */
+  protected async identitiesOf(model: string): Promise<ReadonlyMap<string, string>> {
+    if (!this.store) {
+      return NO_IDENTITIES;
+    }
+    const connections = await this.connections.of(model);
+    return connections.size ? new Map([...connections].map(([name, c]) => [name, identityOf(c)])) : NO_IDENTITIES;
+  }
+
+  /**
+   * Serves a model over its connections as they are now. One changed to
+   * another identity (a new host, database or user) is served by compiling,
+   * over it, the active revision's modules holding its cubes, then switching
+   * to them and to its new drivers at once: from then on, no query here is
+   * given a result or rollup of its old target. Until then, the old target
+   * serves. A new target that doesn't connect, or doesn't compile, leaves the
+   * old one served, and is reported failed. Runs only in the model's sync
+   * chain.
+   */
+  protected async followIdentities(model: string, state: ModelState) {
+    const identities = await this.identitiesOf(model);
+    const { active } = state;
+    const changed = active
+      ? [...new Set([...identities.keys(), ...active.identities.keys()])].filter((n) => identities.get(n) !== active.identities.get(n))
+      : [];
+    if (!this.core || !active || !changed.length) {
+      this.connections.settle(model, identities);
+      return;
+    }
+    if (changed.some((name) => identities.has(name) && !this.connections.ready(model, name, identities.get(name)!))) {
+      this.connections.settle(model, active.identities, 'its new settings failed to connect; the previous ones stay');
+      return;
+    }
+    const next = this.residentsOf(active, active.key, active.data, identities);
+    try {
+      for (const resident of next.modules.values()) {
+        await this.ensureCompiled(resident);
+      }
+    } catch (e: any) {
+      this.connections.settle(model, active.identities);
+      this.warn('xcube: the model could not be compiled over its new connection settings; the previous ones stay', {
+        model, connections: changed, error: String(e?.message ?? e),
+      });
+      return;
+    }
+    // What served the old identities finishes what it began, and nothing new reaches it.
+    this.supersede({ ...active, unions: new Map(active.unions), whole: active.whole });
+    // At once: the held drivers, and the modules aliased by their identities.
+    this.connections.settle(model, identities);
+    Object.assign(active, {
+      modules: next.modules,
+      holders: next.holders,
+      owner: next.owner,
+      single: next.modules.size === 1,
+      data: { ...active.data, files: next.files },
+      identities,
+    });
+    active.unions.clear();
+    active.whole = undefined;
+    // Replaced revisions and previews over this one are served over the new identities only, built again.
+    [...this.served.values()]
+      .filter((revision) => revision.model === model && revision !== active && revision.state !== 'activating'
+        && !revision.key.includes(SUPERSEDED))
+      .forEach((revision) => this.supersede(revision));
+    this.retireUnused();
+    this.log('xcube: serving new connection settings', {
+      model, revision: active.revision, connections: changed, recompiled: [...next.modules.values()].filter((r) => !r.compiled).length,
+    });
+  }
+
+  /**
+   * A revision no request may be pinned to any more, kept under a key none
+   * can name until its grace is over, so what it compiled serves the requests
+   * already on it.
+   */
+  protected supersede(revision: ServedRevision) {
+    if (this.served.get(revision.key) === revision) {
+      this.served.delete(revision.key);
+    }
+    const key = `${revision.key}${SUPERSEDED}${crypto.randomBytes(4).toString('hex')}`;
+    this.served.set(key, { ...revision, key, state: 'retiring', retireAfter: Date.now() + this.settings.retireGraceMs });
+  }
+
+  /** The identity of a data source a context's revision is served over, which its driver must be of. */
+  public servedIdentity(context: any, dataSource: string): string | undefined {
+    const appId = context?.xcubePin?.appId;
+    const model = this.modelOfContext(context);
+    const revision = (typeof appId === 'string' ? this.served.get(appId) : undefined)
+      ?? (model === undefined ? undefined : this.models.get(model)?.active);
+    return revision?.identities.get(dataSource);
   }
 
   /** A revision's files and modules: from what this process holds, else the database. */
@@ -2399,12 +2508,52 @@ export class XcubeRuntime {
     head: ModelHead,
     data: RevisionData,
     overlay?: { key: string; id: string; version: number; base: string },
+    identities: ReadonlyMap<string, string> = NO_IDENTITIES,
   ): ServedRevision {
     const key = overlay?.key ?? appIdOf(head);
     const existing = this.served.get(key);
     if (existing) {
       return existing;
     }
+    const { modules, holders, owner, files } = this.residentsOf(head, key, data, identities);
+    const revision: ServedRevision = {
+      key,
+      model: head.model,
+      generation: head.generation,
+      revision: head.revision,
+      contentHash: head.contentHash,
+      data: { ...data, files },
+      modules,
+      holders,
+      owner,
+      single: modules.size === 1,
+      unions: new Map(),
+      state: 'activating',
+      holds: 0,
+      mode: head.mode,
+      identities,
+      ...(overlay ? { overlay: { id: overlay.id, version: overlay.version, base: overlay.base }, lastUsed: Date.now() } : {}),
+    };
+    this.served.set(key, revision);
+    return revision;
+  }
+
+  /**
+   * A revision's compiled models (one per module, or `all`), over its
+   * connections' identities: a module holding a cube aliased by one has an
+   * app id naming it, so it compiles apart from the same module over another.
+   */
+  protected residentsOf(
+    head: Pick<ModelHead, 'model' | 'generation' | 'revision'>,
+    key: string,
+    data: RevisionData,
+    identities: ReadonlyMap<string, string>,
+  ) {
+    const { files: servedFiles, salts } = withIdentityAliases(data.files, identities);
+    const saltOf = (files: SnapshotFile[]) => {
+      const named = files.map((f) => salts.get(f.path)).filter((salt): salt is string => salt !== undefined).sort();
+      return named.length ? `:c${crypto.createHash('sha256').update(named.join('\n'), 'utf8').digest('hex').slice(0, 12)}` : '';
+    };
     const resident = (appId: string, moduleId: string, files: SnapshotFile[]): Resident => {
       const known = this.residents.get(appId);
       if (known) {
@@ -2421,36 +2570,19 @@ export class XcubeRuntime {
     const holders = new Map<string, Set<string>>();
     const owner = new Map<string, string>();
     if (!data.modules.length) {
-      modules.set('all', resident(key, 'all', data.files));
+      modules.set('all', resident(`${key}${saltOf(servedFiles)}`, 'all', servedFiles));
     } else {
-      const byPath = new Map(data.files.map((f) => [f.path, f]));
+      const byPath = new Map(servedFiles.map((f) => [f.path, f]));
       for (const module of data.modules) {
         const names = [...module.members, ...module.copies];
         const files = names.map((n) => byPath.get(`${n}.yml`)).filter((f): f is SnapshotFile => Boolean(f));
-        modules.set(module.id, resident(`xcube:${head.model}:m:${module.id}:${module.version.slice(0, 12)}`, module.id, files));
+        const appId = `xcube:${head.model}:m:${module.id}:${module.version.slice(0, 12)}${saltOf(files)}`;
+        modules.set(module.id, resident(appId, module.id, files));
         names.forEach((n) => holders.set(n, (holders.get(n) ?? new Set()).add(module.id)));
         module.members.forEach((n) => owner.set(n, module.id));
       }
     }
-    const revision: ServedRevision = {
-      key,
-      model: head.model,
-      generation: head.generation,
-      revision: head.revision,
-      contentHash: head.contentHash,
-      data,
-      modules,
-      holders,
-      owner,
-      single: modules.size === 1,
-      unions: new Map(),
-      state: 'activating',
-      holds: 0,
-      mode: head.mode,
-      ...(overlay ? { overlay: { id: overlay.id, version: overlay.version, base: overlay.base }, lastUsed: Date.now() } : {}),
-    };
-    this.served.set(key, revision);
-    return revision;
+    return { modules, holders, owner, files: servedFiles };
   }
 
   /**
@@ -2493,7 +2625,7 @@ export class XcubeRuntime {
       return true;
     }
 
-    const revision = this.servedRevision(head, data);
+    const revision = this.servedRevision(head, data, undefined, await this.identitiesOf(model));
     const reused = revision.state === 'retiring';
     revision.retireAfter = undefined;
     const drop = () => {

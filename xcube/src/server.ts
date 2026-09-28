@@ -92,7 +92,10 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
       if (brought) {
         return runtime.connections.overlayDriverFor({ ...brought, name: dataSource }, driverOptions);
       }
-      const driver = await runtime.connections.driverFor(model, dataSource, driverOptions);
+      const driver = await runtime.connections.driverFor(model, dataSource, {
+        ...driverOptions,
+        identity: runtime.servedIdentity(context, dataSource),
+      });
       if (driver) {
         return driver;
       }

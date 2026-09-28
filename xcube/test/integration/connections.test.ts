@@ -603,5 +603,48 @@ describeWithDatabase('connections: data sources served from sealed credentials',
       revision = (await admin('put', '/snapshot', { baseRevision: revision, folders, items: changed }).expect(201)).body.revision;
       expect(await boundOf('fabc__early')).toBe('fabc__warehouse');
     });
+
+    test('a data source changed in place is served from its new target at once, never its old one\'s cache or rollups (AC-161)', async () => {
+      const sold = {
+        folderId: 'fa',
+        name: 'sold',
+        kind: 'cube',
+        yaml: 'cubes:\n  - name: sold\n    data_source: warehouse\n    sql: SELECT current_database() AS db\n    dimensions:\n      - name: db\n        sql: db\n        type: string\n        primary_key: true\n        public: true\n      - name: at\n        sql: db\n        type: string\n    measures:\n      - name: count\n        type: count\n    pre_aggregations:\n      - name: by_db\n        dimensions:\n          - CUBE.db\n        measures:\n          - CUBE.count\n',
+      };
+      const token = () => jwt.sign({ wechartModel: 'dev', wechartRevision: revision }, API_SECRET);
+      // Served from cache while it renews: what would answer from the old target, if anything could.
+      // (`at`, which the rollup doesn't hold: its query reads the source.)
+      const ask = () => request(server).get('/cubejs-api/v1/load')
+        .query({ query: JSON.stringify({ dimensions: ['fa__sold.at'], cacheMode: 'stale-while-revalidate' }) })
+        .set('Authorization', token());
+      const sqlOf = async (query: object) => (await request(server).get('/cubejs-api/v1/sql')
+        .query({ query: JSON.stringify(query) })
+        .set('Authorization', token())
+        .expect(200)).body.sql;
+      const rollupOf = async () => (await sqlOf({ measures: ['fa__sold.count'], dimensions: ['fa__sold.db'] })).preAggregations[0]?.tableName;
+      const push = async (fields: object) => {
+        const res = await admin('put', '/connections/fa__warehouse', {
+          ...connection(role, 'second-password'), folderId: 'fa', fields: { ...target, user: role, ...fields },
+        }).expect(200);
+        await reported('fa__warehouse', (i) => i.version === res.body.version && i.state === 'live');
+      };
+
+      revision = (await admin('post', '/changesets', { baseRevision: revision, upserts: [sold] }).expect(201)).body.revision;
+      expect((await ask().expect(200)).body.data[0]['fa__sold.at']).toBe(target.database);
+      const [sqlBefore, rollupBefore] = [(await sqlOf({ dimensions: ['fa__sold.at'] })).sql[0], await rollupOf()];
+      expect(rollupBefore).toBeTruthy();
+
+      // A new password, sealed again, to the same target: served as it was, nothing to rebuild.
+      await push({});
+      expect((await sqlOf({ dimensions: ['fa__sold.at'] })).sql[0]).toBe(sqlBefore);
+      expect(await rollupOf()).toBe(rollupBefore);
+
+      // The same data source, now on the other database: from its new target at once, however asked.
+      await push({ database: workspaceDb });
+      expect((await ask().expect(200)).body.data[0]['fa__sold.at']).toBe(workspaceDb);
+      expect((await sqlOf({ dimensions: ['fa__sold.at'] })).sql[0]).not.toBe(sqlBefore);
+      // Its rollup is another table, to be built from the new target; the old one is never read for it.
+      expect(await rollupOf()).not.toBe(rollupBefore);
+    });
   });
 });

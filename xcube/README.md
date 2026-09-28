@@ -448,6 +448,27 @@ Pool sizes and timeouts still come from the environment.
   - A changed connection is built and tested, then swapped in. Changes go one
     at a time and never back to an older version. Running queries finish on
     the old driver, which is released once idle. A failure keeps the old one.
+  - **Changed in place (AC-161).** A connection's identity is what it reaches:
+    its driver, auth method and fields, secrets left out. A new password keeps
+    it, and is only swapped in. A new host, database or user is another
+    identity, and no query is then given a result or rollup of the old one:
+    - Each cube on a connection, its own or inherited, is served aliased by
+      `<data source>@<identity>`. Its SQL, and so Cube's cached results, and
+      its rollup tables are then another target's than any before.
+    - On a change of identity, each instance tests the new settings and
+      compiles the modules holding that connection's cubes over it, while the
+      old target keeps serving. Then it switches at once to the new modules
+      and drivers, and reports the new version `live`. New settings that
+      don't connect or compile leave the old ones served, reported `failed`.
+    - **Rollups are built again** from the new target by the refresh worker.
+      Until one is, a query that would use it answers Cube's "No
+      pre-aggregation partitions were built yet", as after any publish that
+      changes a rollup. Queries that don't use one answer from the new target
+      at once.
+    - Previews over the model, and revisions it replaced, are built again
+      over the new settings; requests already on them finish.
+    - On upgrading to this, every cube on a connection gets such an alias at
+      its model's first activation, and its rollups rebuild once.
   - A removed connection's driver refuses calls, and serves again if the
     connection is pushed again.
   - Errors from a connection's driver reach Cube with its secrets taken out.
@@ -751,7 +772,8 @@ Stores a model's data source:
   - `400 invalid_connection` (`problems`);
   - `422 invalid_secret`;
   - `409 driver_change`.
-- **After storing,** every instance swaps it in as soon as it hears.
+- **After storing,** every instance swaps it in as soon as it hears, or, for
+  new settings of another target, once it serves them (see Serving).
 
 #### `GET …/connections`, `DELETE …/connections/{name}`
 
