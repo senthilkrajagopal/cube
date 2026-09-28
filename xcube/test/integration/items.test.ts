@@ -78,11 +78,19 @@ const folders = [
   { id: 'fops', parentId: 'froot' },
 ];
 
+// Widens what the runtime keeps protected: the items as their authors wrote them, as published now.
+class TestRuntime extends XcubeRuntime {
+  public async authored(model: string) {
+    const head = await this.requireStore().head(model);
+    return (await this.itemsAt(head!)).map(({ folderId, name, kind, yaml }) => ({ folderId, name, kind, yaml }));
+  }
+}
+
 describeWithDatabase('xcube items and changesets', () => {
   const schema = `xcube_t_${crypto.randomBytes(4).toString('hex')}`;
   let modelDir: string;
   let driver: DuckDBDriver;
-  let runtime: XcubeRuntime;
+  let runtime: TestRuntime;
   let core: XcubeServerCore;
   let server: http.Server;
 
@@ -114,7 +122,7 @@ describeWithDatabase('xcube items and changesets', () => {
         'INSERT INTO main.orders VALUES (1, 1, 12.5), (2, 2, 30), (3, 1, 7.5)',
       ].join('; '),
     });
-    runtime = new XcubeRuntime(settings, { logger: () => undefined });
+    runtime = new TestRuntime(settings, { logger: () => undefined });
     await runtime.start();
     const nodeEnv = process.env.NODE_ENV;
     process.env.NODE_ENV = 'production';
@@ -293,5 +301,22 @@ describeWithDatabase('xcube items and changesets', () => {
     expect(republished.body.revision).toBe(next.body.revision + 1);
     items = await admin.get('/items').expect(200);
     expect(items.body.items.find((i: any) => i.fullName === 'fops__orders').bindings).toEqual({ customers: 'fops__customers' });
+  });
+
+  test('a whole-model snapshot keeps each unchanged item as bound; one bound to an item it drops binds afresh', async () => {
+    const tree = { folders: [{ id: 'froot', parentId: null }, { id: 'fops', parentId: 'froot' }] };
+    const bindingOf = async (fullName: string) => (await admin.get('/items').expect(200)).body.items.find((i: any) => i.fullName === fullName).bindings;
+    let head = (await admin.get('/revision').expect(200)).body.current.revision;
+    const all = await runtime.authored('dev');
+
+    // Sent as it is: nothing is resolved again, nothing changes.
+    const same = await admin.put('/snapshot', { baseRevision: head, ...tree, items: all }).expect(200);
+    expect(same.body.created).toBe(false);
+    expect(await bindingOf('fops__orders')).toEqual({ customers: 'fops__customers' });
+
+    // Sent without fops's own customers: fops's orders, bound to it, binds to the root's now.
+    const without = all.filter((i) => !(i.folderId === 'fops' && i.name === 'customers'));
+    head = (await admin.put('/snapshot', { baseRevision: head, ...tree, items: without }).expect(201)).body.revision;
+    expect(await bindingOf('fops__orders')).toEqual({ customers: 'customers' });
   });
 });

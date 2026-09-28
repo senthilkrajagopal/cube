@@ -578,5 +578,30 @@ describeWithDatabase('connections: data sources served from sealed credentials',
       // What the twin queries, and where it gets it.
       expect(items.find((i: any) => i.fullName === 'fab__twin')).toMatchObject({ dataSource: 'fab__warehouse', extends: 'fab__where' });
     });
+
+    test('a whole-model snapshot keeps what is published as it was bound; only what it changes binds afresh (AC-273)', async () => {
+      const folders = [
+        { id: 'froot', parentId: null }, { id: 'fa', parentId: 'froot' }, { id: 'fab', parentId: 'fa' }, { id: 'fabc', parentId: 'fab' },
+      ];
+      await admin('put', '/folders', { folders }).expect(200);
+      const early = { folderId: 'fabc', name: 'early', kind: 'cube', yaml: `cubes:\n  - name: early\n    data_source: warehouse\n    sql_table: ${warehouse}.orders\n    measures:\n      - name: total\n        sql: amount\n        type: sum\n` };
+      revision = (await admin('post', '/changesets', { baseRevision: revision, upserts: [early] }).expect(201)).body.revision;
+      const boundOf = async (fullName: string) => (await admin('get', '/items').expect(200)).body.items.find((i: any) => i.fullName === fullName).dataSource;
+      expect(await boundOf('fabc__early')).toBe('fab__warehouse');
+
+      // A nearer warehouse comes, then the whole model is sent again as it is: nothing published moves.
+      const { name: _name, ...onOther } = copy();
+      await admin('put', '/connections/fabc__warehouse', { ...onOther, folderId: 'fabc' }).expect(200);
+      const whole = async () => (await runtime.storeAt('dev')).items.map(({ folderId, name, kind, yaml }) => ({ folderId, name, kind, yaml }));
+      const again = await admin('put', '/snapshot', { baseRevision: revision, folders, items: await whole() });
+      expect([200, 201]).toContain(again.status);
+      revision = again.body.revision;
+      expect(await boundOf('fabc__early')).toBe('fab__warehouse');
+
+      // Sent changed, it is resolved afresh, and binds to the nearest now.
+      const changed = (await whole()).map((i) => (i.name === 'early' ? { ...i, yaml: i.yaml.replace('type: sum', 'type: max') } : i));
+      revision = (await admin('put', '/snapshot', { baseRevision: revision, folders, items: changed }).expect(201)).body.revision;
+      expect(await boundOf('fabc__early')).toBe('fabc__warehouse');
+    });
   });
 });

@@ -843,8 +843,18 @@ data source only a superseded revision used.
 #### `PUT …/snapshot` with items
 
 `{ baseRevision, folders, items, source }` replaces the whole folder tree and
-item set, resolving every item afresh: the first import, and a recovery. A
-model in items mode refuses a file set (`409 mode`).
+item set: the first import, and a recovery. A model in items mode refuses a
+file set (`409 mode`).
+
+**It changes nothing published that it sends unchanged (AC-273).** An item
+whose kind and authored YAML are what is published keeps what it was resolved
+to: its bindings, its data source and its alias. Only these are resolved
+afresh:
+- items it adds or changes;
+- items bound to an item it drops;
+- items in a folder its tree drops, which are refused there.
+
+Sent exactly as published, it answers `200` with nothing changed.
 
 **The items hash** (`itemsHash`) is the SHA-256 of the items sorted by
 `folderId + "/" + name` (byte order), as the JSON

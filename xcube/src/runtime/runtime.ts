@@ -3006,7 +3006,13 @@ export class XcubeRuntime {
     return ((await this.requireStore().head(model))?.revision ?? null) !== (head?.revision ?? null);
   }
 
-  /** Replaces the model's whole folder tree and item set: a first import, or a recovery. */
+  /**
+   * Replaces the model's whole folder tree and item set: a first import, or a
+   * recovery. An item as published now keeps what it was resolved to (its
+   * bindings, data source and alias), as a changeset's untouched items do
+   * (AC-273): only new and changed items are resolved afresh, and those bound
+   * to an item the snapshot drops, which have to be.
+   */
   public async importItemsSnapshot(
     model: string,
     snapshot: { baseRevision: number | null; folders: Folder[]; items: AuthoredItem[]; source: Record<string, unknown> },
@@ -3016,14 +3022,31 @@ export class XcubeRuntime {
       throw new FolderTreeError(problems);
     }
     const head = await this.requireStore().head(model);
+    const tree = new FolderTree(snapshot.folders);
+    const current = head?.mode === 'items' ? await this.itemsAt(head) : [];
+    const { upserts, deletes } = XcubeRuntime.snapshotChanges(current, snapshot.items, tree);
     return this.publishItems(model, head, {
-      tree: new FolderTree(snapshot.folders),
-      current: [],
-      upserts: snapshot.items,
-      deletes: [],
-      replaceAll: true,
-      dataSources: await this.dataSourcesOf(model),
+      tree, current, upserts, deletes, dataSources: await this.dataSourcesOf(model),
     }, snapshot, undefined, snapshot.folders) as Promise<ItemsOutcome>;
+  }
+
+  /**
+   * A snapshot as a changeset over what is published: the items it adds or
+   * changes, those it drops, and those whose binding it drops or whose folder
+   * it drops (resolved afresh, or refused there). The rest stay as published.
+   */
+  protected static snapshotChanges(current: PublishedItem[], items: AuthoredItem[], tree: FolderTree) {
+    const key = (i: { folderId: string; name: string }) => `${i.folderId}/${i.name}`;
+    const sent = new Set(items.map(key));
+    const dropped = current.filter((item) => !sent.has(key(item)));
+    const droppedNames = new Set(dropped.map((item) => item.fullName));
+    const published = new Map(current.map((item) => [key(item), item]));
+    const upserts = items.filter((item) => {
+      const now = published.get(key(item));
+      return !now || now.kind !== item.kind || now.yaml !== item.yaml || !tree.has(item.folderId)
+        || Object.values(now.bindings).some((target) => droppedNames.has(target));
+    });
+    return { upserts, deletes: dropped.map(({ folderId, name }) => ({ folderId, name })) };
   }
 
   protected async publishItems(
