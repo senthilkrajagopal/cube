@@ -121,15 +121,20 @@ function aliasedDataSource(entry: Entry, byFullName: Map<string, Entry>): string
 }
 
 /**
- * The SQL alias xcube gives a cube whose author wrote none:
- * - a prefixed cube's names it; so does any cube's on a data source of its
- *   own, inherited ones included;
+ * The SQL alias xcube gives an item whose author wrote none:
+ * - a prefixed view's is its full name, or a short hash when that is long;
+ * - a prefixed cube's names it too, and the data source it is on unless that is
+ *   Cube's default; so does a root cube's on a data source of its own,
+ *   inherited ones included;
  * - a cube that extends another has one of its own, or Cube would give it its
  *   parent's (`CubeSymbols` sets the parent as its prototype);
- * - any other root cube has none, and is its name.
+ * - any other root item has none, and is its name.
  */
 function generatedAlias(entry: Entry, byFullName: Map<string, Entry>): string | undefined {
   const { def, doc } = entry;
+  if (def.kind === 'view') {
+    return def.folderId === ROOT ? undefined : aliasOf(def.fullName);
+  }
   const dataSource = aliasedDataSource(entry, byFullName);
   if (def.folderId === ROOT && dataSource === undefined) {
     return typeof doc.extends === 'string' ? def.fullName : undefined;
@@ -141,7 +146,7 @@ function generatedAlias(entry: Entry, byFullName: Map<string, Entry>): string | 
 }
 
 /**
- * Each cube's SQL alias, once every item of the publish is resolved. A kept
+ * Each item's SQL alias, once every item of the publish is resolved. A kept
  * cube whose alias that changes (its parent published onto another data
  * source) is re-dumped with the new alias, and nothing else: its bindings
  * stay as published. Returns the keys of those.
@@ -150,7 +155,7 @@ function assignAliases(entries: Entry[]): Set<string> {
   const byFullName = new Map(entries.map((entry) => [entry.def.fullName, entry]));
   const realiased = new Set<string>();
   entries
-    .filter(({ def }) => def.kind === 'cube' && def.doc.sql_alias === undefined && def.doc.sqlAlias === undefined)
+    .filter(({ def }) => def.doc.sql_alias === undefined && def.doc.sqlAlias === undefined)
     .forEach((entry) => {
       const { def, doc } = entry;
       const alias = generatedAlias(entry, byFullName);
@@ -171,8 +176,9 @@ function assignAliases(entries: Entry[]): Set<string> {
 }
 
 /**
- * What xcube adds to a resolved item: its title and alias when prefixed,
- * aliases for the cubes of a view that prefix or split by them, and where
+ * What xcube adds to a resolved item: its title when prefixed (its alias
+ * comes once every item is resolved, `assignAliases`), aliases for the
+ * cubes of a view that prefix or split by them, and where
  * it came from, in `meta.xcube`, for the client's pickers.
  */
 function finish(def: ItemDefinition, doc: Record<string, any>) {

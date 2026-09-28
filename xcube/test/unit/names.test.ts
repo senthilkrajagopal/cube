@@ -213,6 +213,16 @@ describe('publish', () => {
     expect(o.sql_alias).toBe(aliasOf(`${longFolder}__orders`));
     expect(o.sql_alias).toMatch(/^x[a-z2-7]{7}$/);
     expect(`${o.sql_alias}_by_city`.length).toBeLessThanOrEqual(25);
+
+    // A view there too: its members are measured against its short alias, not its full name.
+    // `created_at` is a time dimension: with Cube's granularity suffix, the full name's member alias passes 63.
+    const overview = view(longFolder, 'sales_overview', '    cubes:\n      - join_path: orders\n        includes:\n          - amount\n          - created_at\n');
+    expect(`${longFolder}__sales_overview__created_at_quarter`.length).toBeGreaterThan(63);
+    const withView = publish({ tree: longTree, current: [], upserts: [customers, orders(longFolder), overview], deletes: [] });
+    expect(withView.errors).toEqual([]);
+    const v = doc(byName(withView.items, `${longFolder}__sales_overview`));
+    expect(v.sql_alias).toBe(aliasOf(`${longFolder}__sales_overview`));
+    expect(v.sql_alias).toMatch(/^x[a-z2-7]{7}$/);
     expect(titleOf('order_items')).toBe('Order Items');
     expect(titleOf('user_id')).toBe('User ID');
   });

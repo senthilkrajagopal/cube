@@ -196,8 +196,9 @@ In both modes:
   the refusal names the items that refer to it.
 - **What people see.** An item in a folder gets `title` from its short name
   (`Orders`, as Cube would title `orders`) and a `sql_alias` (its full name,
-  or a stable hash when that is longer than 20 characters), so SQL and
-  rollup table names stay short. xcube adds `meta.xcube = { folderId,
+  or a stable hash when that is longer than 20 characters), so SQL, member
+  and rollup table names stay short. A cube's alias also names its data
+  source (see Connections). xcube adds `meta.xcube = { folderId,
   shortName }` to every item, for pickers. Root items keep their names,
   titles and SQL as they were.
 - **Expressions** are read with Cube's own lexer, so names in string
