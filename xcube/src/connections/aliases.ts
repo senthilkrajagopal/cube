@@ -82,12 +82,13 @@ function identityAlias(name: string, salt: string, rollups: string[], extra = 0)
 }
 
 /**
- * A revision's files as served over its connections' identities. Each cube on
- * a connection (its own data source, or its parent's through `extends`) is
- * aliased by a hash of its name and `<data source>@<identity>`, so its rollup
- * tables are another target's than those of any identity before. Files of
- * several documents, or not YAML, are served as they are. Returns, by path,
- * the salts of each file aliased so.
+ * A revision's files as served over `identities`: those of its connections
+ * moved from their base (the runtime's `movedIdentities`). Each cube on one
+ * (its own data source, or its parent's through `extends`) is aliased by a
+ * hash of its name and `<data source>@<identity>`, so its rollup tables are
+ * another target's than those of any identity before; a cube on a connection
+ * at its base keeps its name. Files of several documents, or not YAML, are
+ * served as they are. Returns, by path, the salts of each file aliased so.
  */
 export function withIdentityAliases(
   files: SnapshotFile[],

@@ -229,4 +229,24 @@ describeWithDatabase('PgRevisionStore', () => {
     expect(stale.outcome).toBe('conflict');
     expect(await store.folders('tree')).toEqual(folders);
   });
+
+  test('a connection\'s base identity is the first recorded, whoever records it and however many at once, and outlives the connection', async () => {
+    await store.putFolders('bases', [{ id: 'froot', parentId: null }]);
+    const bases = await Promise.all(Array.from({ length: 8 }, (_, i) => store.connectionBases('bases', new Map([['default', `identity-${i}`]]))));
+    const [first] = bases.map((b) => b.get('default'));
+    expect(first).toMatch(/^identity-\d$/);
+    expect(bases.map((b) => b.get('default'))).toEqual(bases.map(() => first));
+
+    // Later sights don't replace it; each connection has its own; one not asked for isn't answered.
+    const later = await store.connectionBases('bases', new Map([['default', 'moved'], ['warehouse', 'w1']]));
+    expect(later).toEqual(new Map([['default', first], ['warehouse', 'w1']]));
+    expect(await store.connectionBases('bases', new Map([['warehouse', 'w2']]))).toEqual(new Map([['warehouse', 'w1']]));
+    expect(await store.connectionBases('bases', new Map())).toEqual(new Map());
+
+    // A connection that goes keeps its base, as does its model: tables under its cubes' names hold that target's rows only.
+    await store.deleteConnection('bases', 'warehouse', null);
+    expect(await store.connectionBases('bases', new Map([['warehouse', 'w3']]))).toEqual(new Map([['warehouse', 'w1']]));
+    await pool.query(`DELETE FROM ${schema}.models WHERE id = 'bases'`);
+    expect(await store.connectionBases('bases', new Map([['default', 'recreated']]))).toEqual(new Map([['default', first]]));
+  });
 });

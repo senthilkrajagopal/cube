@@ -455,12 +455,20 @@ Pool sizes and timeouts still come from the environment.
     password for the same user keeps it, and is only swapped in. A new host,
     database, user or key holder is another identity. No query is then given
     a result or rollup of the old one:
+    - **A base identity.** Each connection's first identity served is
+      recorded as its base, once for every instance (`connection_bases`). It
+      is kept when the connection is dropped. While a connection has its base
+      identity, its cubes keep the names and rollup tables they have: nothing
+      is renamed or rebuilt, at an upgrade or otherwise (AC-328). Only that
+      target's rows are ever built into those tables.
     - **An epoch.** A revision is served over its connections' identities,
-      its *epoch*: its key names it (`<app id>~<epoch>`), each cube on a
-      connection, its own or inherited, is aliased by a hash of its name and
-      identity, and its requests run on an orchestrator of that epoch alone.
-      So its SQL, Cube's cached results and its rollup tables are that target's
-      only, and a compile of one epoch never runs on another's drivers.
+      its *epoch*: its key names it (`<app id>~<epoch>`), and its requests run
+      on an orchestrator of that epoch alone. Each cube on a connection moved
+      from its base, its own or inherited, is aliased by a hash of its name and
+      identity. So its SQL, Cube's cached results and its rollup tables are
+      that target's only, and a compile of one epoch never runs on another's
+      drivers. Moved back to its base, a connection's cubes have their own
+      names and tables again.
     - **A change of identity is a new epoch.** Each instance compiles the
       revision over it, only the modules holding that connection's cubes, as
       it would a new revision. It switches to it, and the old epoch retires
@@ -482,10 +490,12 @@ Pool sizes and timeouts still come from the environment.
     - **File sets:** only YAML files are aliased. A JavaScript, Jinja or
       Python cube keeps its alias, so its rollups renew on their refresh keys;
       its results are still its epoch's own.
-    - **Upgrading to this:** every cube on a connection gets such an alias at
-      its model's first activation, and its rollups are renamed and rebuilt
-      once. Upgrade the refresh worker first, so they are built when the API
-      instances look for them.
+    - **Upgrading to this:** a connection's identity at its model's first
+      activation is its base, so nothing is renamed. From an xcube that
+      aliased every cube on a connection (`c561077b94` to `8d08fac20c`), cubes
+      go back to their own names, and their rollups are rebuilt once. Upgrade
+      the refresh worker first, so they are built when the API instances look
+      for them.
   - A removed connection's driver refuses calls, and serves again if the
     connection is pushed again.
   - Errors from a connection's driver reach Cube with its secrets taken out.
@@ -533,8 +543,9 @@ descendant's.
   names it, and a cube published again onto another data source is answered
   from it at once, and builds its rollups there, never serving the old one's.
   - A cube on the root's `default` keeps its alias as before. An alias the
-    author wrote is kept at publish; a cube on a stored connection is still
-    served under an alias of its connection's identity (see Serving).
+    author wrote is kept at publish. A cube on a stored connection moved from
+    its base identity is served under an alias of that identity instead (see
+    Serving).
   - A cube that `extends` another is aliased by the data source it inherits,
     and always has an alias of its own: otherwise Cube gives it its parent's.
     When a parent is published onto another data source, each child that

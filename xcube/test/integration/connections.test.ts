@@ -65,6 +65,13 @@ class TestRuntime extends XcubeRuntime {
     return super.validateModules(model, head, files, modules, priority, securityContext, probes);
   }
 
+  /** A file as the model is served now, and as it was published. */
+  public servedFile(model: string, filePath: string) {
+    const active = this.models.get(model)?.active;
+    const find = (files?: SnapshotFile[]) => files?.find((f) => f.path === filePath)?.content;
+    return { served: find(active?.data.files), published: find(active?.source.files) };
+  }
+
   public async storeAt(model: string) {
     const store = this.requireStore();
     const head = await store.head(model);
@@ -634,6 +641,12 @@ describeWithDatabase('connections: data sources served from sealed credentials',
       expect((await ask().expect(200)).body.data[0]['fa__sold.at']).toBe(target.database);
       const [sqlBefore, rollupBefore] = [(await sqlOf({ dimensions: ['fa__sold.at'] })).sql[0], await rollupOf()];
       expect(rollupBefore).toBeTruthy();
+      // On the target it was first served with (its base): served as published, under its own names.
+      const asPublished = () => {
+        const { served, published } = runtime.servedFile('dev', 'fa__sold.yml');
+        return Boolean(published) && served === published;
+      };
+      expect(asPublished()).toBe(true);
 
       // A new password, sealed again, to the same target: served as it was, nothing to rebuild.
       await push({});
@@ -646,10 +659,14 @@ describeWithDatabase('connections: data sources served from sealed credentials',
       expect((await sqlOf({ dimensions: ['fa__sold.at'] })).sql[0]).not.toBe(sqlBefore);
       // Its rollup is another table, to be built from the new target; the old one is never read for it.
       expect(await rollupOf()).not.toBe(rollupBefore);
+      expect(asPublished()).toBe(false);
 
-      // Back again: the first target's, at once.
+      // Back again: the first target's, at once, under its own names again, and its own tables.
       await push({});
       expect((await ask().expect(200)).body.data[0]['fa__sold.at']).toBe(target.database);
+      expect((await sqlOf({ dimensions: ['fa__sold.at'] })).sql[0]).toBe(sqlBefore);
+      expect(await rollupOf()).toBe(rollupBefore);
+      expect(asPublished()).toBe(true);
 
       // Two changed together: each switches.
       await Promise.all([push({ database: workspaceDb }), push({ database: target.database }, 'live', 'fab__warehouse', 'fab')]);
@@ -667,6 +684,53 @@ describeWithDatabase('connections: data sources served from sealed credentials',
       expect(failing.body.data).toBeUndefined();
       expect(failing.body.error).toMatch(/_missing" does not exist/);
       await push({});
+    });
+
+    test('a cube keeps its names and rollup tables while its connection has the identity it was first served with; moved, it is aliased (AC-328)', async () => {
+      const token = () => jwt.sign({ wechartModel: 'dev', wechartRevision: revision }, API_SECRET);
+      const rollupOf = async () => (await request(server).get('/cubejs-api/v1/sql')
+        .query({ query: JSON.stringify({ measures: ['orders.total'] }) })
+        .set('Authorization', token())
+        .expect(200)).body.sql.preAggregations[0]?.tableName as string;
+      const push = async (body: object) => {
+        const res = await admin('put', '/connections/default', body).expect(200);
+        await reported('default', (i) => i.version === res.body.version && i.state === 'live');
+      };
+      const asPublished = () => {
+        const { served, published } = runtime.servedFile('dev', 'orders.yml');
+        return Boolean(published) && served === published;
+      };
+      revision = (await admin('post', '/changesets', {
+        baseRevision: revision,
+        upserts: [{
+          folderId: 'froot',
+          name: 'orders',
+          kind: 'cube',
+          yaml: `cubes:\n  - name: orders\n    sql_table: ${warehouse}.orders\n    measures:\n      - name: total\n        sql: amount\n        type: sum\n    pre_aggregations:\n      - name: by_all\n        measures:\n          - CUBE.total\n`,
+        }],
+      }).expect(201)).body.revision;
+
+      // The root's default was first served as the database's own user, and moved to the role since: aliased.
+      await push(connection(role, 'second-password'));
+      const moved = await rollupOf();
+      expect(moved).not.toMatch(/\.orders_by_all/);
+      expect(asPublished()).toBe(false);
+
+      // Back on the target it was first served with: the root's cube under its own name, its own rollup table.
+      await push(connection(url.username, decodeURIComponent(url.password)));
+      expect(await rollupOf()).toMatch(/\.orders_by_all/);
+      expect(asPublished()).toBe(true);
+
+      // The base is recorded once, for every instance: another's first sight of it doesn't replace it.
+      const { store } = await runtime.storeAt('dev');
+      const [current] = await store.connections('dev').then((all) => all.filter((c) => c.name === 'default'));
+      const recorded = (await store.connectionBases('dev', new Map([['default', 'another-identity']]))).get('default');
+      expect(recorded).toBe(runtime.connections.identityOf(current));
+
+      // Moved again: the same alias as before, as on every instance.
+      await push(connection(role, 'second-password'));
+      expect(await rollupOf()).toBe(moved);
+      expect(asPublished()).toBe(false);
     });
   });
 });

@@ -118,6 +118,10 @@ class MemoryStore implements RevisionStore {
     return [];
   }
 
+  public async connectionBases() {
+    return new Map<string, string>();
+  }
+
   public async items() {
     return [];
   }

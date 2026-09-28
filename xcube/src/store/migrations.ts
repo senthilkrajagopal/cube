@@ -239,6 +239,26 @@ export const MIGRATIONS: Migration[] = [
       ALTER TABLE ${s}.overlays ADD COLUMN connections jsonb NOT NULL DEFAULT '[]'::jsonb;
     `,
   },
+  {
+    version: 8,
+    name: 'connection bases',
+    // Additive: older code aliases every cube on a connection by its identity, as before.
+    minReader: 2,
+    sql: (s) => `
+      -- The identity each connection was first served with, its base: its
+      -- cubes keep their names while it has it, and are aliased by identity
+      -- once it moves. Kept when the connection or its model goes (a model's
+      -- rollup schema is named by the model alone), since tables under those
+      -- names hold only that target's rows.
+      CREATE TABLE ${s}.connection_bases (
+        model       text        NOT NULL,
+        name        text        NOT NULL,
+        identity    text        NOT NULL,
+        recorded_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (model, name)
+      );
+    `,
+  },
 ];
 
 /** The newest schema version this code knows. */

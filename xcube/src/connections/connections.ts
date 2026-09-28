@@ -175,6 +175,13 @@ export class Connections {
     return identityWith(connection, principals);
   }
 
+  /** Whether a connection's identity is of what it names: no secret saying who connects failed to open. */
+  public settled(connection: StoredConnection): boolean {
+    this.identityOf(connection);
+    return principalSecrets(connection).every((field) => connection.revisions?.[field] !== undefined
+      || this.principalHashes.get(`${connection.model}/${connection.name}/${connection.version}/${field}`) !== 'unopened');
+  }
+
   /** Refused when a request's compile is of another identity than the connection's now: a newer one serves it. */
   public static readonly CHANGING = 'changed to new settings on this instance; try again';
 

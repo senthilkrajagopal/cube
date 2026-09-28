@@ -161,8 +161,8 @@ export interface ServedRevision {
   items?: PublishedItem[];
   /**
    * The identity of each of the model's connections it is served over: its
-   * cubes on one are aliased by it (`withIdentityAliases`), and their drivers
-   * must be of it.
+   * cubes on one moved from its base are aliased by it (`movedIdentities`),
+   * and their drivers must be of it.
    */
   identities: ReadonlyMap<string, string>;
 }
@@ -2436,13 +2436,46 @@ export class XcubeRuntime {
     };
   }
 
-  /** The identity of each of a model's connections now. */
+  /** The identity of each of a model's connections now, recorded as its base if it has none yet. */
   protected async identitiesOf(model: string): Promise<ReadonlyMap<string, string>> {
     if (!this.store) {
       return NO_IDENTITIES;
     }
     const connections = await this.connections.of(model);
-    return connections.size ? new Map([...connections].map(([name, c]) => [name, this.connections.identityOf(c)])) : NO_IDENTITIES;
+    if (!connections.size) {
+      return NO_IDENTITIES;
+    }
+    const identities = new Map([...connections].map(([name, c]) => [name, this.connections.identityOf(c)]));
+    await this.recordBases(model, new Map([...identities].filter(([name]) => this.connections.settled(connections.get(name)!))));
+    return identities;
+  }
+
+  /** Each model's connections' base identities, as recorded: once recorded, one never changes. */
+  protected readonly connectionBases = new Map<string, Map<string, string>>();
+
+  /**
+   * Records each connection's identity as its base where it has none, before
+   * anything is served over it; learns those another instance recorded first.
+   */
+  protected async recordBases(model: string, identities: ReadonlyMap<string, string>) {
+    const known = this.connectionBases.get(model) ?? new Map<string, string>();
+    const unknown = new Map([...identities].filter(([name]) => !known.has(name)));
+    if (unknown.size) {
+      (await this.requireStore().connectionBases(model, unknown)).forEach((identity, name) => known.set(name, identity));
+      this.connectionBases.set(model, known);
+    }
+  }
+
+  /**
+   * The identities a revision's cubes are aliased by: those of connections
+   * moved from their base. Cubes on one at its base keep their names, and the
+   * tables under them, which only that target's rows are ever built into; one
+   * with no base recorded is taken as moved.
+   */
+  protected movedIdentities(model: string, identities: ReadonlyMap<string, string>): ReadonlyMap<string, string> {
+    const bases = this.connectionBases.get(model);
+    const moved = [...identities].filter(([name, identity]) => bases?.get(name) !== identity);
+    return moved.length === identities.size ? identities : new Map(moved);
   }
 
   /**
@@ -2589,8 +2622,9 @@ export class XcubeRuntime {
 
   /**
    * A revision's compiled models (one per module, or `all`), over its
-   * connections' identities: a module holding a cube aliased by one has an
-   * app id naming it, so it compiles apart from the same module over another.
+   * connections' identities: a module holding a cube aliased by one (moved
+   * from its base) has an app id naming it, so it compiles apart from the same
+   * module over another; at their bases, it has the app id it always had.
    */
   protected residentsOf(
     head: Pick<ModelHead, 'model' | 'generation' | 'revision'>,
@@ -2598,7 +2632,7 @@ export class XcubeRuntime {
     data: RevisionData,
     identities: ReadonlyMap<string, string>,
   ) {
-    const { files: servedFiles, salts } = withIdentityAliases(data.files, identities);
+    const { files: servedFiles, salts } = withIdentityAliases(data.files, this.movedIdentities(head.model, identities));
     const saltOf = (files: SnapshotFile[]) => {
       const named = files.map((f) => salts.get(f.path)).filter((salt): salt is string => salt !== undefined).sort();
       return named.length ? `:c${crypto.createHash('sha256').update(named.join('\n'), 'utf8').digest('hex').slice(0, 12)}` : '';
