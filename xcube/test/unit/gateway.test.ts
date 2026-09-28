@@ -455,3 +455,36 @@ describe('Data source introspection API', () => {
     });
   });
 });
+
+describe('answers that say to try again', () => {
+  // Widens what the gateway keeps protected: the callback its routes answer through.
+  class TestGateway extends XcubeApiGateway {
+    public answerWith(res: any) {
+      return this.resToResultFn(res);
+    }
+  }
+  const gateway = new TestGateway(API_SECRET, async () => ({}), async () => ({}), () => undefined, {
+    standalone: true, dataSourceStorage: {}, basePath: '/cubejs-api', refreshScheduler: {},
+  } as any, jest.fn());
+  const response = () => {
+    const sent: { status?: number; headers: Record<string, string>; body?: any } = { headers: {} };
+    const res: any = {
+      status: (code: number) => { sent.status = code; return res; },
+      set: (name: string, value: string) => { sent.headers[name] = value; return res; },
+      json: (body: any) => { sent.body = body; return res; },
+    };
+    return { res, sent };
+  };
+
+  test('a driver refused while its connection changes is a 503 with Retry-After, whatever Cube made of it', async () => {
+    for (const status of [400, 500]) {
+      const { res, sent } = response();
+      await gateway.answerWith(res)({ error: 'Error: Connection "default" changed to new settings on this instance; try again' }, { status });
+      expect(sent).toEqual({ status: 503, headers: { 'Retry-After': '2' }, body: { error: 'Error: Connection "default" changed to new settings on this instance; try again' } });
+    }
+    // Any other error is answered as Cube answers it.
+    const { res, sent } = response();
+    await gateway.answerWith(res)({ error: 'Error: something else' }, { status: 400 });
+    expect(sent).toEqual({ status: 400, headers: {}, body: { error: 'Error: something else' } });
+  });
+});

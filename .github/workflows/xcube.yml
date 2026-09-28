@@ -112,6 +112,7 @@ jobs:
           load: true
           push: false
           tags: xcube:ci
+          build-args: REVISION=${{ github.sha }}
       - name: Boots as Cube does, introspection only, as the non-root user Helm runs it as
         run: |
           docker run -d --name xcube-ci --user 1000 \
@@ -160,6 +161,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.tags.outputs.tags }}
+          build-args: REVISION=${{ github.sha }}
       - name: Name what was published
         if: steps.tags.outputs.tags
         env:

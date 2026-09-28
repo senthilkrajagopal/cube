@@ -40,6 +40,7 @@ import {
 } from './requests';
 import type { DataSourceDescription, DataSourceIntrospectionApi } from './types';
 import { initAdminRoutes } from './admin/routes';
+import { Connections } from './connections/connections';
 import { MODULE_KEY, type XcubeRuntime } from './runtime/runtime';
 import { ROLE_KEY } from './security/verifier';
 
@@ -114,6 +115,22 @@ export class XcubeApiGateway extends ApiGateway {
     protected readonly groupsOf: (context: RequestContext) => Promise<string[]> = async () => [],
   ) {
     super(apiSecret, compilerApi, adapterApi, logger, options);
+  }
+
+  /**
+   * A refusal that says to try again is answered as one: 503, with
+   * `Retry-After`, however it reached Cube's error handling (an error from
+   * building a driver comes back through Cube's queue as a 400 or a 500).
+   */
+  protected override resToResultFn(res: ExpressResponse) {
+    const result = super.resToResultFn(res);
+    return async (message: any, options: { status?: number } = {}) => {
+      if ((options.status ?? 200) >= 400 && typeof message?.error === 'string' && message.error.includes(Connections.CHANGING)) {
+        res.set('Retry-After', '2');
+        return result(message, { status: 503 });
+      }
+      return result(message, options);
+    };
   }
 
   /**

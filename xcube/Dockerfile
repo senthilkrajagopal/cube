@@ -27,7 +27,11 @@ RUN npm run build
 
 FROM cubejs/cube:${CUBE_VERSION}
 
+# The fork's commit the package was built from (CI passes it), not Cube's image's own.
+ARG REVISION=unknown
+
 LABEL org.opencontainers.image.source="https://github.com/senthilkrajagopal/cube" \
+      org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.description="Cube with the xcube package: models served from xcube's schema, and data source introspection" \
       org.opencontainers.image.licenses="Apache-2.0"
 

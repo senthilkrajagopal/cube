@@ -1755,7 +1755,9 @@ export class XcubeRuntime {
     if (connections) {
       return { key, ...overlay, connections };
     }
-    if (strict && (this.retiredOverlayConnections.has(key) || this.overlayOrchestrators.has(key))) {
+    // Its orchestrators are noted per epoch of its base (`<key>/<epoch>`).
+    const orchestrated = [...this.overlayOrchestrators.keys()].some((k) => k.startsWith(`${key}/`));
+    if (strict && (this.retiredOverlayConnections.has(key) || orchestrated)) {
       // Never the published data sources in an overlay's place.
       throw unavailable('The overlay this request was pinned to is no longer compiled here; try again');
     }

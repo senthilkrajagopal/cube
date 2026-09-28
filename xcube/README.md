@@ -533,7 +533,8 @@ descendant's.
   names it, and a cube published again onto another data source is answered
   from it at once, and builds its rollups there, never serving the old one's.
   - A cube on the root's `default` keeps its alias as before. An alias the
-    author wrote is kept, and so is its caching.
+    author wrote is kept at publish; a cube on a stored connection is still
+    served under an alias of its connection's identity (see Serving).
   - A cube that `extends` another is aliased by the data source it inherits,
     and always has an alias of its own: otherwise Cube gives it its parent's.
     When a parent is published onto another data source, each child that
@@ -542,9 +543,8 @@ descendant's.
   - Aliases are worked out for every item at each publish, so a cube from
     before this that is due another alias gets it at the model's next publish.
     Its rollups rebuild once then.
-  - A connection changed in place, the same name aimed elsewhere, keeps its
-    cubes' aliases. Their cached results and rollups renew on their refresh
-    keys, as in Cube itself.
+  - A connection changed in place, the same name aimed elsewhere, is served
+    as a new epoch (see Serving, "Changed in place").
 - **Dropping and publishing don't interleave.** A drop checks its users at the
   current revision, and is taken only while that revision is still current. A
   publish is stored only while every connection its changed cubes bind to
