@@ -342,7 +342,9 @@ export function publish({
 }: PublishInput): PublishResult {
   const errors: ItemError[] = [];
 
-  for (const item of [...upserts, ...deletes]) {
+  // What is written must be in the tree; what is deleted need not be, as a snapshot drops a
+  // folder and its items together (a delete of an item that isn't there is refused below).
+  for (const item of upserts) {
     if (!tree.has(item.folderId)) {
       errors.push({ folderId: item.folderId, name: item.name, kind: 'folder', message: `Folder ${item.folderId} is not in the folder tree` });
     }

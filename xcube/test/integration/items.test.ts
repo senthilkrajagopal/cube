@@ -319,4 +319,21 @@ describeWithDatabase('xcube items and changesets', () => {
     head = (await admin.put('/snapshot', { baseRevision: head, ...tree, items: without }).expect(201)).body.revision;
     expect(await bindingOf('fops__orders')).toEqual({ customers: 'customers' });
   });
+
+  test('a whole snapshot whose tree drops folders deletes the items it holds there, and the folders go', async () => {
+    const head = (await admin.get('/revision').expect(200)).body.current.revision;
+    const root = (await runtime.authored('dev')).filter((i) => i.folderId === 'froot');
+    const before = (await admin.get('/items').expect(200)).body.items.map((i: any) => i.folderId);
+    expect(before).toContain('fops');
+    const res = await admin.put('/snapshot', { baseRevision: head, folders: [{ id: 'froot', parentId: null }], items: root }).expect(201);
+    const after = (await admin.get('/items').expect(200)).body.items;
+    expect(new Set(after.map((i: any) => i.folderId))).toEqual(new Set(['froot']));
+    // The tree is the snapshot's: sending it again changes nothing; a folder may be added again.
+    await admin.put('/folders', { folders: [{ id: 'froot', parentId: null }, { id: 'fnew', parentId: 'froot' }] }).expect(200);
+    // An item sent in a folder its tree lacks is still refused.
+    const lacking = await admin.put('/snapshot', {
+      baseRevision: res.body.revision, folders: [{ id: 'froot', parentId: null }], items: [...root, orders('fgone')],
+    }).expect(422);
+    expect(lacking.body.errors[0]).toMatchObject({ folderId: 'fgone', kind: 'folder' });
+  });
 });

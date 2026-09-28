@@ -895,8 +895,11 @@ whose kind and authored YAML are what is published keeps what it was resolved
 to: its bindings, its data source and its alias. Only these are resolved
 afresh:
 - items it adds or changes;
-- items bound to an item it drops;
-- items in a folder its tree drops, which are refused there.
+- items bound to an item it drops.
+
+What it doesn't send goes, including items in folders its tree drops, which go
+with them. An item it sends in a folder its tree lacks is refused (`422`,
+kind `folder`).
 
 Sent exactly as published, it answers `200` with nothing changed.
 
