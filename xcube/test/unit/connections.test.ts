@@ -115,8 +115,16 @@ describe('connection checks', () => {
   test('a key holder with no revision from the client is told by the key itself: sealed again, the same identity', () => {
     const sa = (secret: string) => sealSecretV1(key.jwk.x, key.kid, 'bigquery', 'credentials', { projectId: 'p' }, secret);
     const stored = (envelope: unknown, version: number) => ({
-      model: 'm', name: 'bq', folderId: 'froot', driver: 'bigquery', authMethod: 'service-account',
-      fields: { projectId: 'p' }, sealed: { credentials: envelope }, revisions: {}, version, updatedAt: new Date(),
+      model: 'm',
+      name: 'bq',
+      folderId: 'froot',
+      driver: 'bigquery',
+      authMethod: 'service-account',
+      fields: { projectId: 'p' },
+      sealed: { credentials: envelope },
+      revisions: {},
+      version,
+      updatedAt: new Date(),
     } as any);
     const one = JSON.stringify({ type: 'service_account', client_email: 'a@p.iam', private_key: 'k1' });
     const other = JSON.stringify({ type: 'service_account', client_email: 'b@p.iam', private_key: 'k2' });
