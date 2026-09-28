@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import cloneDeep from 'lodash/cloneDeep';
 
 import { config, createConfig, runtimeOf, setGlobalRuntime, XcubeRuntime, XcubeServerCore } from '../../src';
+import { targetOf } from '../../src/connections/aliases';
 import { orchestratorDefaults, QUEUE_HEART_BEAT_S } from '../../src/config';
 import type { XcubeSettings } from '../../src';
 
@@ -36,8 +37,24 @@ describe('config', () => {
     setGlobalRuntime(r);
     expect(runtimeOf(config())).toBe(r);
     expect(r.servingOptions).toEqual({
-      modelClaim: 'xcubeModel', revisionClaim: 'xcubeRevision', withoutModel: 'disk', overlayClaim: 'xcubeOverlay',
+      modelClaim: 'xcubeModel', revisionClaim: 'xcubeRevision', withoutModel: 'disk', overlayClaim: 'xcubeOverlay', environmentTarget: expect.any(Function),
     });
+  });
+
+  test('tells what serves a data source without a connection: Cube\'s environment, by its target, or cube.js\'s factory', () => {
+    const names = ['CUBEJS_DB_TYPE', 'CUBEJS_DB_HOST', 'CUBEJS_DB_NAME', 'CUBEJS_DB_USER'];
+    try {
+      const r = runtime();
+      createConfig(r, {});
+      expect(r.servingOptions.environmentTarget!('default')).toBeUndefined();
+      Object.assign(process.env, { CUBEJS_DB_TYPE: 'postgres', CUBEJS_DB_HOST: 'db', CUBEJS_DB_NAME: 'sales', CUBEJS_DB_USER: 'cube' });
+      expect(r.servingOptions.environmentTarget!('default')).toBe(targetOf('postgres', { host: 'db', database: 'sales', user: 'cube' }));
+      const withFactory = runtime();
+      createConfig(withFactory, {}, { driverFactory: () => ({ type: 'postgres' }) });
+      expect(withFactory.servingOptions.environmentTarget!('default')).toBe('env:cube.js');
+    } finally {
+      names.forEach((name) => delete process.env[name]);
+    }
   });
 
   test('refuses the hooks xcube owns', () => {

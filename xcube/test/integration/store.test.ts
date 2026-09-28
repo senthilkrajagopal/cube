@@ -244,9 +244,19 @@ describeWithDatabase('PgRevisionStore', () => {
     expect(await store.connectionBases('bases', new Map())).toEqual(new Map());
 
     // A connection that goes keeps its base, as does its model: tables under its cubes' names hold that target's rows only.
-    await store.deleteConnection('bases', 'warehouse', null);
+    await store.putConnection({
+      model: 'bases', name: 'warehouse', folderId: 'froot', driver: 'postgres', authMethod: 'password', fields: { host: 'h' }, sealed: {}, revisions: {},
+    });
+    expect(await store.deleteConnection('bases', 'warehouse', null)).toBe(true);
     expect(await store.connectionBases('bases', new Map([['warehouse', 'w3']]))).toEqual(new Map([['warehouse', 'w1']]));
     await pool.query(`DELETE FROM ${schema}.models WHERE id = 'bases'`);
     expect(await store.connectionBases('bases', new Map([['default', 'recreated']]))).toEqual(new Map([['default', first]]));
+
+    // Cube's environment's base is taken by a connection only where the connection says it reaches the same target.
+    await store.connectionBases('bases', new Map([['env_a', 'env:aaa'], ['env_b', 'env:bbb']]));
+    const adopted = await store.connectionBases('bases', new Map([['env_a', 'stored-a'], ['env_b', 'stored-b']]), new Map([['env_a', 'env:aaa'], ['env_b', 'env:ccc']]));
+    expect(adopted).toEqual(new Map([['env_a', 'stored-a'], ['env_b', 'env:bbb']]));
+    // Once taken, it is that connection's: another reaching the same target is a move.
+    expect(await store.connectionBases('bases', new Map([['env_a', 'stored-a2']]), new Map([['env_a', 'env:aaa']]))).toEqual(new Map([['env_a', 'stored-a']]));
   });
 });

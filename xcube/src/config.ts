@@ -3,6 +3,7 @@ import { FileRepository } from '@cubejs-backend/server-core';
 import crypto from 'crypto';
 import { assertDataSource, getEnv } from '@cubejs-backend/shared';
 
+import { environmentTargetOf } from './connections/aliases';
 import { DRIVERS, isDriverType } from './connections/drivers';
 import { XcubeRuntime, type ServingOptions } from './runtime/runtime';
 import { GATE_GROUP } from './security/marker';
@@ -105,6 +106,22 @@ export function createConfig(
     revisionClaim: options.revisionClaim ?? 'xcubeRevision',
     withoutModel: options.withoutModel ?? 'disk',
     overlayClaim: options.overlayClaim ?? 'xcubeOverlay',
+    // What serves a data source without a connection (`driverFactory` below): cube.js's, whose
+    // target xcube can't tell, else Cube's environment's.
+    environmentTarget: (dataSource: string) => {
+      if (cube.driverFactory) {
+        return 'env:cube.js';
+      }
+      try {
+        const opts = { dataSource: assertDataSource(dataSource) };
+        const type = getEnv('dbType', opts);
+        return type ? environmentTargetOf(type, {
+          host: getEnv('dbHost', opts), port: getEnv('dbPort', opts), database: getEnv('dbName', opts), user: getEnv('dbUser', opts),
+        }) : undefined;
+      } catch {
+        return undefined;
+      }
+    },
   };
   if (serving.withoutModel !== 'disk' && serving.withoutModel !== 'refuse') {
     throw new Error('xcube.config(): withoutModel is \'disk\' or \'refuse\'');

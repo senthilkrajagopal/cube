@@ -457,10 +457,16 @@ Pool sizes and timeouts still come from the environment.
     a result or rollup of the old one:
     - **A base identity.** Each connection's first identity served is
       recorded as its base, once for every instance (`connection_bases`). It
-      is kept when the connection is dropped. While a connection has its base
-      identity, its cubes keep the names and rollup tables they have: nothing
-      is renamed or rebuilt, at an upgrade or otherwise (AC-328). Only that
-      target's rows are ever built into those tables.
+      is kept when the connection or its model is dropped. While a connection
+      has its base identity, its cubes keep the names and rollup tables they
+      have: nothing is renamed or rebuilt, at an upgrade or otherwise
+      (AC-328). Only that target's rows are ever built into those tables.
+    - **Cube's environment.** A data source cubes use with no connection,
+      served by Cube's environment (`CUBEJS_DB_*`), has the environment's
+      target as its base. A connection later stored under its name keeps
+      the cubes' names only if it reaches the same place: the same host,
+      port, database and user, for Postgres, Redshift and MySQL. Otherwise,
+      and for other drivers or a `driverFactory` in cube.js, it is a move.
     - **An epoch.** A revision is served over its connections' identities,
       its *epoch*: its key names it (`<app id>~<epoch>`), and its requests run
       on an orchestrator of that epoch alone. Each cube on a connection moved
@@ -494,11 +500,15 @@ Pool sizes and timeouts still come from the environment.
       Python cube keeps its alias, so its rollups renew on their refresh keys;
       its results are still its epoch's own.
     - **Upgrading to this:** a connection's identity at its model's first
-      activation is its base, so nothing is renamed. From an xcube that
-      aliased every cube on a connection (`c561077b94` to `8d08fac20c`), cubes
-      go back to their own names, and their rollups are rebuilt once. Upgrade
-      the refresh worker first, so they are built when the API instances look
-      for them.
+      activation is its base, so nothing is renamed. Tables under the
+      original names are taken to be that target's. One changed in place
+      before `c561077b94`, whose tables were built from its old target, keeps
+      them until its refresh keys renew them.
+    - **From an xcube that aliased every cube on a connection** (`c561077b94`
+      to `8d08fac20c`), cubes go back to their own names. Their tables from
+      before `c561077b94`, if kept, serve again; the others are built again.
+      Upgrade the refresh worker first, so they are built when the API
+      instances look for them.
   - A removed connection's driver refuses calls, and serves again if the
     connection is pushed again.
   - Errors from a connection's driver reach Cube with its secrets taken out.

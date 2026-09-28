@@ -4,7 +4,9 @@ import os from 'os';
 import path from 'path';
 
 import { Connections, redact } from '../../src/connections/connections';
-import { identityOf, withIdentityAliases } from '../../src/connections/aliases';
+import {
+  dataSourcesOf, environmentTargetOf, identityOf, targetOf, withIdentityAliases,
+} from '../../src/connections/aliases';
 import { DRIVERS } from '../../src/connections/drivers';
 import { SwitchableDriver } from '../../src/connections/switchable';
 import { modelSchema } from '../../src/config';
@@ -224,5 +226,30 @@ describe('connection identities', () => {
     const moved = withIdentityAliases(files, new Map([['fa__warehouse', 'id2']]));
     expect(aliasIn(moved.files[0].content)).not.toBe(aliasIn(served.files[0].content));
     expect(withIdentityAliases(files, new Map()).files).toBe(files);
+  });
+
+  test('a connection reaches where Cube\'s environment does when its host, port, database and user are the same, as its driver reads them', () => {
+    const env = environmentTargetOf('postgres', { host: 'db', port: '5432', database: 'sales', user: 'cube' });
+    expect(targetOf('postgres', pg.fields)).toBe(env);
+    // A port left out is the driver's default; how the server is checked, and other fields, don't count.
+    expect(environmentTargetOf('postgres', { host: 'db', database: 'sales', user: 'cube' })).toBe(env);
+    expect(targetOf('postgres', { ...pg.fields, ssl: true, schema: 'x' })).toBe(env);
+    expect(targetOf('postgres', { ...pg.fields, user: 'other' })).not.toBe(env);
+    expect(targetOf('mysql', pg.fields)).not.toBe(env);
+    // Drivers the environment doesn't name so never match it.
+    expect(targetOf('snowflake', { account: 'a' })).toBeUndefined();
+    expect(environmentTargetOf('snowflake', { host: 'db' })).toMatch(/^env:snowflake:/);
+  });
+
+  test('the data sources a revision\'s cubes use: their own or inherited, and default for a file that may hold any', () => {
+    const files = [
+      { path: 'a.yml', content: 'cubes:\n  - name: a\n    data_source: w\n  - name: b\n    extends: a\n' },
+      { path: 'plain.yml', content: 'cubes:\n  - name: plain\n' },
+      { path: 'views.yml', content: 'views:\n  - name: v\n    cubes: []\n' },
+    ];
+    expect(dataSourcesOf(files)).toEqual(new Set(['w', 'default']));
+    expect(dataSourcesOf(files.slice(0, 1))).toEqual(new Set(['w']));
+    expect(dataSourcesOf([...files.slice(0, 1), { path: 'x.js', content: 'cube(`x`, {});' }])).toEqual(new Set(['w', 'default']));
+    expect(dataSourcesOf(files.slice(2))).toEqual(new Set());
   });
 });

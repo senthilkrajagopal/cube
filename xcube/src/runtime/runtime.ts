@@ -34,7 +34,7 @@ import {
 import { Connections, ConnectionError, type ConnectionInput } from '../connections/connections';
 import { CredentialError, CredentialKeys, type SealedV1 } from '../credentials/credentials';
 import { DRIVERS, isDriverType } from '../connections/drivers';
-import { epochOf, withIdentityAliases } from '../connections/aliases';
+import { dataSourcesOf, epochOf, targetOf, withIdentityAliases } from '../connections/aliases';
 import { createListenClient, createPool, type Logger } from '../store/db';
 import { migrate } from '../store/migrate';
 import {
@@ -75,6 +75,12 @@ export interface ServingOptions {
   withoutModel: 'disk' | 'refuse';
   /** The claim naming the overlay a request previews. */
   overlayClaim?: string;
+  /**
+   * What Cube's environment (or cube.js) serves a data source without a
+   * connection as, in the form a connection's target takes (`targetOf`);
+   * `undefined` when nothing serves it.
+   */
+  environmentTarget?: (dataSource: string) => string | undefined;
 }
 
 /** What xcube needs of Cube's server core. */
@@ -2446,36 +2452,82 @@ export class XcubeRuntime {
       return NO_IDENTITIES;
     }
     const identities = new Map([...connections].map(([name, c]) => [name, this.connections.identityOf(c)]));
-    await this.recordBases(model, new Map([...identities].filter(([name]) => this.connections.settled(connections.get(name)!))));
+    const settled = [...connections].filter(([, c]) => this.connections.settled(c));
+    const targets = new Map<string, string>();
+    settled.forEach(([name, c]) => {
+      const target = targetOf(c.driver, c.fields);
+      if (target !== undefined) {
+        targets.set(name, target);
+      }
+    });
+    await this.recordBases(model, new Map(settled.map(([name]) => [name, identities.get(name)!])), targets);
     return identities;
   }
 
-  /** Each model's connections' base identities, as recorded: once recorded, one never changes. */
+  /**
+   * Records, as its base, what Cube's environment serves each data source a
+   * revision's cubes use without a connection as, before they are served
+   * over it: a connection stored under that name later keeps their names
+   * only if it reaches the same target.
+   */
+  protected async recordEnvironmentBases(model: string, files: SnapshotFile[], identities: ReadonlyMap<string, string>) {
+    const environmentTarget = this.options?.environmentTarget;
+    if (!environmentTarget || !this.store) {
+      return;
+    }
+    const known = this.connectionBases.get(model);
+    const served = new Map<string, string>();
+    for (const name of dataSourcesOf(files)) {
+      const target = identities.has(name) || known?.has(name) ? undefined : environmentTarget(name);
+      if (target !== undefined) {
+        served.set(name, target);
+      }
+    }
+    await this.recordBases(model, served);
+  }
+
+  /** Each model's data sources' base identities, as recorded: once recorded, one changes only as `recordBases` says. */
   protected readonly connectionBases = new Map<string, Map<string, string>>();
 
   /**
-   * Records each connection's identity as its base where it has none, before
-   * anything is served over it; learns those another instance recorded first.
+   * Records each data source's identity as its base where it has none,
+   * before anything is served over it, and learns those another instance
+   * recorded first. A connection whose base is Cube's environment's, reaching
+   * its `targets` (where the connection does), takes it as its own.
    */
-  protected async recordBases(model: string, identities: ReadonlyMap<string, string>) {
-    const known = this.connectionBases.get(model) ?? new Map<string, string>();
-    const unknown = new Map([...identities].filter(([name]) => !known.has(name)));
-    if (unknown.size) {
-      (await this.requireStore().connectionBases(model, unknown)).forEach((identity, name) => known.set(name, identity));
+  protected async recordBases(model: string, identities: ReadonlyMap<string, string>, targets: ReadonlyMap<string, string> = new Map()) {
+    let known = this.connectionBases.get(model);
+    if (!known) {
+      known = new Map<string, string>();
       this.connectionBases.set(model, known);
+    }
+    const bases = known;
+    const asked = new Map([...identities].filter(([name, identity]) => !bases.has(name)
+      || (bases.get(name) !== identity && bases.get(name) === targets.get(name))));
+    if (asked.size) {
+      (await this.requireStore().connectionBases(model, asked, targets)).forEach((identity, name) => bases.set(name, identity));
     }
   }
 
   /**
    * The identities a revision's cubes are aliased by: those of connections
-   * moved from their base. Cubes on one at its base keep their names, and the
-   * tables under them, which only that target's rows are ever built into; one
-   * with no base recorded is taken as moved.
+   * moved from their base, and, for a data source Cube's environment serves,
+   * its target there if another was its base (a connection since dropped).
+   * Cubes at their base keep their names, and the tables under them, which
+   * only that target's rows are ever built into; a connection with no base
+   * recorded is taken as moved.
    */
   protected movedIdentities(model: string, identities: ReadonlyMap<string, string>): ReadonlyMap<string, string> {
     const bases = this.connectionBases.get(model);
-    const moved = [...identities].filter(([name, identity]) => bases?.get(name) !== identity);
-    return moved.length === identities.size ? identities : new Map(moved);
+    const moved = new Map([...identities].filter(([name, identity]) => bases?.get(name) !== identity));
+    const environmentTarget = this.options?.environmentTarget;
+    bases?.forEach((base, name) => {
+      const target = identities.has(name) || !environmentTarget ? undefined : environmentTarget(name);
+      if (target !== undefined && target !== base) {
+        moved.set(name, target);
+      }
+    });
+    return moved;
   }
 
   /**
@@ -2709,6 +2761,7 @@ export class XcubeRuntime {
       return true;
     }
 
+    await this.recordEnvironmentBases(model, data.files, identities);
     const revision = this.servedRevision(head, data, undefined, identities);
     const reused = revision.state === 'retiring';
     revision.retireAfter = undefined;

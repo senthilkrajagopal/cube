@@ -727,7 +727,8 @@ describeWithDatabase('connections: data sources served from sealed credentials',
       const recorded = (await store.connectionBases('dev', new Map([['default', 'another-identity']]))).get('default');
       expect(recorded).toBe(runtime.connections.identityOf(current));
 
-      // Moved again: the same alias as before, as on every instance.
+      // Moved again, worked out afresh (what served it before is gone): the same alias as before, as on every instance.
+      runtime.retireNow();
       await push(connection(role, 'second-password'));
       expect(await rollupOf()).toBe(moved);
       expect(asPublished()).toBe(false);

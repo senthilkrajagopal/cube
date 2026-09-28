@@ -240,9 +240,14 @@ export interface RevisionStore {
   /**
    * The base identity of each connection named: the first recorded for it,
    * by whichever instance served it first. `identities` are recorded where
-   * none is yet.
+   * none is yet, and in place of a base that is the connection's `targets`
+   * (Cube's environment's, reaching where it does).
    */
-  connectionBases(model: string, identities: ReadonlyMap<string, string>): Promise<Map<string, string>>;
+  connectionBases(
+    model: string,
+    identities: ReadonlyMap<string, string>,
+    targets?: ReadonlyMap<string, string>,
+  ): Promise<Map<string, string>>;
   deleteOverlay(model: string, id: string): Promise<boolean>;
   /** A revision's items, with their authored and resolved YAML. */
   items(model: string, revision: number): Promise<PublishedItem[]>;
@@ -714,18 +719,31 @@ export class PgRevisionStore implements RevisionStore {
     }));
   }
 
-  public async connectionBases(model: string, identities: ReadonlyMap<string, string>): Promise<Map<string, string>> {
+  public async connectionBases(
+    model: string,
+    identities: ReadonlyMap<string, string>,
+    targets: ReadonlyMap<string, string> = new Map(),
+  ): Promise<Map<string, string>> {
     const names = [...identities.keys()];
     if (!names.length) {
       return new Map();
     }
-    // Two statements: the read sees a base another instance committed while the insert waited on it.
+    // Separate statements: each sees a base another instance committed while it waited on it.
     await this.pool.query(
       `INSERT INTO ${this.s}.connection_bases (model, name, identity)
        SELECT $1, name, identity FROM unnest($2::text[], $3::text[]) AS t (name, identity)
        ON CONFLICT (model, name) DO NOTHING`,
       [model, names, names.map((name) => identities.get(name))]
     );
+    const adopting = names.filter((name) => targets.has(name));
+    if (adopting.length) {
+      await this.pool.query(
+        `UPDATE ${this.s}.connection_bases b SET identity = t.identity, recorded_at = now()
+           FROM unnest($2::text[], $3::text[], $4::text[]) AS t (name, identity, target)
+          WHERE b.model = $1 AND b.name = t.name AND b.identity = t.target`,
+        [model, adopting, adopting.map((name) => identities.get(name)), adopting.map((name) => targets.get(name))]
+      );
+    }
     const { rows } = await this.pool.query(
       `SELECT name, identity FROM ${this.s}.connection_bases WHERE model = $1 AND name = ANY($2::text[])`,
       [model, names]
