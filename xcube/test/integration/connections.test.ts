@@ -469,8 +469,8 @@ describeWithDatabase('connections: data sources served from sealed credentials',
         folderId: 'froot', name: 'default', fullName: 'default', driver: 'postgres', secrets: ['password'],
       })]);
       expect(JSON.stringify(status.body)).not.toContain('"enc"');
-      // Its own orchestrator, which no model's id can name: model ids have no capitals.
-      expect(runtime.overlayOrchestratorIds()).toContain(`STANDALONE_dev_O_ws-copy_${copyVersion}`);
+      // Its own orchestrator, of its base's connection settings, which no model's id can name: model ids have no capitals.
+      expect(runtime.overlayOrchestratorIds()).toEqual([expect.stringMatching(new RegExp(`^STANDALONE_dev_O_ws-copy_${copyVersion}_[0-9a-f]{12}$`))]);
     });
 
     test('a copy aimed at another host, or with verification turned off, needs its secret again', async () => {
@@ -622,11 +622,12 @@ describeWithDatabase('connections: data sources served from sealed credentials',
         .set('Authorization', token())
         .expect(200)).body.sql;
       const rollupOf = async () => (await sqlOf({ measures: ['fa__sold.count'], dimensions: ['fa__sold.db'] })).preAggregations[0]?.tableName;
-      const push = async (fields: object) => {
-        const res = await admin('put', '/connections/fa__warehouse', {
-          ...connection(role, 'second-password'), folderId: 'fa', fields: { ...target, user: role, ...fields },
+      const push = async (fields: object, state = 'live', name = 'fa__warehouse', folderId = 'fa') => {
+        const res = await admin('put', `/connections/${name}`, {
+          ...connection(role, 'second-password'), folderId, fields: { ...target, user: role, ...fields },
         }).expect(200);
-        await reported('fa__warehouse', (i) => i.version === res.body.version && i.state === 'live');
+        const health = await reported(name, (i) => i.version === res.body.version && i.state === state);
+        expect(health.instances[0]).toMatchObject({ version: res.body.version, state });
       };
 
       revision = (await admin('post', '/changesets', { baseRevision: revision, upserts: [sold] }).expect(201)).body.revision;
@@ -645,6 +646,27 @@ describeWithDatabase('connections: data sources served from sealed credentials',
       expect((await sqlOf({ dimensions: ['fa__sold.at'] })).sql[0]).not.toBe(sqlBefore);
       // Its rollup is another table, to be built from the new target; the old one is never read for it.
       expect(await rollupOf()).not.toBe(rollupBefore);
+
+      // Back again: the first target's, at once.
+      await push({});
+      expect((await ask().expect(200)).body.data[0]['fa__sold.at']).toBe(target.database);
+
+      // Two changed together: each switches.
+      await Promise.all([push({ database: workspaceDb }), push({ database: target.database }, 'live', 'fab__warehouse', 'fab')]);
+      expect((await ask().expect(200)).body.data[0]['fa__sold.at']).toBe(workspaceDb);
+      const whereNow = await request(server).get('/cubejs-api/v1/load')
+        .query({ query: JSON.stringify({ dimensions: ['fab__where.db'], cacheMode: 'stale-while-revalidate' }) })
+        .set('Authorization', token())
+        .expect(200);
+      expect(whereNow.body.data[0]['fab__where.db']).toBe(target.database);
+
+      // New settings that don't connect: queries fail, and never answer from the old target.
+      await push({ database: `${workspaceDb}_missing` }, 'failed');
+      const failing = await ask();
+      expect(failing.status).not.toBe(200);
+      expect(failing.body.data).toBeUndefined();
+      expect(failing.body.error).toMatch(/_missing" does not exist/);
+      await push({});
     });
   });
 });

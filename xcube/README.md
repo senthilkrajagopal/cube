@@ -448,27 +448,38 @@ Pool sizes and timeouts still come from the environment.
   - A changed connection is built and tested, then swapped in. Changes go one
     at a time and never back to an older version. Running queries finish on
     the old driver, which is released once idle. A failure keeps the old one.
-  - **Changed in place (AC-161).** A connection's identity is what it reaches:
-    its driver, auth method and fields, secrets left out. A new password keeps
-    it, and is only swapped in. A new host, database or user is another
-    identity, and no query is then given a result or rollup of the old one:
-    - Each cube on a connection, its own or inherited, is served aliased by
-      `<data source>@<identity>`. Its SQL, and so Cube's cached results, and
-      its rollup tables are then another target's than any before.
-    - On a change of identity, each instance tests the new settings and
-      compiles the modules holding that connection's cubes over it, while the
-      old target keeps serving. Then it switches at once to the new modules
-      and drivers, and reports the new version `live`. New settings that
-      don't connect or compile leave the old ones served, reported `failed`.
+  - **Changed in place (AC-161).** A connection's identity is what it reaches
+    and as whom: its driver, auth method and fields (how the server is
+    checked, such as `ssl`, left out), and the revisions of secrets that say
+    who connects (a service-account key, an OAuth or Dremio token). A new
+    password for the same user keeps it, and is only swapped in. A new host,
+    database, user or key holder is another identity. No query is then given
+    a result or rollup of the old one:
+    - **An epoch.** A revision is served over its connections' identities,
+      its *epoch*: its key names it (`<app id>~<epoch>`), each cube on a
+      connection, its own or inherited, is aliased by a hash of its name and
+      identity, and its requests run on an orchestrator of that epoch alone.
+      So its SQL, Cube's cached results and its rollup tables are that target's
+      only, and a compile of one epoch never runs on another's drivers.
+    - **A change of identity is a new epoch.** Each instance compiles the
+      revision over it, only the modules holding that connection's cubes, as
+      it would a new revision. It switches to it, and the old epoch retires
+      after its grace, with its orchestrator and drivers. Instances that miss
+      the notification find it at the next poll.
+    - **New settings that don't connect** still switch: queries fail, and
+      report `failed`, rather than answer from the old target.
     - **Rollups are built again** from the new target by the refresh worker.
       Until one is, a query that would use it answers Cube's "No
       pre-aggregation partitions were built yet", as after any publish that
       changes a rollup. Queries that don't use one answer from the new target
       at once.
-    - Previews over the model, and revisions it replaced, are built again
-      over the new settings; requests already on them finish.
-    - On upgrading to this, every cube on a connection gets such an alias at
-      its model's first activation, and its rollups rebuild once.
+    - **File sets:** only YAML files are aliased. A JavaScript, Jinja or
+      Python cube keeps its alias, so its rollups renew on their refresh keys;
+      its results are still its epoch's own.
+    - **Upgrading to this:** every cube on a connection gets such an alias at
+      its model's first activation, and its rollups are renamed and rebuilt
+      once. Upgrade the refresh worker first, so they are built when the API
+      instances look for them.
   - A removed connection's driver refuses calls, and serves again if the
     connection is pushed again.
   - Errors from a connection's driver reach Cube with its secrets taken out.

@@ -8,7 +8,6 @@ import { identityOf, withIdentityAliases } from '../../src/connections/aliases';
 import { DRIVERS } from '../../src/connections/drivers';
 import { SwitchableDriver } from '../../src/connections/switchable';
 import { modelSchema } from '../../src/config';
-import { aliasOf } from '../../src/names/publish';
 import { CredentialKeys, generateCredentialKey, sealSecretV1 } from '../../src/credentials/credentials';
 import { open } from '../../src/credentials/hpke';
 
@@ -166,29 +165,39 @@ describe('HPKE, low-order points', () => {
 describe('connection identities', () => {
   const pg = { driver: 'postgres', authMethod: 'password', fields: { host: 'db', port: 5432, database: 'sales', user: 'cube' } };
 
-  test('what a connection reaches: its settings, never its secrets', () => {
+  test('what a connection reaches and as whom: settings and key holders, not passwords or how the server is checked', () => {
     expect(identityOf(pg)).toBe(identityOf({ ...pg, fields: { user: 'cube', database: 'sales', port: 5432, host: 'db' } }));
     expect(identityOf({ ...pg, sealed: { password: { v: 1 } } } as any)).toBe(identityOf(pg));
+    expect(identityOf({ ...pg, fields: { ...pg.fields, ssl: true, sslRejectUnauthorized: false } })).toBe(identityOf(pg));
     expect(identityOf({ ...pg, fields: { ...pg.fields, database: 'other' } })).not.toBe(identityOf(pg));
     expect(identityOf({ ...pg, authMethod: 'client-certificate' })).not.toBe(identityOf(pg));
+    // A service-account key or a token says who connects: entered anew (a new revision), another identity.
+    const bq = { driver: 'bigquery', authMethod: 'service-account', fields: { projectId: 'p' }, sealed: { credentials: { ct: 'a' } } } as any;
+    expect(identityOf({ ...bq, revisions: { credentials: 'r1' } })).toBe(identityOf({ ...bq, sealed: { credentials: { ct: 'b' } }, revisions: { credentials: 'r1' } }));
+    expect(identityOf({ ...bq, revisions: { credentials: 'r1' } })).not.toBe(identityOf({ ...bq, revisions: { credentials: 'r2' } }));
   });
 
-  test('a cube on a connection, its own or inherited, is served aliased by its identity; others and marks stay', () => {
+  test('a cube on a connection, its own or inherited, is served aliased by its identity; the rest of a file, and marks, stay', () => {
     const files = [
       { path: 'fa__base.yml', content: 'cubes:\n  - name: fa__base\n    data_source: fa__warehouse\n    sql_alias: fa__base_abcd\n    sql_table: t\n' },
       { path: 'fa__child.yml', content: '# xcube: overlay data source fa__warehouse (postgres)\ncubes:\n  - name: fa__child\n    extends: fa__base\n' },
+      { path: 'set.yml', content: 'cubes:\n  - name: onit\n    data_source: fa__warehouse\n    sql_table: t\nviews:\n  - name: v\n    cubes: []\n' },
       { path: 'plain.yml', content: 'cubes:\n  - name: plain\n    sql_table: t\n' },
       { path: 'script.js', content: 'cube(`x`, {});' },
     ];
     const served = withIdentityAliases(files, new Map([['fa__warehouse', 'id1']]));
-    expect([...served.salts]).toEqual([['fa__base.yml', 'fa__warehouse@id1'], ['fa__child.yml', 'fa__warehouse@id1']]);
-    expect(served.files[0].content).toContain(`sql_alias: ${aliasOf('fa__base', 'fa__warehouse@id1')}`);
+    expect([...served.salts.keys()]).toEqual(['fa__base.yml', 'fa__child.yml', 'set.yml']);
+    const aliasIn = (content: string) => /sql_alias: (\S+)/.exec(content)?.[1];
+    expect(aliasIn(served.files[0].content)).toMatch(/^x[a-z2-7]{3,9}$/);
+    expect(aliasIn(served.files[0].content)).not.toBe('fa__base_abcd');
     expect(served.files[1].content.startsWith('# xcube: overlay data source fa__warehouse (postgres)\n')).toBe(true);
-    expect(served.files[1].content).toContain(`sql_alias: ${aliasOf('fa__child', 'fa__warehouse@id1')}`);
-    expect(served.files.slice(2)).toEqual(files.slice(2));
+    expect(aliasIn(served.files[1].content)).toMatch(/^x[a-z2-7]{3,9}$/);
+    // A file holding more than one item keeps the others.
+    expect(served.files[2].content).toContain('views:');
+    expect(served.files.slice(3)).toEqual(files.slice(3));
     // Another identity: other aliases. None: the files as they are.
     const moved = withIdentityAliases(files, new Map([['fa__warehouse', 'id2']]));
-    expect(moved.files[0].content).not.toBe(served.files[0].content);
+    expect(aliasIn(moved.files[0].content)).not.toBe(aliasIn(served.files[0].content));
     expect(withIdentityAliases(files, new Map()).files).toBe(files);
   });
 });

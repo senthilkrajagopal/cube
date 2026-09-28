@@ -99,10 +99,8 @@ function envelopeProblem(field: string, value: unknown): string | undefined {
 interface LiveEntry {
   switchable: SwitchableDriver;
   version: number;
-  /** What its driver reaches (`identityOf`). */
+  /** What its driver reaches (`identityOf`): its orchestrator serves compiles of that identity only. */
   identity: string;
-  /** A driver of the connection's new identity, built and tested, swapped in once the runtime serves that identity. */
-  pending?: { driver: any; version: number; identity: string; secrets: string[] };
   preAggregations: boolean;
   /** Cube's driver type it was built as: a compiled model's dialect. */
   cubeType: string;
@@ -139,15 +137,13 @@ export class Connections {
   protected refreshing: Promise<void> | null = null;
 
   /**
-   * Called once a connection's change is read and its drivers of the same
-   * identity swapped; drivers of a new identity are held until then. The
-   * runtime serves the new identity, then calls `commit`. Unset, they are
-   * committed at once.
+   * Called once a connection's change is read: the runtime serves a changed
+   * identity as a new epoch, over its own orchestrator.
    */
   public onChanged: ((model: string, name: string) => Promise<void>) | null = null;
 
-  /** Refused when a query's revision is served over another identity than the connection's now: it will be, shortly. */
-  public static readonly CHANGING = 'is changing to new settings on this instance; try again';
+  /** Refused when a request's compile is of another identity than the connection's now: a newer one serves it. */
+  public static readonly CHANGING = 'changed to new settings on this instance; try again';
 
   /** `<model>/<name>` → what this instance last reported of it, re-written by the heartbeat. */
   protected readonly lastReports = new Map<string, { model: string; name: string; version: number | null; state: string; error: string | null }>();
@@ -374,8 +370,9 @@ export class Connections {
     if (!connection) {
       return undefined;
     }
-    if (options.identity !== undefined && identityOf(connection) !== options.identity) {
-      // The request's compiled model is aliased by another identity than this driver would reach.
+    // The request's compile, and its orchestrator, are of one identity: never a driver of another.
+    const expected = (c: StoredConnection) => options.identity === undefined || identityOf(c) === options.identity;
+    if (!expected(connection)) {
       throw new Error(`Connection "${name}" ${Connections.CHANGING}`);
     }
     let built: Awaited<ReturnType<Connections['connect']>>;
@@ -385,6 +382,12 @@ export class Connections {
       const message = String(e?.message ?? e);
       this.report(model, name, connection.version, 'failed', message);
       throw new Error(`Connection "${name}" can't be used: ${message}`);
+    }
+    const now = (await this.of(model)).get(name);
+    if (!now || !expected(now)) {
+      // Changed while it connected.
+      await Promise.resolve(built.driver.release?.()).catch(() => undefined);
+      throw new Error(`Connection "${name}" ${Connections.CHANGING}`);
     }
     const key = `${model}/${name}`;
     const entry: LiveEntry = {
@@ -458,20 +461,15 @@ export class Connections {
         && (!isDriverType(connection.driver) || DRIVERS[connection.driver].cubeType !== entry.cubeType)) {
         // Compiled models keep the dialect they were compiled with.
         this.report(model, name, connection.version, 'failed', `its driver changed from ${entry.cubeType}; Cube must compile the model again`);
-      } else if (entry.switchable.isRemoved || connection.version > entry.version) {
-        const identity = identityOf(connection);
+      } else if ((entry.switchable.isRemoved || connection.version > entry.version) && identityOf(connection) === entry.identity) {
+        // The same target (a new password): swapped in place. Another target
+        // is another epoch, with drivers of its own; this one serves its own
+        // until its orchestrator goes.
         try {
           const built = await this.connect(connection, entry.preAggregations);
-          if (identity !== entry.identity) {
-            // Another target: held until the runtime serves it (`commit`).
-            this.discard(entry);
-            entry.pending = { driver: built.driver, version: connection.version, identity, secrets: built.secrets };
-          } else {
-            this.install(model, name, entry, { driver: built.driver, version: connection.version, identity, secrets: built.secrets });
-          }
+          this.install(model, name, entry, { driver: built.driver, version: connection.version, identity: entry.identity, secrets: built.secrets });
         } catch (e: any) {
           const message = String(e?.message ?? e);
-          this.discard(entry);
           this.report(model, name, connection.version, 'failed', message);
           this.log('xcube: a changed connection failed; the previous one stays', {
             model, connection: name, error: message, warning: 'connection failed',
@@ -481,13 +479,29 @@ export class Connections {
     }
     if (connection && this.onChanged) {
       await this.onChanged(model, name);
-    } else {
-      this.settle(model);
     }
   }
 
-  /** A driver in place of an entry's: a secret changed, or the runtime now serves its identity. */
-  protected install(model: string, name: string, entry: LiveEntry, next: NonNullable<LiveEntry['pending']>) {
+  /**
+   * Connects with a connection's stored settings, to report on them (its
+   * drivers are built where queries need them), then lets go.
+   */
+  public async probe(model: string, name: string): Promise<void> {
+    const connection = (await this.of(model)).get(name);
+    if (!connection) {
+      return;
+    }
+    try {
+      const built = await this.connect(connection, false, 1);
+      await Promise.resolve(built.driver.release?.()).catch(() => undefined);
+      this.report(model, name, connection.version, 'live');
+    } catch (e: any) {
+      this.report(model, name, connection.version, 'failed', String(e?.message ?? e));
+    }
+  }
+
+  /** A driver in place of an entry's: a secret changed. */
+  protected install(model: string, name: string, entry: LiveEntry, next: { driver: any; version: number; identity: string; secrets: string[] }) {
     if (entry.switchable.isRemoved) {
       entry.switchable.restore(next.driver);
     } else {
@@ -498,40 +512,6 @@ export class Connections {
     entry.secrets = next.secrets;
     this.report(model, name, next.version, 'live');
     this.log('xcube: connection swapped', { model, connection: name, version: next.version });
-  }
-
-  protected discard(entry: LiveEntry) {
-    const held = entry.pending;
-    entry.pending = undefined;
-    if (held) {
-      Promise.resolve(held.driver.release?.()).catch(() => undefined);
-    }
-  }
-
-  /**
-   * The runtime serves a model over `identities` now (all of them when not
-   * given): each held driver of the identity served goes in; any other goes,
-   * reported failed with `reason`, and the driver it would have replaced stays.
-   */
-  public settle(model: string, identities?: ReadonlyMap<string, string>, reason = 'Cube could not serve the model over its new settings; the previous ones stay') {
-    [...this.live].filter(([key]) => key.startsWith(`${model}/`)).forEach(([key, entries]) => {
-      const name = key.slice(model.length + 1);
-      [...entries].filter((entry) => entry.pending).forEach((entry) => {
-        const next = entry.pending!;
-        if (!identities || identities.get(name) === next.identity) {
-          entry.pending = undefined;
-          this.install(model, name, entry, next);
-        } else {
-          this.discard(entry);
-          this.report(model, name, next.version, 'failed', reason);
-        }
-      });
-    });
-  }
-
-  /** Whether an instance's drivers of a connection's new identity were all built and tested (none failed). */
-  public ready(model: string, name: string, identity: string): boolean {
-    return [...(this.live.get(`${model}/${name}`) ?? [])].every((entry) => entry.switchable.isRemoved || entry.identity === identity || entry.pending?.identity === identity);
   }
 
   /**
@@ -554,7 +534,11 @@ export class Connections {
           for (const name of names) {
             const entries = [...(this.live.get(`${model}/${name}`) ?? [])];
             const current = stored.get(name);
-            if (entries.some((e) => (current ? e.switchable.isRemoved || e.version !== current.version : !e.switchable.isRemoved))) {
+            const identity = current ? identityOf(current) : undefined;
+            const behind = entries.some((e) => (current
+              ? e.identity === identity && (e.switchable.isRemoved || e.version !== current.version)
+              : !e.switchable.isRemoved));
+            if (behind) {
               await this.changed(model, name);
             }
           }

@@ -34,7 +34,7 @@ import {
 import { Connections, ConnectionError, type ConnectionInput } from '../connections/connections';
 import { CredentialError, CredentialKeys, type SealedV1 } from '../credentials/credentials';
 import { DRIVERS, isDriverType } from '../connections/drivers';
-import { identityOf, withIdentityAliases } from '../connections/aliases';
+import { epochOf, identityOf, withIdentityAliases } from '../connections/aliases';
 import { createListenClient, createPool, type Logger } from '../store/db';
 import { migrate } from '../store/migrate';
 import {
@@ -127,8 +127,12 @@ export interface ModuleIndex {
 }
 
 export interface ServedRevision {
-  /** `appIdOf(head)`: what requests are pinned to. */
+  /** What requests are pinned to: `appIdOf(head)`, with its connections' epoch (`servedKeyOf`). */
   key: string;
+  /** `appIdOf(head)`: the revision it serves, whatever its connections. */
+  headKey: string;
+  /** Its files and modules as published, before they were aliased by its identities. */
+  source: RevisionData;
   model: string;
   generation: string;
   revision: number;
@@ -163,10 +167,26 @@ export interface ServedRevision {
   identities: ReadonlyMap<string, string>;
 }
 
+export function appIdOf(head: ModelHead): string {
+  return `xcube:${head.model}:${head.revision}:${head.contentHash.slice(0, 12)}`;
+}
+
 const NO_IDENTITIES: ReadonlyMap<string, string> = new Map();
 
-/** Marks the key of a revision kept only for requests already on it (`supersede`). */
-const SUPERSEDED = '#superseded:';
+/**
+ * What a revision is served under: its app id, and the epoch of its
+ * connections' identities. Another epoch is another served revision, compiled
+ * and switched to as a new revision is, with an orchestrator of its own.
+ */
+export function servedKeyOf(head: ModelHead, identities: ReadonlyMap<string, string>): string {
+  const epoch = epochOf(identities);
+  return epoch === undefined ? appIdOf(head) : `${appIdOf(head)}~${epoch}`;
+}
+
+/** The epoch a served revision's key (or an overlay's, over it) names, if any. */
+export function epochOfKey(key: string): string | undefined {
+  return /~([0-9a-f]{12})(?:$|[^0-9a-f])/.exec(key)?.[1];
+}
 
 /** An overlay id: what the client names a workspace or a proposal by. */
 export const OVERLAY_ID = /^[A-Za-z0-9_-]{1,64}$/;
@@ -274,10 +294,6 @@ export interface InstanceModelStatus {
   revision: number | null;
   state: 'active' | 'activating' | 'failed' | 'none';
   error?: string;
-}
-
-export function appIdOf(head: ModelHead): string {
-  return `xcube:${head.model}:${head.revision}:${head.contentHash.slice(0, 12)}`;
 }
 
 /** The context key naming the module a request is served from. */
@@ -516,8 +532,8 @@ export class XcubeRuntime {
       this.instanceId,
       (m, p) => this.log(m, p),
     );
-    // A connection changed: the model's sync serves it (`followIdentities`). A model not followed here serves nothing.
-    this.connections.onChanged = (model) => this.sync(model).catch(() => this.connections.settle(model));
+    // A connection changed: the model's sync serves a new identity as a new epoch.
+    this.connections.onChanged = (model) => this.sync(model).catch(() => undefined);
     this.verifier = new TokenVerifier(this.tokens, {
       modelClaim: () => this.options?.modelClaim ?? 'xcubeModel',
       revisionClaim: () => this.options?.revisionClaim ?? 'xcubeRevision',
@@ -676,7 +692,9 @@ export class XcubeRuntime {
     }
     this.core = null;
     for (const revision of this.served.values()) {
-      this.detached.set(revision.key, revision.data);
+      if (!revision.overlay) {
+        this.detached.set(revision.headKey, revision.source);
+      }
     }
     this.served.clear();
     this.residents.clear();
@@ -866,7 +884,8 @@ export class XcubeRuntime {
   /** The whole revision as one model, compiled on first use: for contexts no module serves (the SQL API, GraphQL). */
   protected wholeOf(revision: ServedRevision): Resident {
     if (!revision.whole) {
-      const appId = `xcube:${revision.model}:all:${revision.contentHash.slice(0, 12)}`;
+      // Its files as served: aliased by its connections' identities.
+      const appId = `xcube:${revision.model}:all:${contentHash(revision.data.files).slice(0, 12)}`;
       const whole = this.residents.get(appId) ?? {
         kind: 'revision' as const,
         appId,
@@ -1103,7 +1122,9 @@ export class XcubeRuntime {
       }
     }
     // Not awaited: a connection's driver test mustn't hold up following revisions and permissions.
-    this.connections.refresh().catch((e) => this.warn('xcube: could not read connections', { error: e.message }));
+    this.connections.refresh()
+      .then(() => this.followConnections())
+      .catch((e) => this.warn('xcube: could not read connections', { error: e.message }));
     const versions = await this.requireStore().versions();
     await Promise.all(versions.map(async ({ model, permissions, keys }) => {
       if (!MODEL_ID.test(model)) {
@@ -1316,13 +1337,7 @@ export class XcubeRuntime {
       throw gone(base.model, id);
     }
     const key = this.overlayKey(base, id, record.version);
-    let known = this.served.get(key);
-    if (known && known.identities !== base.identities && known.state !== 'activating') {
-      // Built over its base's previous connection settings.
-      this.served.delete(key);
-      this.retireUnused();
-      known = undefined;
-    }
+    const known = this.served.get(key);
     if (known && known.state !== 'activating') {
       // Idle, or pushed again unchanged: the same version on the same revision, used again.
       known.state = 'active';
@@ -2068,7 +2083,7 @@ export class XcubeRuntime {
       // A revision the database doesn't have (its schema was recreated since
       // the client heard of it) can't be waited for: answer from the current one.
       if (fresh && state?.target && atLeast > state.target.revision
-        && appIdOf(state.target) === active.key) {
+        && appIdOf(state.target) === active.headKey) {
         return active;
       }
       return undefined;
@@ -2286,7 +2301,7 @@ export class XcubeRuntime {
       const state = this.admit(head.model);
       const appId = appIdOf(head);
       // Only the model's sync chain writes its target; this only asks it to run.
-      if (state && (!state.active || state.active.key !== appId || !state.target || appIdOf(state.target) !== appId)) {
+      if (state && (!state.active || state.active.headKey !== appId || !state.target || appIdOf(state.target) !== appId)) {
         if (fromPoll && this.core && state.target && appIdOf(state.target) !== appId) {
           this.warn('xcube: poll found a revision no notification announced', { model: head.model, revision: head.revision });
         }
@@ -2384,12 +2399,18 @@ export class XcubeRuntime {
       return;
     }
 
-    const appId = appIdOf(head);
-    const retryLater = state.failed?.appId === appId && Date.now() < state.failed.retryAt;
-    if (state.active?.key !== appId && !retryLater && !await this.activateHead(head) && !state.active) {
+    const previous = state.active;
+    const key = servedKeyOf(head, await this.identitiesOf(model));
+    const retryLater = (state.failed?.appId === key || state.failed?.appId === appIdOf(head)) && Date.now() < state.failed.retryAt;
+    if (state.active?.key !== key && !retryLater && !await this.activateHead(head) && !state.active) {
       await this.fallBack(head, state);
     }
-    await this.followIdentities(model, state);
+    if (previous && state.active && state.active !== previous && state.active.headKey === previous.headKey) {
+      // The same revision, over connections changed to another target: say how they connect now.
+      [...new Set([...state.active.identities.keys()])]
+        .filter((name) => state.active!.identities.get(name) !== previous.identities.get(name))
+        .forEach((name) => this.connections.probe(model, name).catch(() => undefined));
+    }
   }
 
   /** The identity of each of a model's connections now. */
@@ -2402,92 +2423,58 @@ export class XcubeRuntime {
   }
 
   /**
-   * Serves a model over its connections as they are now. One changed to
-   * another identity (a new host, database or user) is served by compiling,
-   * over it, the active revision's modules holding its cubes, then switching
-   * to them and to its new drivers at once: from then on, no query here is
-   * given a result or rollup of its old target. Until then, the old target
-   * serves. A new target that doesn't connect, or doesn't compile, leaves the
-   * old one served, and is reported failed. Runs only in the model's sync
-   * chain.
+   * Serves each model over its connections as they are now: one this instance
+   * heard no notification for is found by the poll, and synced.
    */
-  protected async followIdentities(model: string, state: ModelState) {
-    const identities = await this.identitiesOf(model);
-    const { active } = state;
-    const changed = active
-      ? [...new Set([...identities.keys(), ...active.identities.keys()])].filter((n) => identities.get(n) !== active.identities.get(n))
-      : [];
-    if (!this.core || !active || !changed.length) {
-      this.connections.settle(model, identities);
-      return;
-    }
-    if (changed.some((name) => identities.has(name) && !this.connections.ready(model, name, identities.get(name)!))) {
-      this.connections.settle(model, active.identities, 'its new settings failed to connect; the previous ones stay');
-      return;
-    }
-    const next = this.residentsOf(active, active.key, active.data, identities);
-    try {
-      for (const resident of next.modules.values()) {
-        await this.ensureCompiled(resident);
+  protected async followConnections() {
+    for (const [model, state] of [...this.models]) {
+      if (state.active && !state.active.overlay) {
+        const now = epochOf(await this.identitiesOf(model));
+        if (now !== epochOf(state.active.identities)) {
+          this.sync(model).catch(() => undefined);
+        }
       }
-    } catch (e: any) {
-      this.connections.settle(model, active.identities);
-      this.warn('xcube: the model could not be compiled over its new connection settings; the previous ones stay', {
-        model, connections: changed, error: String(e?.message ?? e),
-      });
-      return;
     }
-    // What served the old identities finishes what it began, and nothing new reaches it.
-    this.supersede({ ...active, unions: new Map(active.unions), whole: active.whole });
-    // At once: the held drivers, and the modules aliased by their identities.
-    this.connections.settle(model, identities);
-    Object.assign(active, {
-      modules: next.modules,
-      holders: next.holders,
-      owner: next.owner,
-      single: next.modules.size === 1,
-      data: { ...active.data, files: next.files },
-      identities,
-    });
-    active.unions.clear();
-    active.whole = undefined;
-    // Replaced revisions and previews over this one are served over the new identities only, built again.
-    [...this.served.values()]
-      .filter((revision) => revision.model === model && revision !== active && revision.state !== 'activating'
-        && !revision.key.includes(SUPERSEDED))
-      .forEach((revision) => this.supersede(revision));
-    this.retireUnused();
-    this.log('xcube: serving new connection settings', {
-      model, revision: active.revision, connections: changed, recompiled: [...next.modules.values()].filter((r) => !r.compiled).length,
-    });
   }
+
+  /** Each model's epochs as served, by `<model>/<epoch>`: what drivers of its orchestrator must be of. */
+  protected readonly epochIdentities = new Map<string, ReadonlyMap<string, string>>();
 
   /**
-   * A revision no request may be pinned to any more, kept under a key none
-   * can name until its grace is over, so what it compiled serves the requests
-   * already on it.
+   * The epoch a context's compile is of: the one its pin names (a request's,
+   * or a refresh run's), else that of the revision served now. Cube keeps a
+   * context for an orchestrator's whole life, so it is read off the pin
+   * itself, never off a revision that may have gone.
    */
-  protected supersede(revision: ServedRevision) {
-    if (this.served.get(revision.key) === revision) {
-      this.served.delete(revision.key);
+  public epochOfContext(context: any): string | undefined {
+    const appId = context?.xcubePin?.appId;
+    if (typeof appId === 'string') {
+      return epochOfKey(appId);
     }
-    const key = `${revision.key}${SUPERSEDED}${crypto.randomBytes(4).toString('hex')}`;
-    this.served.set(key, { ...revision, key, state: 'retiring', retireAfter: Date.now() + this.settings.retireGraceMs });
+    const model = this.modelOfContext(context);
+    const active = model === undefined ? undefined : this.models.get(model)?.active;
+    return active ? epochOf(active.identities) : undefined;
   }
 
-  /** The identity of a data source a context's revision is served over, which its driver must be of. */
+  /** The identity of a data source a context's epoch is of, which its drivers must be of. */
   public servedIdentity(context: any, dataSource: string): string | undefined {
-    const appId = context?.xcubePin?.appId;
     const model = this.modelOfContext(context);
-    const revision = (typeof appId === 'string' ? this.served.get(appId) : undefined)
-      ?? (model === undefined ? undefined : this.models.get(model)?.active);
-    return revision?.identities.get(dataSource);
+    const epoch = this.epochOfContext(context);
+    return model === undefined || epoch === undefined ? undefined : this.epochIdentities.get(`${model}/${epoch}`)?.get(dataSource);
+  }
+
+  /** The orchestrators Cube built for each epoch of a model, by `<model>/<epoch>`: they go with the epoch. */
+  protected readonly epochOrchestrators = new Map<string, Set<string>>();
+
+  public noteEpochOrchestrator(model: string, epoch: string, orchestratorId: string) {
+    const key = `${model}/${epoch}`;
+    this.epochOrchestrators.set(key, (this.epochOrchestrators.get(key) ?? new Set()).add(orchestratorId));
   }
 
   /** A revision's files and modules: from what this process holds, else the database. */
   protected async dataFor(head: ModelHead): Promise<RevisionData | null> {
     const key = appIdOf(head);
-    const known = this.served.get(key)?.data ?? this.detached.get(key);
+    const known = [...this.served.values()].find((r) => r.headKey === key && !r.overlay)?.source ?? this.detached.get(key);
     if (known) {
       return known;
     }
@@ -2510,14 +2497,20 @@ export class XcubeRuntime {
     overlay?: { key: string; id: string; version: number; base: string },
     identities: ReadonlyMap<string, string> = NO_IDENTITIES,
   ): ServedRevision {
-    const key = overlay?.key ?? appIdOf(head);
+    const key = overlay?.key ?? servedKeyOf(head, identities);
     const existing = this.served.get(key);
     if (existing) {
       return existing;
     }
     const { modules, holders, owner, files } = this.residentsOf(head, key, data, identities);
+    const epoch = epochOf(identities);
+    if (epoch !== undefined) {
+      this.epochIdentities.set(`${head.model}/${epoch}`, identities);
+    }
     const revision: ServedRevision = {
       key,
+      headKey: appIdOf(head),
+      source: data,
       model: head.model,
       generation: head.generation,
       revision: head.revision,
@@ -2620,12 +2613,13 @@ export class XcubeRuntime {
     }
     const { model } = head;
     const state = this.state(model);
-    const key = appIdOf(head);
+    const identities = await this.identitiesOf(model);
+    const key = servedKeyOf(head, identities);
     if (state.active?.key === key) {
       return true;
     }
 
-    const revision = this.servedRevision(head, data, undefined, await this.identitiesOf(model));
+    const revision = this.servedRevision(head, data, undefined, identities);
     const reused = revision.state === 'retiring';
     revision.retireAfter = undefined;
     const drop = () => {
@@ -2667,7 +2661,7 @@ export class XcubeRuntime {
     if (this.core !== core) {
       return false;
     }
-    const current = state.target !== undefined && appIdOf(state.target) === key;
+    const current = state.target !== undefined && servedKeyOf(state.target, identities) === key;
     if (!current && !(fallback && !state.active)) {
       // Superseded while it compiled: the next read switches to the newer one.
       drop();
@@ -2680,7 +2674,7 @@ export class XcubeRuntime {
     if (current || state.failed?.appId === key) {
       state.failed = undefined;
     }
-    this.detached.delete(key);
+    this.detached.delete(appIdOf(head));
     if (previous && previous !== revision) {
       previous.state = 'retiring';
       previous.retireAfter = Date.now() + this.settings.retireGraceMs;
@@ -2817,6 +2811,24 @@ export class XcubeRuntime {
         this.retiredOverlayConnections.add(key);
       }
     }
+    // An epoch no kept revision is served over: its orchestrators, and their drivers, go.
+    const epochs = new Set<string>();
+    for (const revision of this.served.values()) {
+      const epoch = epochOf(revision.identities);
+      if (epoch !== undefined) {
+        epochs.add(`${revision.model}/${epoch}`);
+      }
+    }
+    for (const [key, orchestrators] of [...this.epochOrchestrators]) {
+      if (!epochs.has(key)) {
+        this.epochOrchestrators.delete(key);
+        orchestrators.forEach((id) => core?.retireOrchestrator?.(id));
+        this.log('xcube: released the drivers of connection settings no longer served', { epoch: key, orchestrators: [...orchestrators] });
+      }
+    }
+    for (const key of [...this.epochIdentities.keys()].slice(0, Math.max(0, this.epochIdentities.size - 10000))) {
+      this.epochIdentities.delete(key);
+    }
     for (const key of [...this.retiredOverlayConnections].slice(0, Math.max(0, this.retiredOverlayConnections.size - 10000))) {
       this.retiredOverlayConnections.delete(key);
     }
@@ -2844,7 +2856,7 @@ export class XcubeRuntime {
       return { revision: state.active?.revision ?? null, state: 'failed', error: state.failed.error };
     }
     if (state?.active) {
-      const current = state.target && appIdOf(state.target) === state.active.key;
+      const current = state.target && appIdOf(state.target) === state.active.headKey;
       return { revision: state.active.revision, state: current || !state.target ? 'active' : 'activating' };
     }
     return { revision: null, state: state?.target ? 'activating' : 'none' };

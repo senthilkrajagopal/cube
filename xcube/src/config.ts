@@ -161,13 +161,24 @@ export function createConfig(
       const base = cube.contextToOrchestratorId ? await cube.contextToOrchestratorId(context) : 'STANDALONE';
       const model = runtime.modelOfContext(context);
       const overlay = model ? runtime.overlayConnectionsOf(context) : undefined;
+      // Drivers are of the identities a request's compile is of (`epochOfContext`): a
+      // changed target is another epoch, never a driver swapped under a compile of the old.
+      const epoch = model ? runtime.epochOfContext(context) : undefined;
+      const suffix = epoch === undefined ? '' : `_${epoch}`;
       if (overlay) {
         // Model ids have no capitals: `_O_` can't be part of one, so no model's id is an overlay's.
-        const id = `${base}_${model}_O_${overlay.id}_${overlay.version}`;
+        const id = `${base}_${model}_O_${overlay.id}_${overlay.version}${suffix}`;
         runtime.noteOverlayOrchestrator(overlay.key, id);
         return id;
       }
-      return model && (await runtime.connections.of(model)).size ? `${base}_${model}` : base;
+      if (!model || !(await runtime.connections.of(model)).size) {
+        return base;
+      }
+      const id = `${base}_${model}${suffix}`;
+      if (epoch !== undefined) {
+        runtime.noteEpochOrchestrator(model, epoch, id);
+      }
+      return id;
     },
     preAggregationsSchema: async (context: any) => {
       const configured = typeof cube.preAggregationsSchema === 'function'
