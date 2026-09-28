@@ -26,25 +26,30 @@ function hash(value: unknown): string {
   return crypto.createHash('sha256').update(JSON.stringify(value), 'utf8').digest('hex').slice(0, 12);
 }
 
+/** The secrets of a connection that say who connects (a service-account key, a token), not a password for a named user. */
+export function principalSecrets(connection: Partial<Pick<StoredConnection, 'sealed'>>): string[] {
+  return Object.keys(connection.sealed ?? {}).filter((field) => PRINCIPAL_SECRETS.has(field)).sort();
+}
+
 /**
  * What a connection reaches and as whom: its driver, auth method and fields
- * (how the server is checked left out), and the secrets that name who
- * connects (a service-account key, a token) by their revision. A new
- * password for the same user keeps it; a new host, database, user or key
+ * (how the server is checked left out), and each secret that names who
+ * connects, by what `principals` says of it: its revision, or a hash of it
+ * opened (`Connections.identityOf`). A new password for the same user keeps
+ * it, as does sealing the same key again; a new host, database, user or key
  * holder is another identity, whose data cached results and rollups of the
  * old one mustn't stand for.
  */
 export function identityOf(
   connection: Pick<StoredConnection, 'driver' | 'authMethod' | 'fields'> & Partial<Pick<StoredConnection, 'sealed' | 'revisions'>>,
+  principals: Record<string, string> = {},
 ): string {
   const fields = Object.entries(connection.fields)
     .filter(([key]) => !TRANSPORT_FIELDS.has(key))
     .sort(([a], [b]) => (a < b ? -1 : 1));
-  const principals = Object.keys(connection.sealed ?? {})
-    .filter((field) => PRINCIPAL_SECRETS.has(field))
-    .sort()
-    .map((field) => [field, connection.revisions?.[field] ?? hash((connection.sealed as any)[field]?.ct ?? null)]);
-  return hash([connection.driver, connection.authMethod, fields, principals]);
+  const named = principalSecrets(connection)
+    .map((field) => [field, principals[field] ?? connection.revisions?.[field] ?? hash((connection.sealed as any)[field]?.ct ?? null)]);
+  return hash([connection.driver, connection.authMethod, fields, named]);
 }
 
 /** An epoch: the identities of a model's connections together, or nothing without connections. */
@@ -66,11 +71,13 @@ function preAggregationNames(cube: any): string[] {
 
 /**
  * A cube's alias over an identity: a hash of its name and the identity, short
- * enough that `<alias>_<pre-aggregation>` stays within the rollup table stem.
+ * enough that `<alias>_<pre-aggregation>` stays within the rollup table stem
+ * where it can, and never under 25 bits; `extra` characters more to part it
+ * from another's.
  */
-function identityAlias(name: string, salt: string, rollups: string[]): string {
+function identityAlias(name: string, salt: string, rollups: string[], extra = 0): string {
   const longest = Math.max(0, ...rollups.map((r) => r.length));
-  const length = Math.max(3, Math.min(9, MAX_TABLE_STEM - 2 - longest));
+  const length = Math.max(5, Math.min(9, MAX_TABLE_STEM - 2 - longest)) + extra;
   return `x${base32(`${name}@${salt}`, length)}`;
 }
 
@@ -119,21 +126,35 @@ export function withIdentityAliases(
     }
     return 'default';
   };
+  // Each cube on a connection, with its salt; the others keep the aliases (or names) Cube uses for them.
+  const aliased = new Map<any, string>();
+  const taken = new Set<string>();
+  parsed.forEach(({ doc }) => (doc?.cubes ?? []).forEach((cube: any) => {
+    const dataSource = cube && typeof cube.name === 'string' ? dataSourceOf(cube) : undefined;
+    const identity = dataSource === undefined ? undefined : identities.get(dataSource);
+    if (identity !== undefined) {
+      aliased.set(cube, `${dataSource}@${identity}`);
+    } else if (cube && typeof cube.name === 'string') {
+      taken.add(cube.sql_alias ?? cube.sqlAlias ?? cube.name);
+    }
+  }));
+  // One alias per cube, in name order so every instance gives the same: lengthened past any clash.
+  [...aliased].sort(([a], [b]) => (a.name < b.name ? -1 : 1)).forEach(([cube, salt]) => {
+    let extra = 0;
+    let alias = identityAlias(cube.name, salt, preAggregationNames(cube));
+    while (taken.has(alias) && extra < 12) {
+      extra += 2;
+      alias = identityAlias(cube.name, salt, preAggregationNames(cube), extra);
+    }
+    taken.add(alias);
+    delete cube.sqlAlias;
+    cube.sql_alias = alias;
+  });
   const served = parsed.map(({ file, doc }) => {
     if (!doc) {
       return file;
     }
-    const fileSalts: string[] = [];
-    for (const cube of doc.cubes) {
-      const dataSource = cube && typeof cube.name === 'string' ? dataSourceOf(cube) : undefined;
-      const identity = dataSource === undefined ? undefined : identities.get(dataSource);
-      if (identity !== undefined) {
-        const salt = `${dataSource}@${identity}`;
-        fileSalts.push(`${cube.name}:${salt}`);
-        delete cube.sqlAlias;
-        cube.sql_alias = identityAlias(cube.name, salt, preAggregationNames(cube));
-      }
-    }
+    const fileSalts = doc.cubes.filter((cube: any) => aliased.has(cube)).map((cube: any) => `${cube.name}:${aliased.get(cube)}`);
     if (!fileSalts.length) {
       return file;
     }

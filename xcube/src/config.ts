@@ -168,16 +168,14 @@ export function createConfig(
       if (overlay) {
         // Model ids have no capitals: `_O_` can't be part of one, so no model's id is an overlay's.
         const id = `${base}_${model}_O_${overlay.id}_${overlay.version}${suffix}`;
-        runtime.noteOverlayOrchestrator(overlay.key, id);
+        runtime.noteOverlayOrchestrator(`${overlay.key}/${epoch ?? '-'}`, id);
         return id;
       }
       if (!model || !(await runtime.connections.of(model)).size) {
         return base;
       }
       const id = `${base}_${model}${suffix}`;
-      if (epoch !== undefined) {
-        runtime.noteEpochOrchestrator(model, epoch, id);
-      }
+      runtime.noteEpochOrchestrator(model, epoch ?? '-', id);
       return id;
     },
     preAggregationsSchema: async (context: any) => {

@@ -34,7 +34,7 @@ import {
 import { Connections, ConnectionError, type ConnectionInput } from '../connections/connections';
 import { CredentialError, CredentialKeys, type SealedV1 } from '../credentials/credentials';
 import { DRIVERS, isDriverType } from '../connections/drivers';
-import { epochOf, identityOf, withIdentityAliases } from '../connections/aliases';
+import { epochOf, withIdentityAliases } from '../connections/aliases';
 import { createListenClient, createPool, type Logger } from '../store/db';
 import { migrate } from '../store/migrate';
 import {
@@ -813,6 +813,11 @@ export class XcubeRuntime {
       if (pin.appId.startsWith(`xcube:${model}:o:`)) {
         // Never the published model in an overlay's place.
         throw unavailable('The overlay this request was pinned to is no longer compiled here; try again');
+      }
+      const active = this.models.get(model)?.active;
+      if (active && epochOfKey(pin.appId) !== epochOf(active.identities)) {
+        // Its orchestrator is of the pin's connection settings: never a compile of others on it.
+        throw unavailable('The connection settings this request was pinned to changed; try again');
       }
       this.warn('xcube: pinned revision retired; answering from the active one', { model, appId: pin.appId });
     }
@@ -2400,10 +2405,19 @@ export class XcubeRuntime {
     }
 
     const previous = state.active;
-    const key = servedKeyOf(head, await this.identitiesOf(model));
+    const identities = await this.identitiesOf(model);
+    const key = servedKeyOf(head, identities);
     const retryLater = (state.failed?.appId === key || state.failed?.appId === appIdOf(head)) && Date.now() < state.failed.retryAt;
     if (state.active?.key !== key && !retryLater && !await this.activateHead(head) && !state.active) {
       await this.fallBack(head, state);
+    }
+    const active = state.active as ServedRevision | undefined;
+    const rekeyed = active ? servedKeyOf(XcubeRuntime.headOf(active), identities) : undefined;
+    if (active && active.headKey !== appIdOf(head) && active.key !== rekeyed
+      && !(state.failed && state.failed.appId === rekeyed && Date.now() < state.failed.retryAt)) {
+      // The current revision doesn't compile: the one served still moves to the connections' new
+      // settings, never serving their old target meanwhile.
+      await this.activate(XcubeRuntime.headOf(active), active.source, false, true);
     }
     if (previous && state.active && state.active !== previous && state.active.headKey === previous.headKey) {
       // The same revision, over connections changed to another target: say how they connect now.
@@ -2413,13 +2427,20 @@ export class XcubeRuntime {
     }
   }
 
+  /** The head a served revision is of. */
+  protected static headOf(revision: ServedRevision): ModelHead {
+    return {
+      model: revision.model, generation: revision.generation, revision: revision.revision, contentHash: revision.contentHash, mode: revision.mode,
+    };
+  }
+
   /** The identity of each of a model's connections now. */
   protected async identitiesOf(model: string): Promise<ReadonlyMap<string, string>> {
     if (!this.store) {
       return NO_IDENTITIES;
     }
     const connections = await this.connections.of(model);
-    return connections.size ? new Map([...connections].map(([name, c]) => [name, identityOf(c)])) : NO_IDENTITIES;
+    return connections.size ? new Map([...connections].map(([name, c]) => [name, this.connections.identityOf(c)])) : NO_IDENTITIES;
   }
 
   /**
@@ -2466,9 +2487,42 @@ export class XcubeRuntime {
   /** The orchestrators Cube built for each epoch of a model, by `<model>/<epoch>`: they go with the epoch. */
   protected readonly epochOrchestrators = new Map<string, Set<string>>();
 
+  /** Each epoch orchestrator's model and epoch (`-`: a model's served before its first connection). */
+  protected readonly orchestratorEpochs = new Map<string, { model: string; epoch: string }>();
+
   public noteEpochOrchestrator(model: string, epoch: string, orchestratorId: string) {
     const key = `${model}/${epoch}`;
     this.epochOrchestrators.set(key, (this.epochOrchestrators.get(key) ?? new Set()).add(orchestratorId));
+    this.orchestratorEpochs.set(orchestratorId, { model, epoch });
+    if (!this.epochsInUse().has(key)) {
+      // Built for an epoch already retired (a request that began before): it goes once Cube has stored it.
+      setTimeout(() => {
+        if (!this.epochsInUse().has(key)) {
+          this.core?.retireOrchestrator?.(orchestratorId);
+        }
+      }, 1000).unref?.();
+    }
+  }
+
+  /** Whether an orchestrator is one of a model with connections, of one epoch. */
+  public isEpochOrchestrator(orchestratorId: string): boolean {
+    return this.orchestratorEpochs.has(orchestratorId);
+  }
+
+  /** Whether an orchestrator serves an epoch its model no longer serves new requests over. */
+  public isSupersededOrchestrator(orchestratorId: string): boolean {
+    const known = this.orchestratorEpochs.get(orchestratorId);
+    const active = known ? this.models.get(known.model)?.active : undefined;
+    return Boolean(known && active && (epochOf(active.identities) ?? '-') !== known.epoch);
+  }
+
+  /** The epochs of each model some kept revision is served over, `<model>/<epoch>` (`-` for none). */
+  protected epochsInUse(): Set<string> {
+    const epochs = new Set<string>();
+    for (const revision of this.served.values()) {
+      epochs.add(`${revision.model}/${epochOf(revision.identities) ?? '-'}`);
+    }
+    return epochs;
   }
 
   /** A revision's files and modules: from what this process holds, else the database. */
@@ -2606,7 +2660,7 @@ export class XcubeRuntime {
    * still the model's current one, or, with `fallback`, if nothing serves
    * the model here. Runs only in the model's sync chain.
    */
-  protected async activate(head: ModelHead, data: RevisionData, fallback = false): Promise<boolean> {
+  protected async activate(head: ModelHead, data: RevisionData, fallback = false, rekey = false): Promise<boolean> {
     const { core } = this;
     if (!core) {
       return false;
@@ -2661,7 +2715,9 @@ export class XcubeRuntime {
     if (this.core !== core) {
       return false;
     }
-    const current = state.target !== undefined && servedKeyOf(state.target, identities) === key;
+    // `rekey`: the revision served now, over its connections' new settings, though the current one failed.
+    const current = (state.target !== undefined && servedKeyOf(state.target, identities) === key)
+      || (rekey && state.active?.headKey === appIdOf(head));
     if (!current && !(fallback && !state.active)) {
       // Superseded while it compiled: the next read switches to the newer one.
       drop();
@@ -2793,13 +2849,16 @@ export class XcubeRuntime {
     }
     // An overlay version no kept revision serves: its data sources and their drivers go.
     const overlays = new Set<string>();
+    const overlayEpochs = new Set<string>();
     for (const revision of this.served.values()) {
       if (revision.overlay) {
-        overlays.add(`${revision.model}/${revision.overlay.id}/${revision.overlay.version}`);
+        const key = `${revision.model}/${revision.overlay.id}/${revision.overlay.version}`;
+        overlays.add(key);
+        overlayEpochs.add(`${key}/${epochOf(revision.identities) ?? '-'}`);
       }
     }
     for (const [key, orchestrators] of [...this.overlayOrchestrators]) {
-      if (!overlays.has(key)) {
+      if (!overlayEpochs.has(key)) {
         this.overlayOrchestrators.delete(key);
         orchestrators.forEach((id) => core?.retireOrchestrator?.(id));
         this.log('xcube: released an overlay\'s data sources', { overlay: key, orchestrators: [...orchestrators] });
@@ -2812,23 +2871,20 @@ export class XcubeRuntime {
       }
     }
     // An epoch no kept revision is served over: its orchestrators, and their drivers, go.
-    const epochs = new Set<string>();
-    for (const revision of this.served.values()) {
-      const epoch = epochOf(revision.identities);
-      if (epoch !== undefined) {
-        epochs.add(`${revision.model}/${epoch}`);
-      }
-    }
+    const epochs = this.epochsInUse();
     for (const [key, orchestrators] of [...this.epochOrchestrators]) {
       if (!epochs.has(key)) {
         this.epochOrchestrators.delete(key);
-        orchestrators.forEach((id) => core?.retireOrchestrator?.(id));
+        orchestrators.forEach((id) => {
+          core?.retireOrchestrator?.(id);
+          this.orchestratorEpochs.delete(id);
+        });
         this.log('xcube: released the drivers of connection settings no longer served', { epoch: key, orchestrators: [...orchestrators] });
       }
     }
-    for (const key of [...this.epochIdentities.keys()].slice(0, Math.max(0, this.epochIdentities.size - 10000))) {
-      this.epochIdentities.delete(key);
-    }
+    // What each epoch's drivers must be of is kept while it is served; the rest, beyond 1,000.
+    const unused = [...this.epochIdentities.keys()].filter((key) => !epochs.has(key));
+    unused.slice(0, Math.max(0, unused.length - 1000)).forEach((key) => this.epochIdentities.delete(key));
     for (const key of [...this.retiredOverlayConnections].slice(0, Math.max(0, this.retiredOverlayConnections.size - 10000))) {
       this.retiredOverlayConnections.delete(key);
     }
@@ -2852,7 +2908,8 @@ export class XcubeRuntime {
 
   public instanceStatus(model: string): InstanceModelStatus {
     const state = this.models.get(model);
-    if (state?.failed && state.target && appIdOf(state.target) === state.failed.appId) {
+    if (state?.failed && state.target
+      && (state.failed.appId === appIdOf(state.target) || state.failed.appId.startsWith(`${appIdOf(state.target)}~`))) {
       return { revision: state.active?.revision ?? null, state: 'failed', error: state.failed.error };
     }
     if (state?.active) {

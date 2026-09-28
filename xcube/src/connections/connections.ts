@@ -1,10 +1,11 @@
+import crypto from 'crypto';
 import { CubejsServerCore } from '@cubejs-backend/server-core';
 
 import { CredentialError, type CredentialKeys } from '../credentials/credentials';
 import type { RevisionStore, StoredConnection } from '../store/revisions';
 import { DRIVERS, isDriverType, type DriverType, type Fields } from './drivers';
 import { SwitchableDriver } from './switchable';
-import { identityOf } from './aliases';
+import { identityOf as identityWith, principalSecrets } from './aliases';
 
 /** A connection as the client pushes or tests it. */
 export interface ConnectionInput {
@@ -141,6 +142,38 @@ export class Connections {
    * identity as a new epoch, over its own orchestrator.
    */
   public onChanged: ((model: string, name: string) => Promise<void>) | null = null;
+
+  /** Hashes of opened key-holder secrets, by `<model>/<name>/<version>/<field>`. */
+  protected readonly principalHashes = new Map<string, string>();
+
+  /**
+   * A stored connection's identity (`aliases.identityOf`): a key-holder secret
+   * with no revision from the client is told by a hash of it opened, so the
+   * same key sealed again (a re-wrap) is the same identity.
+   */
+  public identityOf(connection: StoredConnection): string {
+    const principals: Record<string, string> = {};
+    for (const field of principalSecrets(connection)) {
+      if (connection.revisions?.[field] === undefined) {
+        const key = `${connection.model}/${connection.name}/${connection.version}/${field}`;
+        let known = this.principalHashes.get(key);
+        if (known === undefined) {
+          try {
+            const opened = this.keys?.open(connection.sealed[field], connection.driver as DriverType, field, connection.fields);
+            known = opened === undefined ? 'unopened' : crypto.createHash('sha256').update(opened, 'utf8').digest('hex').slice(0, 12);
+          } catch {
+            known = 'unopened';
+          }
+          this.principalHashes.set(key, known);
+          while (this.principalHashes.size > 10000) {
+            this.principalHashes.delete(this.principalHashes.keys().next().value!);
+          }
+        }
+        principals[field] = known;
+      }
+    }
+    return identityWith(connection, principals);
+  }
 
   /** Refused when a request's compile is of another identity than the connection's now: a newer one serves it. */
   public static readonly CHANGING = 'changed to new settings on this instance; try again';
@@ -371,7 +404,7 @@ export class Connections {
       return undefined;
     }
     // The request's compile, and its orchestrator, are of one identity: never a driver of another.
-    const expected = (c: StoredConnection) => options.identity === undefined || identityOf(c) === options.identity;
+    const expected = (c: StoredConnection) => options.identity === undefined || this.identityOf(c) === options.identity;
     if (!expected(connection)) {
       throw new Error(`Connection "${name}" ${Connections.CHANGING}`);
     }
@@ -393,7 +426,7 @@ export class Connections {
     const entry: LiveEntry = {
       switchable: null as unknown as SwitchableDriver,
       version: connection.version,
-      identity: identityOf(connection),
+      identity: this.identityOf(connection),
       preAggregations: options.preAggregations,
       cubeType: built.cubeType,
       secrets: built.secrets,
@@ -461,7 +494,7 @@ export class Connections {
         && (!isDriverType(connection.driver) || DRIVERS[connection.driver].cubeType !== entry.cubeType)) {
         // Compiled models keep the dialect they were compiled with.
         this.report(model, name, connection.version, 'failed', `its driver changed from ${entry.cubeType}; Cube must compile the model again`);
-      } else if ((entry.switchable.isRemoved || connection.version > entry.version) && identityOf(connection) === entry.identity) {
+      } else if ((entry.switchable.isRemoved || connection.version > entry.version) && this.identityOf(connection) === entry.identity) {
         // The same target (a new password): swapped in place. Another target
         // is another epoch, with drivers of its own; this one serves its own
         // until its orchestrator goes.
@@ -534,7 +567,7 @@ export class Connections {
           for (const name of names) {
             const entries = [...(this.live.get(`${model}/${name}`) ?? [])];
             const current = stored.get(name);
-            const identity = current ? identityOf(current) : undefined;
+            const identity = current ? this.identityOf(current) : undefined;
             const behind = entries.some((e) => (current
               ? e.identity === identity && (e.switchable.isRemoved || e.version !== current.version)
               : !e.switchable.isRemoved));

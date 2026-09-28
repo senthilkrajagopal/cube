@@ -443,9 +443,11 @@ Pool sizes and timeouts still come from the environment.
 - **Drivers.** Cube asks `resolveDriver` for a data source's driver.
   - A model's connection gets a stable xcube driver, with Cube's own driver
     for it behind it, once it has connected.
-  - A changed connection is built and tested, then swapped in. Changes go one
-    at a time and never back to an older version. Running queries finish on
-    the old driver, which is released once idle. A failure keeps the old one.
+  - A connection changed to the same target (a new password) is built and
+    tested, then swapped in. Changes go one at a time and never back to an
+    older version. Running queries finish on the old driver, which is
+    released once idle. A failure keeps the old one. A change of target is
+    served as a new epoch instead (below).
   - **Changed in place (AC-161).** A connection's identity is what it reaches
     and as whom: its driver, auth method and fields (how the server is
     checked, such as `ssl`, left out), and the revisions of secrets that say
@@ -465,7 +467,13 @@ Pool sizes and timeouts still come from the environment.
       after its grace, with its orchestrator and drivers. Instances that miss
       the notification find it at the next poll.
     - **New settings that don't connect** still switch: queries fail, and
-      report `failed`, rather than answer from the old target.
+      report `failed`, rather than answer from the old target. If the revision
+      can't be compiled over them, it stays served over the old ones and the
+      model reports `failed` (`GET …/revision`). A request pinned to an epoch
+      no longer served answers `503`, to be sent again.
+    - **Epochs share their model's rollup schema,** so an orchestrator of an
+      epoch no longer served drops none of its tables: the current one's
+      clean-up clears what the old one leaves.
     - **Rollups are built again** from the new target by the refresh worker.
       Until one is, a query that would use it answers Cube's "No
       pre-aggregation partitions were built yet", as after any publish that

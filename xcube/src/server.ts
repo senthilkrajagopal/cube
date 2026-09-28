@@ -11,6 +11,7 @@ import type { DriverFactoryByDataSource } from '@cubejs-backend/query-orchestrat
 import { OrchestratorStorage } from '@cubejs-backend/server-core/dist/src/core/OrchestratorStorage';
 
 import { CatalogQueues } from './catalog/queue';
+import { Connections } from './connections/connections';
 import { globalRuntime, runtimeOf } from './config';
 import { XcubeApiGateway } from './gateway';
 import { DataSourceIntrospection } from './introspection';
@@ -55,14 +56,39 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
     // xcube's connection drivers this orchestrator was given, released with it. Not through
     // Cube's seen data sources: /livez would then test every model's connections.
     const connections = new Set<any>();
+    // An orchestrator of a superseded epoch shares its model's rollup schema with the one serving
+    // now, but not Cube's record of what that one built: its orphan clean-up would drop those
+    // tables. It drops none; the one serving now clears what it leaves.
+    const orchestratorId = (options as any).redisPrefix as string | undefined;
+    const epochs = Boolean(orchestratorId && this.xcube?.isEpochOrchestrator(orchestratorId));
+    const superseded = () => Boolean(orchestratorId && this.xcube?.isSupersededOrchestrator(orchestratorId));
+    const guarded = (driver: any) => (epochs && driver && typeof driver.dropTable === 'function'
+      ? new Proxy(driver, {
+        get: (target, prop, receiver) => {
+          if (prop !== 'dropTable') {
+            return Reflect.get(target, prop, receiver);
+          }
+          return async (...args: any[]) => {
+            if (superseded()) {
+              this.logger('xcube: a superseded epoch drops no rollup table', { table: args[0], orchestratorId });
+              return undefined;
+            }
+            return Reflect.apply(target.dropTable, target, args);
+          };
+        },
+      })
+      : driver);
     const tracked: DriverFactoryByDataSource = async (dataSource, preAggregations) => {
       const driver: any = await getDriver(dataSource, preAggregations);
       if (driver?.__xcubeConnection) {
         connections.add(driver);
       }
-      return driver;
+      return guarded(driver);
     };
-    const orchestratorApi = super.createOrchestratorApi(tracked, options);
+    const external = (options as any).externalDriverFactory as (() => Promise<any>) | undefined;
+    const orchestratorApi = super.createOrchestratorApi(tracked, external
+      ? { ...options, externalDriverFactory: async () => guarded(await external()) } as OrchestratorApiOptions
+      : options);
     const release = orchestratorApi.release.bind(orchestratorApi);
     orchestratorApi.release = async () => {
       const released = await release();
@@ -92,10 +118,12 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
       if (brought) {
         return runtime.connections.overlayDriverFor({ ...brought, name: dataSource }, driverOptions);
       }
-      const driver = await runtime.connections.driverFor(model, dataSource, {
-        ...driverOptions,
-        identity: runtime.servedIdentity(context, dataSource),
-      });
+      const identity = runtime.servedIdentity(context, dataSource);
+      if (identity === undefined && (await runtime.connections.of(model)).has(dataSource)) {
+        // A compile from before this connection was served (a model's first): not on its drivers.
+        throw new Error(`Connection "${dataSource}" ${Connections.CHANGING}`);
+      }
+      const driver = await runtime.connections.driverFor(model, dataSource, { ...driverOptions, identity });
       if (driver) {
         return driver;
       }

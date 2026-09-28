@@ -112,6 +112,18 @@ describe('connection checks', () => {
   const fields = { host: 'db', port: 5432, database: 'd', user: 'u' };
   const sealed = (secret: string) => sealSecretV1(key.jwk.x, key.kid, 'postgres', 'password', fields, secret);
 
+  test('a key holder with no revision from the client is told by the key itself: sealed again, the same identity', () => {
+    const sa = (secret: string) => sealSecretV1(key.jwk.x, key.kid, 'bigquery', 'credentials', { projectId: 'p' }, secret);
+    const stored = (envelope: unknown, version: number) => ({
+      model: 'm', name: 'bq', folderId: 'froot', driver: 'bigquery', authMethod: 'service-account',
+      fields: { projectId: 'p' }, sealed: { credentials: envelope }, revisions: {}, version, updatedAt: new Date(),
+    } as any);
+    const one = JSON.stringify({ type: 'service_account', client_email: 'a@p.iam', private_key: 'k1' });
+    const other = JSON.stringify({ type: 'service_account', client_email: 'b@p.iam', private_key: 'k2' });
+    expect(connections.identityOf(stored(sa(one), 1))).toBe(connections.identityOf(stored(sa(one), 2)));
+    expect(connections.identityOf(stored(sa(other), 3))).not.toBe(connections.identityOf(stored(sa(one), 1)));
+  });
+
   test('an envelope must have its shape: v 1, a kid, 32 bytes of enc, whole padded blocks of ct', () => {
     const good = sealed('pw');
     const problems = (envelope: unknown) => Connections.validate({ driver: 'postgres', authMethod: 'password', fields, sealed: { password: envelope } }).problems;
@@ -195,6 +207,11 @@ describe('connection identities', () => {
     // A file holding more than one item keeps the others.
     expect(served.files[2].content).toContain('views:');
     expect(served.files.slice(3)).toEqual(files.slice(3));
+    // Never another cube's alias: one taken is passed by a longer one.
+    const taken = aliasIn(served.files[0].content)!;
+    const clash = withIdentityAliases([...files, { path: 'other.yml', content: `cubes:\n  - name: other\n    sql_alias: ${taken}\n    sql_table: t\n` }], new Map([['fa__warehouse', 'id1']]));
+    expect(aliasIn(clash.files[0].content)).not.toBe(taken);
+    expect(aliasIn(clash.files[0].content)!.startsWith(taken)).toBe(true);
     // Another identity: other aliases. None: the files as they are.
     const moved = withIdentityAliases(files, new Map([['fa__warehouse', 'id2']]));
     expect(aliasIn(moved.files[0].content)).not.toBe(aliasIn(served.files[0].content));
