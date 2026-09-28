@@ -480,8 +480,11 @@ Pool sizes and timeouts still come from the environment.
       model reports `failed` (`GET …/revision`). A request pinned to an epoch
       no longer served answers `503`, to be sent again.
     - **Epochs share their model's rollup schema,** so an orchestrator of an
-      epoch no longer served drops none of its tables: the current one's
-      clean-up clears what the old one leaves.
+      epoch no longer served drops none of its tables. The current one's
+      clean-up treats them as Cube treats a removed rollup's: it keeps the
+      newest table of each name, unless `CUBEJS_DROP_PRE_AGG_WITHOUT_TOUCH`
+      is on, which drops those not used for a while. So a connection moved
+      back to its base usually finds its cubes' tables still there.
     - **Rollups are built again** from the new target by the refresh worker.
       Until one is, a query that would use it answers Cube's "No
       pre-aggregation partitions were built yet", as after any publish that
