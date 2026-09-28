@@ -273,9 +273,10 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
     const nobody = userToken(['nobody']);
     expect(await metaNames(nobody)).toEqual([]);
     expect(await metaNames(userToken([]))).toEqual([]);
+    // Refused plainly, naming the folder the groups don't reach (a Preview as groups says so).
     const refused = await load(nobody, 'fa__sales.count');
-    expect(refused.status).not.toBe(200);
-    expect(JSON.stringify(refused.body)).toMatch(/hidden member|fa__sales/);
+    expect({ status: refused.status, error: refused.body.error })
+      .toEqual({ status: 403, error: 'None of these groups reaches folder fa (fa__sales)' });
     const sql = await request(server).get('/cubejs-api/v1/sql')
       .query({ query: JSON.stringify({ measures: ['fa__sales.count'] }) })
       .set('Authorization', nobody)

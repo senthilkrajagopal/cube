@@ -1673,6 +1673,29 @@ export class XcubeRuntime {
   protected readonly retiredOverlayConnections = new Set<string>();
 
   /**
+   * The first cube or view a query names whose folder the gate keeps these
+   * groups out of, for a refusal that says so (Cube's own is a hidden member,
+   * answered 500). Nothing while the model's security is off.
+   */
+  public refusedFolder(query: unknown, context: any, groups: string[]): { cube: string; folderId: string } | undefined {
+    const model = this.modelOfContext(context);
+    const permissions = model === undefined ? undefined : this.permissions.get(model);
+    if (!permissions?.security) {
+      return undefined;
+    }
+    const reach = new Set(groups);
+    for (const cube of cubesOfQuery(query)) {
+      // A full name's folder is what precedes its `__`; a root item's name has none.
+      const separator = cube.indexOf('__');
+      const folderId = separator === -1 ? ROOT : cube.slice(0, separator);
+      if (!admits(permissions, folderId, reach)) {
+        return { cube, folderId };
+      }
+    }
+    return undefined;
+  }
+
+  /**
    * The overlay version a preview request is pinned to, when it brings data
    * sources. Its previews get an orchestrator of their own: their own
    * drivers, queues and result cache, which Cube keys by the SQL alone.

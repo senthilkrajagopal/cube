@@ -273,6 +273,11 @@ policies still apply within:
   on a descendant, plus its Super-Admin group). With **security off** (the
   default) every folder admits everyone, and only the model's own policies
   apply.
+- **A query into a folder the groups don't reach** is refused before Cube
+  runs it: `403`, `{ "error": "None of these groups reaches folder <folderId>
+  (<cube>)" }`, naming the first such cube or view. Cube's own refusal would
+  be a hidden member, answered `500`. `/v1/meta` leaves the folder's items
+  out, as before.
 - A denied context doesn't see the item in `/v1/meta`. `/v1/load` refuses it
   (Cube's `500 You requested hidden member`), and `/v1/sql` answers its SQL
   with `1 = 0`.

@@ -111,8 +111,34 @@ export class XcubeApiGateway extends ApiGateway {
     options: ApiGatewayOptions,
     protected readonly introspectionFor: IntrospectionFactory,
     protected readonly xcubeRuntime: () => XcubeRuntime | undefined = () => undefined,
+    protected readonly groupsOf: (context: RequestContext) => Promise<string[]> = async () => [],
   ) {
     super(apiSecret, compilerApi, adapterApi, logger, options);
+  }
+
+  /**
+   * A query naming a cube or view in a folder the context's groups don't
+   * reach is refused plainly, naming the folder (403), before Cube's own
+   * refusal: a hidden member, answered 500.
+   */
+  protected override async getNormalizedQueries(
+    inputQuery: Parameters<ApiGateway['getNormalizedQueries']>[0],
+    context: RequestContext,
+    persistent = false,
+    memberExpressions = false,
+    cacheMode?: Parameters<ApiGateway['getNormalizedQueries']>[4],
+  ) {
+    const runtime = this.xcubeRuntime();
+    if (runtime?.serving) {
+      const groups = await this.groupsOf(context);
+      for (const query of Array.isArray(inputQuery) ? inputQuery : [inputQuery]) {
+        const refused = runtime.refusedFolder(query, context, groups);
+        if (refused) {
+          throw new CubejsHandlerError(403, 'Forbidden', `None of these groups reaches folder ${refused.folderId} (${refused.cube})`);
+        }
+      }
+    }
+    return super.getNormalizedQueries(inputQuery, context, persistent, memberExpressions, cacheMode);
   }
 
   public override initApp(app: ExpressApplication) {

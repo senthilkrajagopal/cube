@@ -150,6 +150,11 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
       options,
       (orchestratorApi, dataSource, requestId) => this.introspectionFor(orchestratorApi, dataSource, requestId),
       () => this.xcube,
+      // The groups the folder gate reads, as the compiler API gets them.
+      async (context: any) => {
+        const groups = this.options.contextToGroups ? await this.options.contextToGroups(context) : context?.securityContext?.groups;
+        return Array.isArray(groups) ? groups : [];
+      },
     );
   }
 
