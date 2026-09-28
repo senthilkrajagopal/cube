@@ -131,7 +131,16 @@ export class XcubeApiGateway extends ApiGateway {
     const runtime = this.xcubeRuntime();
     if (runtime?.serving) {
       const groups = await this.groupsOf(context);
-      for (const query of Array.isArray(inputQuery) ? inputQuery : [inputQuery]) {
+      // GET /v1/sql and /v1/dry-run hand the query on as the string they were given.
+      let parsed: unknown = inputQuery;
+      if (typeof inputQuery === 'string') {
+        try {
+          parsed = JSON.parse(inputQuery);
+        } catch {
+          // Not JSON: Cube refuses it as it does.
+        }
+      }
+      for (const query of Array.isArray(parsed) ? parsed : [parsed]) {
         const refused = runtime.refusedFolder(query, context, groups);
         if (refused) {
           throw new CubejsHandlerError(403, 'Forbidden', `None of these groups reaches folder ${refused.folderId} (${refused.cube})`);

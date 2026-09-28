@@ -274,13 +274,11 @@ policies still apply within:
   default) every folder admits everyone, and only the model's own policies
   apply.
 - **A query into a folder the groups don't reach** is refused before Cube
-  runs it: `403`, `{ "error": "None of these groups reaches folder <folderId>
-  (<cube>)" }`, naming the first such cube or view. Cube's own refusal would
-  be a hidden member, answered `500`. `/v1/meta` leaves the folder's items
-  out, as before.
-- A denied context doesn't see the item in `/v1/meta`. `/v1/load` refuses it
-  (Cube's `500 You requested hidden member`), and `/v1/sql` answers its SQL
-  with `1 = 0`.
+  runs it, by `/v1/load`, `/v1/sql` and `/v1/dry-run` alike: `403`,
+  `{ "error": "None of these groups reaches folder <folderId> (<cube>)" }`,
+  naming the first such cube or view. Cube's own refusal would be a hidden
+  member, answered `500`, or SQL selecting nothing (`1 = 0`). `/v1/meta` leaves
+  the folder's items out.
 - Each item is gated by its own folder only. That is sound because a folder
   allows every group its children do, as the client works the sets out; with
   security on, xcube refuses groups that break it (`invalid_permissions`).

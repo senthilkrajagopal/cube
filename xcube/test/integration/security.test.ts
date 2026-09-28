@@ -269,7 +269,7 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
     expect(await metaNames(userToken(['g_ab']))).toEqual(['fa__sales', 'fab__v_sales', 'orders']);
   });
 
-  test('a token no folder admits sees nothing: not in /v1/meta, refused by /v1/load, 1 = 0 in /v1/sql', async () => {
+  test('a token no folder admits sees nothing: not in /v1/meta, refused by /v1/load, /v1/sql and /v1/dry-run', async () => {
     const nobody = userToken(['nobody']);
     expect(await metaNames(nobody)).toEqual([]);
     expect(await metaNames(userToken([]))).toEqual([]);
@@ -277,11 +277,24 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
     const refused = await load(nobody, 'fa__sales.count');
     expect({ status: refused.status, error: refused.body.error })
       .toEqual({ status: 403, error: 'None of these groups reaches folder fa (fa__sales)' });
-    const sql = await request(server).get('/cubejs-api/v1/sql')
+    // The SQL view of a Preview as groups: refused the same way, by GET as by POST.
+    for (const route of ['sql', 'dry-run']) {
+      const got = await request(server).get(`/cubejs-api/v1/${route}`)
+        .query({ query: JSON.stringify({ measures: ['fa__sales.count'] }) })
+        .set('Authorization', nobody);
+      expect({ route, status: got.status, error: got.body.error })
+        .toEqual({ route, status: 403, error: 'None of these groups reaches folder fa (fa__sales)' });
+    }
+    const posted = await request(server).post('/cubejs-api/v1/sql')
+      .send({ query: { measures: ['fa__sales.count'] } })
+      .set('Authorization', nobody);
+    expect(posted.status).toBe(403);
+    // A group it reaches still gets the SQL.
+    const allowed = await request(server).get('/cubejs-api/v1/sql')
       .query({ query: JSON.stringify({ measures: ['fa__sales.count'] }) })
-      .set('Authorization', nobody)
+      .set('Authorization', userToken(['g_ab']))
       .expect(200);
-    expect(sql.body.sql.sql[0]).toMatch(/1 = 0/);
+    expect(allowed.body.sql.sql[0]).not.toMatch(/1 = 0/);
   });
 
   test('a view in /A/B is closed to a group admitted to /A but not /A/B, though the /A cube is open to it', async () => {
