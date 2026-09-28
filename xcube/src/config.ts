@@ -27,14 +27,18 @@ export interface XcubeConfigOptions {
   overlayClaim?: string;
 }
 
+/** How every rollup schema of a model ends (`modelSchema`): what tells its tables from another model's. */
+export function modelSchemaSuffix(model: string): string {
+  return `_${crypto.createHash('sha256').update(model).digest('hex').slice(0, 12)}`;
+}
+
 /**
  * A model's own pre-aggregation schema: `<base>_<model>_<hash>`, the hash of
  * the model id as it is, so two models never share one (`a-b` and `a_b`),
  * within Postgres's 63 bytes.
  */
 export function modelSchema(base: string, model: string): string {
-  const hash = crypto.createHash('sha256').update(model).digest('hex').slice(0, 12);
-  return `${base.slice(0, 29)}_${model.replace(/[^a-z0-9_]/g, '_').slice(0, 20)}_${hash}`;
+  return `${base.slice(0, 29)}_${model.replace(/[^a-z0-9_]/g, '_').slice(0, 20)}${modelSchemaSuffix(model)}`;
 }
 
 /**

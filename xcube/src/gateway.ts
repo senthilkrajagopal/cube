@@ -39,7 +39,9 @@ import {
   pageOfTables,
 } from './requests';
 import type { DataSourceDescription, DataSourceIntrospectionApi } from './types';
+import { PreAggregations } from '@cubejs-backend/query-orchestrator';
 import { initAdminRoutes } from './admin/routes';
+import { modelSchemaSuffix } from './config';
 import { Connections } from './connections/connections';
 import { MODULE_KEY, type XcubeRuntime } from './runtime/runtime';
 import { ROLE_KEY } from './security/verifier';
@@ -49,6 +51,48 @@ function uuidOf(text: string): string {
   const h = crypto.createHash('sha256').update(text, 'utf8').digest('hex');
   const variant = '89ab'[parseInt(h[16], 16) % 4];
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-${variant}${h.slice(17, 20)}-${h.slice(20, 32)}`;
+}
+
+/**
+ * Every cube of a meta config, and every member, each marked `public` as
+ * Cube shows it (a cube set `public: false` hides every member): what the
+ * admin meta gives with `hidden=true`, so a reader of the whole model (a
+ * rollup's schedule) finds the cubes a user's `/v1/meta` never lists.
+ */
+function allMembersOf(cubes: any[]): any[] {
+  const marked = (cubeVisible: boolean) => (item: any) => ({ ...item, public: cubeVisible && item.isVisible !== false });
+  return cubes.map(({ config }) => {
+    const visible = config.isVisible !== false;
+    return {
+      ...config,
+      public: visible,
+      measures: config.measures?.map(marked(visible)),
+      dimensions: config.dimensions?.map(marked(visible)),
+      segments: config.segments?.map(marked(visible)),
+    };
+  });
+}
+
+/** An entry of a model's pre-aggregation build queue (`XcubeApiGateway.ownQueue`). */
+export interface QueueEntry {
+  /** What cancels it. */
+  key: string;
+  dataSource: string;
+  /** The published name, `cube.preAggregation`. */
+  preAggregation: string | null;
+  /** The table, a partition's for a partitioned rollup, `schema.table`. */
+  table: string;
+  /** The version of it the build writes. */
+  targetTable: string | null;
+  partition: { start: string | null; end: string | null } | null;
+  status: 'queued' | 'processing';
+  /** Cube found it stalled or orphaned: it goes at the queue's next reconcile. */
+  stalled: boolean;
+  addedAt: string | null;
+  requestId: string | null;
+  startedBy: 'scheduler' | 'jobs' | 'query';
+  /** The jobs request's token for it, when one asked for it. */
+  job: string | null;
 }
 
 /**
@@ -176,6 +220,8 @@ export class XcubeApiGateway extends ApiGateway {
       initAdminRoutes(app, this.basePath, runtime, (type, params) => this.log({ type, ...params }), {
         meta: (model, extended, options) => this.ownMeta(model, extended, options),
         partitions: (model, query) => this.ownPartitions(model, query),
+        queue: (model) => this.ownQueue(model),
+        cancel: (model, keys, processing) => this.ownCancel(model, keys, processing),
       });
       // Before Cube's jobs route: each job's context names the module its pre-aggregations are in.
       app.post(`${this.basePath}/v1/pre-aggregations/jobs`, (req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
@@ -185,6 +231,7 @@ export class XcubeApiGateway extends ApiGateway {
           return;
         }
         this.fanOutJobs(runtime, req.body);
+        this.recordJobTokens(runtime, req, res);
         next();
       });
     }
@@ -230,6 +277,126 @@ export class XcubeApiGateway extends ApiGateway {
         ? modules.map((id) => ({ ...context, securityContext: { ...context.securityContext, [MODULE_KEY]: id } }))
         : [context];
     });
+  }
+
+  /**
+   * The tokens a jobs `post` answers are recorded by the version of a table
+   * each builds, for the build queue to name them: read from Cube's own job
+   * records, once the answer is on its way. Never in its way.
+   */
+  protected recordJobTokens(runtime: XcubeRuntime, req: ExpressRequest, res: ExpressResponse) {
+    const contexts = req.body?.action === 'post' ? req.body?.selector?.contexts : undefined;
+    if (!runtime.serving || !Array.isArray(contexts)) {
+      return;
+    }
+    const { modelClaim } = runtime.servingOptions;
+    const models = [...new Set(contexts.map((c: any) => c?.securityContext?.[modelClaim]).filter((m: unknown): m is string => typeof m === 'string'))];
+    if (!models.length) {
+      return;
+    }
+    const json = res.json.bind(res);
+    res.json = (body: any) => {
+      if (res.statusCode < 400 && Array.isArray(body) && body.length) {
+        this.recordJobs(runtime, models, body.filter((t: unknown): t is string => typeof t === 'string')).catch((e: any) => {
+          this.log({ type: 'xcube: a jobs request\'s tokens could not be recorded', error: e?.message ?? String(e) } as any);
+        });
+      }
+      return json(body);
+    };
+  }
+
+  protected async recordJobs(runtime: XcubeRuntime, models: string[], tokens: string[]) {
+    const { modelClaim } = runtime.servingOptions;
+    const found: { model: string; token: string; requestId: string | null; targetTable: string }[] = [];
+    for (const model of models) {
+      const jobs = await this.refreshScheduler().getCachedBuildJobs(await runtime.adminContext(model), tokens);
+      for (const { job, token } of jobs) {
+        if (job?.target && job.context?.securityContext?.[modelClaim] === model) {
+          found.push({ model, token, requestId: job.request ?? null, targetTable: job.target });
+        }
+      }
+    }
+    await runtime.recordBuildJobs(found);
+  }
+
+  /**
+   * A model's pre-aggregation build queue in its served epoch: of each data
+   * source it is served over, the builds in its rollup schema (a model
+   * without connections shares its orchestrator with others), as Cube's
+   * `/cubejs-system/v1/pre-aggregations/queue` lists them (not served under
+   * xcube: it takes the playground secret), each naming its pre-aggregation.
+   */
+  public async ownQueue(model: string): Promise<QueueEntry[]> {
+    const runtime = this.xcubeRuntime()!;
+    const orchestratorApi = await this.getAdapterApi(await runtime.adminContext(model) as RequestContext);
+    const suffix = modelSchemaSuffix(model);
+    const entries: QueueEntry[] = [];
+    for (const dataSource of await runtime.dataSourcesServing(model)) {
+      const queued: any[] = await orchestratorApi.getPreAggregationQueueStates(dataSource);
+      for (const item of queued) {
+        const query = item?.query ?? {};
+        const version = query.newVersionEntry;
+        const table: string | undefined = version?.table_name ?? query.preAggregation?.tableName;
+        if (typeof table === 'string' && table.split('.')[0].endsWith(suffix)) {
+          const statuses: string[] = Array.isArray(item.status) ? item.status : [];
+          const requestId: string | null = item.requestId ?? query.requestId ?? null;
+          const partitioned = Boolean(query.preAggregation?.partitionGranularity);
+          let startedBy: QueueEntry['startedBy'] = query.isJob ? 'jobs' : 'query';
+          if (requestId?.startsWith('scheduler-')) {
+            startedBy = 'scheduler';
+          }
+          entries.push({
+            key: item.queryKey,
+            dataSource,
+            preAggregation: query.preAggregation?.preAggregationId ?? null,
+            table,
+            targetTable: version ? PreAggregations.targetTableName(version) : null,
+            partition: partitioned ? { start: query.preAggregation.buildRangeStart ?? null, end: query.preAggregation.buildRangeEnd ?? null } : null,
+            status: statuses.includes('active') ? 'processing' : 'queued',
+            stalled: statuses.includes('stalled') || statuses.includes('orphaned'),
+            addedAt: typeof item.addedToQueueTime === 'number' ? new Date(item.addedToQueueTime).toISOString() : null,
+            requestId,
+            startedBy,
+            job: null,
+          });
+        }
+      }
+    }
+    // The jobs requests' tokens, by the version each asked for: its own request's first.
+    const jobs = await runtime.buildJobsFor(model, [...new Set(entries.map((e) => e.targetTable).filter((t): t is string => t !== null))]);
+    for (const entry of entries) {
+      const asked = entry.targetTable ? jobs.get(entry.targetTable) ?? [] : [];
+      entry.job = (asked.find((j) => j.requestId === entry.requestId) ?? asked[0])?.token ?? null;
+    }
+    return entries.sort((a, b) => (a.addedAt ?? '').localeCompare(b.addedAt ?? ''));
+  }
+
+  /**
+   * Cancels entries of a model's build queue, by key: a queued one, and a
+   * processing one only with `processing` (its instance stops it at its next
+   * heartbeat). Says why any wasn't: processing, or already gone.
+   */
+  public async ownCancel(model: string, keys: string[], processing: boolean): Promise<{
+    cancelled: { key: string; preAggregation: string | null; status: 'queued' | 'processing' }[];
+    notCancelled: { key: string; reason: 'processing' | 'gone' }[];
+  }> {
+    const runtime = this.xcubeRuntime()!;
+    const orchestratorApi = await this.getAdapterApi(await runtime.adminContext(model) as RequestContext);
+    const entries = new Map((await this.ownQueue(model)).map((entry) => [entry.key, entry]));
+    const cancelled: { key: string; preAggregation: string | null; status: 'queued' | 'processing' }[] = [];
+    const notCancelled: { key: string; reason: 'processing' | 'gone' }[] = [];
+    for (const key of [...new Set(keys)]) {
+      const entry = entries.get(key);
+      if (!entry) {
+        notCancelled.push({ key, reason: 'gone' });
+      } else if (entry.status === 'processing' && !processing) {
+        notCancelled.push({ key, reason: 'processing' });
+      } else {
+        await orchestratorApi.cancelPreAggregationQueriesFromQueue([key], entry.dataSource);
+        cancelled.push({ key, preAggregation: entry.preAggregation, status: entry.status });
+      }
+    }
+    return { cancelled, notCancelled };
   }
 
   /** `/v1/meta` of a model served in modules: every module's own answer, merged. */
@@ -467,10 +634,10 @@ export class XcubeApiGateway extends ApiGateway {
   public async ownMeta(
     model: string,
     extended: boolean,
-    least: { revision?: number; res?: any } = {},
+    least: { revision?: number; res?: any; hidden?: boolean } = {},
   ): Promise<{ status: number; body: any }> {
     const runtime = this.xcubeRuntime()!;
-    const context: any = await runtime.adminContext(model, least);
+    const context: any = await runtime.adminContext(model, { revision: least.revision, res: least.res });
     const modules = runtime.metaModules(context) ?? ['all'];
     let answer: { status: number; body: any } = { status: 500, body: null };
     await this.mergedMeta(modules, context, (body, options) => {
@@ -484,7 +651,7 @@ export class XcubeApiGateway extends ApiGateway {
         skipVisibilityPatch: true,
       });
       const configs = extended ? metaConfig : metaConfig.cubes;
-      const visible = publicMembersOf(configs);
+      const visible = least.hidden ? allMembersOf(configs) : publicMembersOf(configs);
       if (!extended) {
         res({
           cubes: visible,

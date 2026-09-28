@@ -271,6 +271,41 @@ export const MIGRATIONS: Migration[] = [
       ALTER TABLE ${s}.connection_bases ADD COLUMN target text;
     `,
   },
+  {
+    version: 10,
+    name: 'build jobs and refresh ticks',
+    // Additive: older code neither writes nor reads them.
+    minReader: 2,
+    sql: (s) => `
+      -- The builds a jobs request asked for, by the version of a table each
+      -- builds: what names a queued build's job token.
+      CREATE TABLE ${s}.build_jobs (
+        model        text        NOT NULL,
+        token        text        NOT NULL,
+        request_id   text,
+        target_table text        NOT NULL,
+        posted_at    timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (model, token)
+      );
+      CREATE INDEX build_jobs_target_idx ON ${s}.build_jobs (model, target_table);
+
+      -- Each refresh worker's last run of each module of a model: the
+      -- revision it refreshed, when, and its last error.
+      CREATE TABLE ${s}.refresh_ticks (
+        model         text        NOT NULL,
+        instance      text        NOT NULL,
+        module        text        NOT NULL,
+        revision      integer     NOT NULL,
+        served_key    text        NOT NULL,
+        last_tick_at  timestamptz NOT NULL,
+        last_finished boolean     NOT NULL,
+        last_ok_at    timestamptz,
+        last_error    text,
+        last_error_at timestamptz,
+        PRIMARY KEY (model, instance, module)
+      );
+    `,
+  },
 ];
 
 /** The newest schema version this code knows. */

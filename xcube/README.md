@@ -806,6 +806,73 @@ It reads the active revision: each module owning a named pre-aggregation is
 asked, or every module when none is named, and a shared cube's rollups appear
 once.
 
+#### `GET …/pre-aggregations/queue`
+
+The model's pre-aggregation builds queued or running, in its served epoch, as
+Cube's `/cubejs-system/v1/pre-aggregations/queue` lists them (not served under
+xcube: it takes the playground secret), of every data source the model is
+served over, and only this model's (a model without connections shares its
+queue with others). Oldest first:
+
+```json
+{ "model": "dev", "queue": [{
+  "key": "8f1c…", "dataSource": "default", "preAggregation": "fsales__orders.main",
+  "table": "prod_pre_aggregations_dev_1fae2d16b59d.fsales__orders_main", "targetTable": "…_main_scuu2bvh_dqcpjtes_1kh3ft2",
+  "partition": null, "status": "processing", "stalled": false, "addedAt": "2026-09-28T18:57:42.564Z",
+  "requestId": "scheduler-…", "startedBy": "scheduler", "job": null
+}] }
+```
+
+- **`preAggregation`** is the published name, `cube.preAggregation`: a folder
+  cube's table has a hashed alias, so the name is what finds its folder.
+- **`partition`** is `{ start, end }` for a partitioned rollup.
+- **`status`** is `queued` or `processing`. **`stalled`**: Cube found it stalled
+  or orphaned, and removes it at its queue's next reconcile.
+- **`startedBy`**: `scheduler` (the refresh worker, `requestId` `scheduler-…`),
+  `jobs` (the jobs API), or `query`. **`job`** is the jobs request's token
+  for it: xcube records each `post`'s tokens by the version of a table each
+  builds.
+- With Cube Store as the queue (production), every instance's builds; with
+  the memory queue, this instance's.
+
+#### `POST …/pre-aggregations/queue/cancel`
+
+`{ "keys": [...], "processing": false }` cancels entries of the model's queue:
+`{ "cancelled": [{ key, preAggregation, status }], "notCancelled": [{ key, reason }] }`,
+`reason` being `processing` or `gone`.
+- A queued entry is taken out of the queue.
+- A processing one only with `"processing": true`: it is taken out, and the
+  instance building it stops the build at its queue's next heartbeat (8 s).
+- **A build the refresh worker queued comes back.** The worker's next run
+  (every 30 s) finds the rollup still due, its refresh key unchanged, and
+  queues it again, under the same key: the key is the refresh key's value.
+  A jobs request's build doesn't come back.
+
+#### `GET …/refresh-worker`
+
+Each refresh worker's last run of each module of the model, as it recorded it
+(within 5 s of the run), and the model's current revision:
+
+```json
+{ "model": "dev", "revision": 12, "workers": [{
+  "instance": "worker-1/1/3dfa66", "revision": 12, "servedKey": "xcube:dev:12:…",
+  "lastTickAt": "…", "modules": [{
+    "module": "m1a2b3c4d5e", "revision": 12, "lastTickAt": "…", "finished": true,
+    "lastOkAt": "…", "lastError": null
+  }]
+}] }
+```
+
+- **`finished`**: the last run ended, rather than stopped waiting on builds
+  still running, which the next run waits on.
+- **`lastError`** `{ message, at }` is the last run that failed (Cube's
+  `Refresh Scheduler Error`: a compile, or a refresh key's query); the module
+  recovered if `lastOkAt` is later. A rollup whose build fails isn't a failed
+  run: Cube backs that rollup off and carries on.
+- Modules of a revision the worker has moved past aren't listed. A worker
+  that stopped is listed for a day, with its `lastTickAt`; each restart is
+  another `instance`. `module` is `all` for a model served whole.
+
 #### `PUT …/connections/{name}`
 
 Stores a model's data source:
@@ -880,8 +947,10 @@ The model's field list for the client's own reads (jobs, schedules):
 - with `?extended=true`, as `/v1/meta?extended` answers;
 - but filtered by no one's policies, as it asks for no one.
 
-Its public members only. `403`/`503` as queries for an unknown or not yet
-loaded model.
+Its public members only, unless `?hidden=true`: then every cube and member,
+a cube set `public: false` too, each marked `"public": true` or `false`, so a
+reader of the whole model (every rollup's schedule) finds them all. `403`/`503`
+as queries for an unknown or not yet loaded model.
 
 - **Read-your-writes.** `?revision=<n>` answers from that revision or a newer
   one. The instance waits for it as it does for a user token naming it

@@ -36,6 +36,7 @@ import { CredentialError, CredentialKeys, type SealedV1 } from '../credentials/c
 import { DRIVERS, isDriverType } from '../connections/drivers';
 import { dataSourcesOf, epochOf, targetOf, withIdentityAliases } from '../connections/aliases';
 import { createListenClient, createPool, type Logger } from '../store/db';
+import { PgOpsStore, type RefreshTick } from '../store/ops';
 import { migrate } from '../store/migrate';
 import {
   channelOf,
@@ -172,6 +173,16 @@ export interface ServedRevision {
    * and their drivers must be of it.
    */
   identities: ReadonlyMap<string, string>;
+}
+
+/** How soon refresh runs noted are written. */
+const TICK_WRITE_MS = 5000;
+
+/** An error's message, as a run's status shows it: its first line, not too long. */
+export function errorLine(error: unknown): string {
+  const text = String((error as any)?.error ?? (error as any)?.message ?? error);
+  const [first] = text.split('\n');
+  return first.length > 1000 ? `${first.slice(0, 1000)}…` : first;
 }
 
 export function appIdOf(head: ModelHead): string {
@@ -455,6 +466,9 @@ export class XcubeRuntime {
 
   protected store: RevisionStore | null;
 
+  /** Jobs requests' tokens and refresh workers' runs; none without xcube's own database. */
+  protected ops: PgOpsStore | null = null;
+
   protected listener: RevisionListener | null = null;
 
   protected options: ServingOptions | null = null;
@@ -621,6 +635,7 @@ export class XcubeRuntime {
         }
       }
       this.store = new PgRevisionStore(this.pool, { schema: settings.schema, keepRevisions: settings.keepRevisions });
+      this.ops = new PgOpsStore(this.pool, settings.schema);
     }
 
     const listenClient = this.deps.listenClient === undefined
@@ -665,6 +680,11 @@ export class XcubeRuntime {
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
     }
+    if (this.tickTimer) {
+      clearTimeout(this.tickTimer);
+      this.tickTimer = undefined;
+    }
+    await this.writeTicks();
     await this.listener?.stop();
     await this.pool?.end().catch(() => undefined);
   }
@@ -2178,6 +2198,102 @@ export class XcubeRuntime {
         xcubePin: pin,
       }));
     });
+  }
+
+  /** Refresh runs ended here and not yet written, by `<model>/<module>`. */
+  protected readonly ticks = new Map<string, RefreshTick>();
+
+  protected tickTimer?: NodeJS.Timeout;
+
+  /**
+   * Notes how a refresh run of one of `refreshContexts` ended, for
+   * `GET …/refresh-worker`: written within a few seconds, with the module's
+   * last success and last error. Never throws: it is on the worker's path.
+   */
+  public noteRefreshRun(context: any, finished: boolean, error?: unknown) {
+    try {
+      const revision = this.revisionOfContext(context);
+      if (!revision || !this.ops || revision.overlay) {
+        return;
+      }
+      const module = String(context?.securityContext?.[MODULE_KEY] ?? context?.authInfo?.[MODULE_KEY] ?? 'all');
+      const key = `${revision.model}/${module}`;
+      const at = new Date();
+      const prior = this.ticks.get(key);
+      const message = error === undefined ? null : errorLine(error);
+      this.ticks.set(key, {
+        model: revision.model,
+        instance: this.instanceId,
+        module,
+        revision: revision.revision,
+        servedKey: revision.key,
+        at,
+        finished,
+        okAt: message === null ? at : prior?.okAt ?? null,
+        error: message ?? prior?.error ?? null,
+        errorAt: message === null ? prior?.errorAt ?? null : at,
+      });
+      if (!this.tickTimer && !this.stopped) {
+        this.tickTimer = setTimeout(() => {
+          this.tickTimer = undefined;
+          this.writeTicks().catch(() => undefined);
+        }, TICK_WRITE_MS);
+        this.tickTimer.unref?.();
+      }
+    } catch {
+      // A status is never worth a refresh run.
+    }
+  }
+
+  /** Writes the refresh runs noted since the last write; kept for the next if the database is down. */
+  protected async writeTicks() {
+    const ticks = [...this.ticks.values()];
+    if (!ticks.length || !this.ops) {
+      return;
+    }
+    this.ticks.clear();
+    try {
+      await this.ops.recordTicks(ticks);
+    } catch (e: any) {
+      ticks.forEach((tick) => {
+        const key = `${tick.model}/${tick.module}`;
+        if (!this.ticks.has(key)) {
+          this.ticks.set(key, tick);
+        }
+      });
+      this.warn('xcube: refresh runs could not be recorded', { error: e?.message ?? String(e) });
+    }
+  }
+
+  /** Each refresh worker's last runs of a model, and the revision the model is at. */
+  public async refreshWorkers(model: string) {
+    if (!this.ops) {
+      throw new CubejsHandlerError(404, 'Not Found', 'Refresh runs are recorded only with xcube\'s database');
+    }
+    return this.ops.refreshWorkers(model);
+  }
+
+  /** The data sources a model is served over: `default`, its connections', and those its cubes name. */
+  public async dataSourcesServing(model: string): Promise<string[]> {
+    const names = new Set<string>(['default']);
+    if (this.store) {
+      (await this.connections.of(model)).forEach((_connection, name) => names.add(name));
+    }
+    const active = this.models.get(model)?.active;
+    if (active) {
+      dataSourcesOf(active.data.files).forEach((name) => names.add(name));
+    }
+    return [...names].sort();
+  }
+
+  /** Records a jobs request's tokens by the table version each builds, for the queue to name them. */
+  public async recordBuildJobs(jobs: { model: string; token: string; requestId: string | null; targetTable: string }[]) {
+    await this.ops?.recordJobs(jobs);
+  }
+
+  /** The jobs requests' tokens for versions of tables of a model: `<target table>` → the newest first. */
+  public async buildJobsFor(model: string, targets: string[]) {
+    return this.ops ? this.ops.jobsFor(model, targets) : new Map<string, { token: string; requestId: string | null }[]>();
   }
 
   /** The module a query is served from, as a context key, when the revision has several. */

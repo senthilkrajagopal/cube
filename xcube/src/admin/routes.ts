@@ -28,6 +28,7 @@ import {
 import { ConnectionError } from '../connections/connections';
 import { CredentialError } from '../credentials/credentials';
 import { MODEL_ID, SnapshotError } from '../model/snapshot';
+import type { QueueEntry } from '../gateway';
 import { adminAuth } from './auth';
 
 const file = Joi.object({
@@ -45,6 +46,12 @@ function jsonObject(maxBytes: number) {
         : value
     ));
 }
+
+const cancelSchema = Joi.object({
+  keys: Joi.array().items(Joi.string().min(1).max(512)).min(1).max(1000)
+    .required(),
+  processing: Joi.boolean().default(false),
+});
 
 const importSchema = Joi.object({
   baseRevision: Joi.number()
@@ -263,9 +270,13 @@ export interface AdminReads {
    * A model's field list, unfiltered, merged across modules (`extended`: as
    * `/v1/meta?extended`); with `revision`, from that revision or a newer.
    */
-  meta(model: string, extended: boolean, options?: { revision?: number; res?: any }): Promise<{ status: number; body: any }>;
+  meta(model: string, extended: boolean, options?: { revision?: number; res?: any; hidden?: boolean }): Promise<{ status: number; body: any }>;
   /** A model's pre-aggregation partitions and their build state, as Cube's system route answers. */
   partitions(model: string, query: any): Promise<{ status: number; body: any }>;
+  /** A model's pre-aggregation build queue, in its served epoch. */
+  queue(model: string): Promise<QueueEntry[]>;
+  /** Cancels entries of a model's build queue by key; processing ones only with `processing`. */
+  cancel(model: string, keys: string[], processing: boolean): Promise<{ cancelled: any[]; notCancelled: any[] }>;
 }
 
 export function initAdminRoutes(
@@ -341,6 +352,15 @@ export function initAdminRoutes(
         res.status(status).json(body);
       }
     });
+  };
+
+  // A model xcube holds, or 404.
+  const requireModel = async (model: string) => {
+    const status = await runtime.status(model);
+    if (!status) {
+      throw new AdminError(404, 'unknown_model', `Unknown model "${model}"`);
+    }
+    return status;
   };
 
   app.get(`${base}/revision`, auth, handle('revision', async (req, res) => {
@@ -485,6 +505,9 @@ export function initAdminRoutes(
     if (req.query.extended !== undefined && req.query.extended !== 'true' && req.query.extended !== 'false') {
       throw new AdminError(400, 'bad_request', 'extended is true or false');
     }
+    if (req.query.hidden !== undefined && req.query.hidden !== 'true' && req.query.hidden !== 'false') {
+      throw new AdminError(400, 'bad_request', 'hidden is true or false');
+    }
     const least = req.query.revision;
     if (least !== undefined && (typeof least !== 'string' || !/^[1-9]\d{0,9}$/.test(least))) {
       throw new AdminError(400, 'bad_request', 'revision is a revision number');
@@ -492,8 +515,39 @@ export function initAdminRoutes(
     const { status, body } = await reads.meta(model, req.query.extended === 'true', {
       revision: least === undefined ? undefined : Number(least),
       res,
+      hidden: req.query.hidden === 'true',
     });
     res.status(status).json(body);
+  }));
+
+  app.get(`${base}/pre-aggregations/queue`, auth, handle('queue', async (req, res) => {
+    const model = modelOf(req);
+    if (!reads) {
+      throw new AdminError(404, 'not_found', 'Not served here');
+    }
+    await requireModel(model);
+    res.json({ model, queue: await reads.queue(model) });
+  }));
+
+  app.post(`${base}/pre-aggregations/queue/cancel`, auth, json, handle('queue-cancel', async (req, res) => {
+    const model = modelOf(req);
+    if (!reads) {
+      throw new AdminError(404, 'not_found', 'Not served here');
+    }
+    const body = valid<{ keys: string[]; processing?: boolean }>(cancelSchema, req.body);
+    await requireModel(model);
+    const result = await reads.cancel(model, body.keys, body.processing === true);
+    logger('xcube: queued builds cancelled', {
+      model, cancelled: result.cancelled.length, notCancelled: result.notCancelled.length,
+    });
+    res.json({ model, ...result });
+  }));
+
+  app.get(`${base}/refresh-worker`, auth, handle('refresh-worker', async (req, res) => {
+    const model = modelOf(req);
+    const status = await requireModel(model);
+    const workers = await runtime.refreshWorkers(model);
+    res.json({ model, revision: status.current?.revision ?? null, workers });
   }));
 
   app.post(`${base}/changesets`, auth, json, handle('changesets', async (req, res) => {

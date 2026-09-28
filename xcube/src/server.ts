@@ -224,17 +224,33 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
     this.compilerCache.delete(appId);
   }
 
-  /** A refresh run keeps the compiled model it started with, so its revision stays compiled until it ends. */
+  /**
+   * A refresh run keeps the compiled model it started with, so its revision
+   * stays compiled until it ends. How it ended is noted for the model's
+   * refresh-worker status: Cube is asked to throw its error, which it has
+   * logged as ever, and it is swallowed here as Cube would unless asked.
+   */
   public override async runScheduledRefresh(context: any, queryingOptions?: any) {
-    const revision = context && this.xcube?.serving ? this.xcube.revisionOfContext(context) : undefined;
-    if (!revision) {
+    const runtime = this.xcube;
+    const revision = context && runtime?.serving ? runtime.revisionOfContext(context) : undefined;
+    if (!runtime || !revision) {
       return super.runScheduledRefresh(context, queryingOptions);
     }
-    this.xcube!.hold(revision);
+    runtime.hold(revision);
     try {
-      return await super.runScheduledRefresh(context, queryingOptions);
+      const result: any = await super.runScheduledRefresh(context, { ...queryingOptions, throwErrors: true });
+      runtime.noteRefreshRun(context, Boolean(result?.finished));
+      return result;
+    } catch (e: any) {
+      // Builds still running when the run stopped waiting: the next run waits on them.
+      const waiting = e?.error === 'Continue wait';
+      runtime.noteRefreshRun(context, false, waiting ? undefined : e);
+      if (queryingOptions?.throwErrors) {
+        throw e;
+      }
+      return { finished: false };
     } finally {
-      this.xcube!.release(revision);
+      runtime.release(revision);
     }
   }
 }
