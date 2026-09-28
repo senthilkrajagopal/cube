@@ -259,6 +259,18 @@ export const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    version: 9,
+    name: 'connection base targets',
+    // Additive: older code reads and writes the columns it names.
+    minReader: 2,
+    sql: (s) => `
+      -- Where a base reaches, in the form Cube's environment is compared in
+      -- (host, port, database and user, for Postgres, Redshift and MySQL):
+      -- the environment reaching it serves the data source at its base.
+      ALTER TABLE ${s}.connection_bases ADD COLUMN target text;
+    `,
+  },
 ];
 
 /** The newest schema version this code knows. */

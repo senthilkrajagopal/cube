@@ -105,6 +105,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
+      - name: Labels
+        id: labels
+        run: |
+          cube="$(node -p "require('./xcube/package.json').peerDependencies['@cubejs-backend/server-core']")"
+          echo "version=v$cube-${GITHUB_SHA::10}" >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
       - name: Build
         uses: docker/build-push-action@v7
         with:
@@ -112,7 +118,10 @@ jobs:
           load: true
           push: false
           tags: xcube:ci
-          build-args: REVISION=${{ github.sha }}
+          build-args: |
+            REVISION=${{ github.sha }}
+            VERSION=${{ steps.labels.outputs.version }}
+            CREATED=${{ steps.labels.outputs.created }}
       - name: Boots as Cube does, introspection only, as the non-root user Helm runs it as
         run: |
           docker run -d --name xcube-ci --user 1000 \
@@ -161,7 +170,10 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.tags.outputs.tags }}
-          build-args: REVISION=${{ github.sha }}
+          build-args: |
+            REVISION=${{ github.sha }}
+            VERSION=${{ steps.labels.outputs.version }}
+            CREATED=${{ steps.labels.outputs.created }}
       - name: Name what was published
         if: steps.tags.outputs.tags
         env:

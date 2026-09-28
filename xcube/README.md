@@ -463,10 +463,14 @@ Pool sizes and timeouts still come from the environment.
       (AC-328). Only that target's rows are ever built into those tables.
     - **Cube's environment.** A data source cubes use with no connection,
       served by Cube's environment (`CUBEJS_DB_*`), has the environment's
-      target as its base. A connection later stored under its name keeps
-      the cubes' names only if it reaches the same place: the same host,
-      port, database and user, for Postgres, Redshift and MySQL. Otherwise,
-      and for other drivers or a `driverFactory` in cube.js, it is a move.
+      target as its base: in a model with connections, only `default`,
+      which alone may fall back to it. A connection later stored under its
+      name keeps the cubes' names only if it reaches the same place: the
+      same host, port, database and user, for Postgres, Redshift and MySQL.
+      Otherwise, and for other drivers or a `driverFactory` in cube.js, it
+      is a move. The other way, a base keeps where it reaches: once its
+      connection is dropped, the environment serving the data source is at
+      its base where it reaches the same place, and a move elsewhere.
     - **An epoch.** A revision is served over its connections' identities,
       its *epoch*: its key names it (`<app id>~<epoch>`), and its requests run
       on an orchestrator of that epoch alone. Each cube on a connection moved
@@ -485,12 +489,20 @@ Pool sizes and timeouts still come from the environment.
       can't be compiled over them, it stays served over the old ones and the
       model reports `failed` (`GET …/revision`). A request pinned to an epoch
       no longer served answers `503`, to be sent again.
+    - **An instance still switching:** a query of the old epoch that needs a
+      driver for a connection this instance has already read as changed, but
+      doesn't serve over yet, answers `503` with `Retry-After: 2` and
+      "Connection … changed to new settings on this instance; try again".
+      Sent again once the instance has switched, it is answered over the new
+      settings.
     - **Epochs share their model's rollup schema,** so an orchestrator of an
       epoch no longer served drops none of its tables. The current one's
-      clean-up treats them as Cube treats a removed rollup's: it keeps the
-      newest table of each name, unless `CUBEJS_DROP_PRE_AGG_WITHOUT_TOUCH`
-      is on, which drops those not used for a while. So a connection moved
-      back to its base usually finds its cubes' tables still there.
+      clean-up drops them: with Cube's default,
+      `CUBEJS_DROP_PRE_AGG_WITHOUT_TOUCH=true`, it keeps only the tables its
+      own orchestrator touched, once its refresh cycle has ended. So a
+      connection moved back to its base finds its cubes' tables gone, unless
+      it moved back before then, and they are built again. With `false`, Cube
+      keeps the newest table of each name, and they serve again at once.
     - **Rollups are built again** from the new target by the refresh worker.
       Until one is, a query that would use it answers Cube's "No
       pre-aggregation partitions were built yet", as after any publish that
@@ -505,9 +517,11 @@ Pool sizes and timeouts still come from the environment.
       before `c561077b94`, whose tables were built from its old target, keeps
       them until its refresh keys renew them.
     - **From an xcube that aliased every cube on a connection** (`c561077b94`
-      to `8d08fac20c`), cubes go back to their own names. Their tables from
-      before `c561077b94`, if kept, serve again; the others are built again.
-      Upgrade the refresh worker first, so they are built when the API
+      to `8d08fac20c`), cubes go back to their own names, and their rollups
+      are built again. Tables from before `c561077b94` are normally gone by
+      then, with Cube's default clean-up (above); with
+      `CUBEJS_DROP_PRE_AGG_WITHOUT_TOUCH=false` they may remain, and serve
+      again. Upgrade the refresh worker first, so they are built when the API
       instances look for them.
   - A removed connection's driver refuses calls, and serves again if the
     connection is pushed again.

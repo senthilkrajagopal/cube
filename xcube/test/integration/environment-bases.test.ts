@@ -124,7 +124,7 @@ describeWithDatabase('a data source served from Cube\'s environment, then from a
     await sql(`DROP SCHEMA IF EXISTS ${schema} CASCADE; DROP SCHEMA IF EXISTS ${warehouse} CASCADE;`).catch(() => undefined);
   });
 
-  const admin = (model: string, method: 'put' | 'get', route: string, body?: object) => {
+  const admin = (model: string, method: 'put' | 'get' | 'post' | 'delete', route: string, body?: object) => {
     const req = request(server)[method](`/cubejs-api/v1/semantic/models/${model}${route}`).set('Authorization', `Bearer ${ADMIN_TOKEN}`);
     return body ? req.send(body) : req;
   };
@@ -137,18 +137,19 @@ describeWithDatabase('a data source served from Cube\'s environment, then from a
     .query({ query: JSON.stringify({ dimensions: ['orders.id'], order: { 'orders.id': 'asc' } }) })
     .set('Authorization', token(model, revision))
     .expect(200)).body.data.map((row: any) => row['orders.id']);
+  const orders = {
+    folderId: 'froot',
+    name: 'orders',
+    kind: 'cube',
+    yaml: `cubes:\n  - name: orders\n    sql_table: ${warehouse}.orders\n    dimensions:\n      - name: id\n        sql: id\n        type: number\n        primary_key: true\n        public: true\n    measures:\n      - name: total\n        sql: amount\n        type: sum\n    pre_aggregations:\n      - name: by_all\n        measures:\n          - CUBE.total\n`,
+  };
   const publish = async (model: string) => (await admin(model, 'put', '/snapshot', {
     baseRevision: null,
     folders: [{ id: 'froot', parentId: null }],
-    items: [{
-      folderId: 'froot',
-      name: 'orders',
-      kind: 'cube',
-      yaml: `cubes:\n  - name: orders\n    sql_table: ${warehouse}.orders\n    dimensions:\n      - name: id\n        sql: id\n        type: number\n        primary_key: true\n        public: true\n    measures:\n      - name: total\n        sql: amount\n        type: sum\n    pre_aggregations:\n      - name: by_all\n        measures:\n          - CUBE.total\n`,
-    }],
+    items: [orders],
   }).expect(201)).body.revision as number;
   // Stores the model's `default`, then waits for it to be served over it.
-  const store = async (model: string, fields: object) => {
+  const store = async (model: string, fields: object, served = true) => {
     await admin(model, 'put', '/connections/default', {
       folderId: 'froot',
       driver: 'postgres',
@@ -157,6 +158,9 @@ describeWithDatabase('a data source served from Cube\'s environment, then from a
       sealed: { password: sealSecretV1(key.jwk.x, key.kid, 'postgres', 'password', fields as any, environment.CUBEJS_DB_PASS) },
       revisions: { password: 'r1' },
     }).expect(200);
+    if (!served) {
+      return;
+    }
     for (let i = 0; i < 100 && !runtime.servedKey(model)?.includes('~'); i++) {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
@@ -183,5 +187,32 @@ describeWithDatabase('a data source served from Cube\'s environment, then from a
     const after = await rollupOf('elsewhere', revision);
     expect(after).toBeTruthy();
     expect(after).not.toMatch(/\.orders_by_all/);
+  });
+
+  // Drops the model's `default` (its cube first, which uses it), then publishes the cube again, on the environment.
+  const toEnvironment = async (model: string, revision: number) => {
+    const emptied = (await admin(model, 'post', '/changesets', { baseRevision: revision, deletes: [{ folderId: 'froot', name: 'orders' }] }).expect(201)).body.revision;
+    await admin(model, 'delete', '/connections/default').expect(204);
+    const republished = (await admin(model, 'post', '/changesets', {
+      baseRevision: emptied,
+      upserts: [orders],
+    }).expect(201)).body.revision as number;
+    return republished;
+  };
+
+  test('served by the environment again once its connection goes: its own names where the environment reaches the base\'s target', async () => {
+    // `same`'s base is its connection's now, which reaches where the environment does.
+    const head = (await admin('same', 'get', '/revision').expect(200)).body.current.revision;
+    const again = await toEnvironment('same', head);
+    expect(await rollupOf('same', again)).toMatch(/\.orders_by_all/);
+    expect(await ids('same', again)).toEqual(['1', '2']);
+
+    // A model whose `default` was stored first, aimed elsewhere: the environment serving it is a move.
+    await store('third', { ...target, database: 'template1', user: environment.CUBEJS_DB_USER }, false);
+    const revision = await publish('third');
+    expect(await rollupOf('third', revision)).toMatch(/\.orders_by_all/);
+    const moved = await toEnvironment('third', revision);
+    expect(await rollupOf('third', moved)).not.toMatch(/\.orders_by_all/);
+    expect(await ids('third', moved)).toEqual(['1', '2']);
   });
 });

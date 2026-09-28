@@ -231,16 +231,21 @@ describeWithDatabase('PgRevisionStore', () => {
   });
 
   test('a connection\'s base identity is the first recorded, whoever records it and however many at once, and outlives the connection', async () => {
+    // Each base's identity, and each target by `<name>@`.
+    const shown = (bases: Map<string, { identity: string; target: string | null }>) => new Map([
+      ...[...bases].map(([name, base]) => [name, base.identity] as [string, string]),
+      ...[...bases].filter(([, base]) => base.target !== null).map(([name, base]) => [`${name}@`, base.target!] as [string, string]),
+    ]);
     await store.putFolders('bases', [{ id: 'froot', parentId: null }]);
     const bases = await Promise.all(Array.from({ length: 8 }, (_, i) => store.connectionBases('bases', new Map([['default', `identity-${i}`]]))));
-    const [first] = bases.map((b) => b.get('default'));
+    const [first] = bases.map((b) => b.get('default')!.identity);
     expect(first).toMatch(/^identity-\d$/);
-    expect(bases.map((b) => b.get('default'))).toEqual(bases.map(() => first));
+    expect(bases.map((b) => b.get('default')!.identity)).toEqual(bases.map(() => first));
 
     // Later sights don't replace it; each connection has its own; one not asked for isn't answered.
     const later = await store.connectionBases('bases', new Map([['default', 'moved'], ['warehouse', 'w1']]));
-    expect(later).toEqual(new Map([['default', first], ['warehouse', 'w1']]));
-    expect(await store.connectionBases('bases', new Map([['warehouse', 'w2']]))).toEqual(new Map([['warehouse', 'w1']]));
+    expect(shown(later)).toEqual(new Map([['default', first], ['warehouse', 'w1']]));
+    expect(shown(await store.connectionBases('bases', new Map([['warehouse', 'w2']])))).toEqual(new Map([['warehouse', 'w1']]));
     expect(await store.connectionBases('bases', new Map())).toEqual(new Map());
 
     // A connection that goes keeps its base, as does its model: tables under its cubes' names hold that target's rows only.
@@ -248,15 +253,22 @@ describeWithDatabase('PgRevisionStore', () => {
       model: 'bases', name: 'warehouse', folderId: 'froot', driver: 'postgres', authMethod: 'password', fields: { host: 'h' }, sealed: {}, revisions: {},
     });
     expect(await store.deleteConnection('bases', 'warehouse', null)).toBe(true);
-    expect(await store.connectionBases('bases', new Map([['warehouse', 'w3']]))).toEqual(new Map([['warehouse', 'w1']]));
+    expect(shown(await store.connectionBases('bases', new Map([['warehouse', 'w3']])))).toEqual(new Map([['warehouse', 'w1']]));
     await pool.query(`DELETE FROM ${schema}.models WHERE id = 'bases'`);
-    expect(await store.connectionBases('bases', new Map([['default', 'recreated']]))).toEqual(new Map([['default', first]]));
+    expect(shown(await store.connectionBases('bases', new Map([['default', 'recreated']])))).toEqual(new Map([['default', first]]));
+
+    // A base recorded before its target was is given it, by the identity it has; never by another.
+    expect(shown(await store.connectionBases('bases', new Map([['warehouse', 'w2']]), new Map([['warehouse', 'env:www']]))))
+      .toEqual(new Map([['warehouse', 'w1']]));
+    expect(shown(await store.connectionBases('bases', new Map([['warehouse', 'w1']]), new Map([['warehouse', 'env:www']]))))
+      .toEqual(new Map([['warehouse', 'w1'], ['warehouse@', 'env:www']]));
 
     // Cube's environment's base is taken by a connection only where the connection says it reaches the same target.
-    await store.connectionBases('bases', new Map([['env_a', 'env:aaa'], ['env_b', 'env:bbb']]));
+    await store.connectionBases('bases', new Map([['env_a', 'env:aaa'], ['env_b', 'env:bbb']]), new Map([['env_a', 'env:aaa'], ['env_b', 'env:bbb']]));
     const adopted = await store.connectionBases('bases', new Map([['env_a', 'stored-a'], ['env_b', 'stored-b']]), new Map([['env_a', 'env:aaa'], ['env_b', 'env:ccc']]));
-    expect(adopted).toEqual(new Map([['env_a', 'stored-a'], ['env_b', 'env:bbb']]));
+    expect(shown(adopted)).toEqual(new Map([['env_a', 'stored-a'], ['env_b', 'env:bbb'], ['env_a@', 'env:aaa'], ['env_b@', 'env:bbb']]));
     // Once taken, it is that connection's: another reaching the same target is a move.
-    expect(await store.connectionBases('bases', new Map([['env_a', 'stored-a2']]), new Map([['env_a', 'env:aaa']]))).toEqual(new Map([['env_a', 'stored-a']]));
+    expect(shown(await store.connectionBases('bases', new Map([['env_a', 'stored-a2']]), new Map([['env_a', 'env:aaa']]))))
+      .toEqual(new Map([['env_a', 'stored-a'], ['env_a@', 'env:aaa']]));
   });
 });

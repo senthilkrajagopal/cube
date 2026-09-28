@@ -724,7 +724,7 @@ describeWithDatabase('connections: data sources served from sealed credentials',
       // The base is recorded once, for every instance: another's first sight of it doesn't replace it.
       const { store } = await runtime.storeAt('dev');
       const [current] = await store.connections('dev').then((all) => all.filter((c) => c.name === 'default'));
-      const recorded = (await store.connectionBases('dev', new Map([['default', 'another-identity']]))).get('default');
+      const recorded = (await store.connectionBases('dev', new Map([['default', 'another-identity']]))).get('default')?.identity;
       expect(recorded).toBe(runtime.connections.identityOf(current));
 
       // Moved again, worked out afresh (what served it before is gone): the same alias as before, as on every instance.

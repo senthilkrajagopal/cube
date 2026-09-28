@@ -7,6 +7,7 @@ import type {
   ModelHead,
   ModelStatus,
   RevisionStore,
+  ConnectionBase,
 } from '../../src/store/revisions';
 
 /** Revisions in memory, as the Postgres store keeps them. */
@@ -119,7 +120,7 @@ class MemoryStore implements RevisionStore {
   }
 
   public async connectionBases() {
-    return new Map<string, string>();
+    return new Map<string, ConnectionBase>();
   }
 
   public async items() {

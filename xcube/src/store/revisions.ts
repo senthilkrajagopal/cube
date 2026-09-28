@@ -191,6 +191,12 @@ export function folderTreeHash(folders: Folder[]): string {
   return crypto.createHash('sha256').update(JSON.stringify(sorted), 'utf8').digest('hex');
 }
 
+/** A data source's base: the identity it was first served with, and where that reaches, if known. */
+export interface ConnectionBase {
+  identity: string;
+  target: string | null;
+}
+
 /** Where revisions are kept. Postgres in production; tests may fake it. */
 export interface RevisionStore {
   /** Every model's current revision. */
@@ -238,16 +244,16 @@ export interface RevisionStore {
   reportConnection(model: string, name: string, instance: string, version: number | null, state: string, error: string | null): Promise<void>;
   connectionReports(model: string, name: string): Promise<{ instance: string; version: number | null; state: string; error: string | null; reportedAt: Date }[]>;
   /**
-   * The base identity of each connection named: the first recorded for it,
-   * by whichever instance served it first. `identities` are recorded where
-   * none is yet, and in place of a base that is the connection's `targets`
-   * (Cube's environment's, reaching where it does).
+   * The base of each data source named: the first identity recorded for it,
+   * by whichever instance served it first, and where it reaches (`targets`).
+   * `identities` are recorded where none is yet, and in place of a base that
+   * is the connection's target (Cube's environment's, reaching where it does).
    */
   connectionBases(
     model: string,
     identities: ReadonlyMap<string, string>,
     targets?: ReadonlyMap<string, string>,
-  ): Promise<Map<string, string>>;
+  ): Promise<Map<string, ConnectionBase>>;
   deleteOverlay(model: string, id: string): Promise<boolean>;
   /** A revision's items, with their authored and resolved YAML. */
   items(model: string, revision: number): Promise<PublishedItem[]>;
@@ -723,32 +729,34 @@ export class PgRevisionStore implements RevisionStore {
     model: string,
     identities: ReadonlyMap<string, string>,
     targets: ReadonlyMap<string, string> = new Map(),
-  ): Promise<Map<string, string>> {
+  ): Promise<Map<string, ConnectionBase>> {
     const names = [...identities.keys()];
     if (!names.length) {
       return new Map();
     }
+    const columns = [model, names, names.map((name) => identities.get(name)), names.map((name) => targets.get(name) ?? null)];
     // Separate statements: each sees a base another instance committed while it waited on it.
     await this.pool.query(
-      `INSERT INTO ${this.s}.connection_bases (model, name, identity)
-       SELECT $1, name, identity FROM unnest($2::text[], $3::text[]) AS t (name, identity)
+      `INSERT INTO ${this.s}.connection_bases (model, name, identity, target)
+       SELECT $1, name, identity, target FROM unnest($2::text[], $3::text[], $4::text[]) AS t (name, identity, target)
        ON CONFLICT (model, name) DO NOTHING`,
-      [model, names, names.map((name) => identities.get(name))]
+      columns
     );
-    const adopting = names.filter((name) => targets.has(name));
-    if (adopting.length) {
+    if (targets.size) {
+      // Cube's environment's base, taken by a connection reaching where it did; or a base's target, first known.
       await this.pool.query(
-        `UPDATE ${this.s}.connection_bases b SET identity = t.identity, recorded_at = now()
+        `UPDATE ${this.s}.connection_bases b SET identity = t.identity, target = t.target
            FROM unnest($2::text[], $3::text[], $4::text[]) AS t (name, identity, target)
-          WHERE b.model = $1 AND b.name = t.name AND b.identity = t.target`,
-        [model, adopting, adopting.map((name) => identities.get(name)), adopting.map((name) => targets.get(name))]
+          WHERE b.model = $1 AND b.name = t.name AND t.target IS NOT NULL
+            AND (b.identity = t.target OR (b.identity = t.identity AND b.target IS NULL))`,
+        columns
       );
     }
     const { rows } = await this.pool.query(
-      `SELECT name, identity FROM ${this.s}.connection_bases WHERE model = $1 AND name = ANY($2::text[])`,
+      `SELECT name, identity, target FROM ${this.s}.connection_bases WHERE model = $1 AND name = ANY($2::text[])`,
       [model, names]
     );
-    return new Map(rows.map((row) => [row.name, row.identity]));
+    return new Map(rows.map((row) => [row.name, { identity: row.identity, target: row.target }]));
   }
 
   public async overlayCount(model: string): Promise<number> {

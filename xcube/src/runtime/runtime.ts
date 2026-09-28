@@ -41,6 +41,7 @@ import {
   channelOf,
   folderTreeHash,
   PgRevisionStore,
+  type ConnectionBase,
   type ModelHead,
   type ModelMode,
   type ModelStatus,
@@ -2478,52 +2479,59 @@ export class XcubeRuntime {
     const known = this.connectionBases.get(model);
     const served = new Map<string, string>();
     for (const name of dataSourcesOf(files)) {
-      const target = identities.has(name) || known?.has(name) ? undefined : environmentTarget(name);
+      // With connections, a model's other data sources are its connections' alone (`driverFactory`).
+      const environments = !identities.size || name === 'default';
+      const target = !environments || identities.has(name) || known?.has(name) ? undefined : environmentTarget(name);
       if (target !== undefined) {
         served.set(name, target);
       }
     }
-    await this.recordBases(model, served);
+    await this.recordBases(model, served, served);
   }
 
-  /** Each model's data sources' base identities, as recorded: once recorded, one changes only as `recordBases` says. */
-  protected readonly connectionBases = new Map<string, Map<string, string>>();
+  /** Each model's data sources' bases, as recorded: once recorded, one changes only as `recordBases` says. */
+  protected readonly connectionBases = new Map<string, Map<string, ConnectionBase>>();
 
   /**
    * Records each data source's identity as its base where it has none,
-   * before anything is served over it, and learns those another instance
-   * recorded first. A connection whose base is Cube's environment's, reaching
-   * its `targets` (where the connection does), takes it as its own.
+   * before anything is served over it, with where it reaches (`targets`),
+   * and learns those another instance recorded first. A connection whose
+   * base is Cube's environment's, reaching where it does, takes it as its
+   * own; a base recorded before its target was, is given it.
    */
   protected async recordBases(model: string, identities: ReadonlyMap<string, string>, targets: ReadonlyMap<string, string> = new Map()) {
     let known = this.connectionBases.get(model);
     if (!known) {
-      known = new Map<string, string>();
+      known = new Map<string, ConnectionBase>();
       this.connectionBases.set(model, known);
     }
     const bases = known;
-    const asked = new Map([...identities].filter(([name, identity]) => !bases.has(name)
-      || (bases.get(name) !== identity && bases.get(name) === targets.get(name))));
+    const asked = new Map([...identities].filter(([name, identity]) => {
+      const base = bases.get(name);
+      return !base
+        || (base.identity !== identity && base.identity === targets.get(name))
+        || (base.identity === identity && base.target === null && targets.has(name));
+    }));
     if (asked.size) {
-      (await this.requireStore().connectionBases(model, asked, targets)).forEach((identity, name) => bases.set(name, identity));
+      (await this.requireStore().connectionBases(model, asked, targets)).forEach((base, name) => bases.set(name, base));
     }
   }
 
   /**
    * The identities a revision's cubes are aliased by: those of connections
    * moved from their base, and, for a data source Cube's environment serves,
-   * its target there if another was its base (a connection since dropped).
-   * Cubes at their base keep their names, and the tables under them, which
-   * only that target's rows are ever built into; a connection with no base
-   * recorded is taken as moved.
+   * its target there if its base (a connection's since dropped) reaches
+   * elsewhere. Cubes at their base keep their names, and the tables under
+   * them, which only that target's rows are ever built into; a connection
+   * with no base recorded is taken as moved.
    */
   protected movedIdentities(model: string, identities: ReadonlyMap<string, string>): ReadonlyMap<string, string> {
     const bases = this.connectionBases.get(model);
-    const moved = new Map([...identities].filter(([name, identity]) => bases?.get(name) !== identity));
+    const moved = new Map([...identities].filter(([name, identity]) => bases?.get(name)?.identity !== identity));
     const environmentTarget = this.options?.environmentTarget;
     bases?.forEach((base, name) => {
       const target = identities.has(name) || !environmentTarget ? undefined : environmentTarget(name);
-      if (target !== undefined && target !== base) {
+      if (target !== undefined && target !== base.identity && target !== base.target) {
         moved.set(name, target);
       }
     });
