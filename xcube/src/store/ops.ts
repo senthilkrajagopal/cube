@@ -1,5 +1,8 @@
 import type { Pool } from 'pg';
 
+import type { CalcKind, CalcSpec } from '../calcs/companions';
+import { channelOf } from './revisions';
+
 /** A jobs request's build: the token Cube gave it, and the version of a table it builds. */
 export interface BuildJob {
   model: string;
@@ -105,6 +108,49 @@ export class PgOpsStore {
       ]
     );
     await this.pool.query(`DELETE FROM ${this.s}.refresh_ticks WHERE last_tick_at < now() - interval '${TICK_DAYS} days'`);
+  }
+
+  /** The calculations a model has been asked for. */
+  public async calculations(model: string): Promise<CalcSpec[]> {
+    const { rows } = await this.pool.query(
+      `SELECT cube, measure, kind, granularity, periods FROM ${this.s}.calculations WHERE model = $1`,
+      [model]
+    );
+    return rows.map((row) => ({
+      cube: row.cube, measure: row.measure, kind: row.kind as CalcKind, granularity: row.granularity, periods: row.periods,
+    }));
+  }
+
+  /** Records calculations a model is asked for, announcing any new: every instance serves them from then on. */
+  public async addCalculations(model: string, specs: CalcSpec[]): Promise<number> {
+    if (!specs.length) {
+      return 0;
+    }
+    const { rowCount } = await this.pool.query(
+      `INSERT INTO ${this.s}.calculations (model, cube, measure, kind, granularity, periods)
+       SELECT $1, * FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::integer[])
+       ON CONFLICT DO NOTHING`,
+      [model, specs.map((s) => s.cube), specs.map((s) => s.measure), specs.map((s) => s.kind), specs.map((s) => s.granularity), specs.map((s) => s.periods)]
+    );
+    if (rowCount) {
+      await this.pool.query('SELECT pg_notify($1, $2)', [channelOf(this.s), JSON.stringify({ model, calculations: true })]);
+    }
+    return rowCount ?? 0;
+  }
+
+  /** Forgets calculations a model couldn't be served with, announcing it: every instance serves it without them. */
+  public async removeCalculations(model: string, specs: CalcSpec[]): Promise<void> {
+    if (!specs.length) {
+      return;
+    }
+    await this.pool.query(
+      `DELETE FROM ${this.s}.calculations c
+        USING unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::integer[]) AS t (cube, measure, kind, granularity, periods)
+        WHERE c.model = $1 AND c.cube = t.cube AND c.measure = t.measure AND c.kind = t.kind
+          AND c.granularity = t.granularity AND c.periods = t.periods`,
+      [model, specs.map((s) => s.cube), specs.map((s) => s.measure), specs.map((s) => s.kind), specs.map((s) => s.granularity), specs.map((s) => s.periods)]
+    );
+    await this.pool.query('SELECT pg_notify($1, $2)', [channelOf(this.s), JSON.stringify({ model, calculations: true })]);
   }
 
   /** Each refresh worker's last runs of a model, the most recent first. */

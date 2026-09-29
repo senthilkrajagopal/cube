@@ -10,6 +10,8 @@ export interface Notice {
   version?: number;
   /** A connection changed or went: its name (and `version` when it changed). */
   connection?: string;
+  /** A quick calculation was asked for the first time: the model is served with it. */
+  calculations?: boolean;
 }
 
 /** What the listener needs of a `pg.Client`. */

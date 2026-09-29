@@ -370,6 +370,62 @@ query previews when its token names it.
     afterwards (a rollback) previews such overlays on the published data
     sources, and its own pushes leave their data sources in place.
 
+### Quick calculations
+
+A query asks for a calculation of one of its measures, and Cube computes it as
+a multi-stage measure: a companion that xcube adds to the measure's cube when
+it serves the model, never to what is published (the items, `GET …/items`,
+and the client's drift check never see it).
+
+```json
+{ "measures": ["fsales__orders.count"],
+  "timeDimensions": [{ "dimension": "fsales__orders.created_at", "granularity": "month", "dateRange": ["2024-03-01", "2024-06-30"] }],
+  "calculations": [{ "measure": "fsales__orders.count", "kind": "running_total" }] }
+```
+
+- **Kinds:** `pct_of_total` (of the grand total of what the query answers,
+  filters and all), `previous_period`, `difference` and `pct_difference` (from
+  the previous period at the query's granularity), `running_total`,
+  `moving_average` (`periods`: 3, 6 or 12; the mean of the last N period
+  values, empty periods left out), and `rank` (across all rows, the largest
+  first; ties share a rank).
+- **In place of its measure.** One calculation per measure: the query asks
+  for the companion in `measures` (and `order`), named
+  `<measure>__xc_<calculation>` (`count__xc_running_total`,
+  `total__xc_ma3_month`, `count__xc_diff_week`). The answer's annotation
+  gives it a `shortTitle` (`Count (running total)`) and
+  `meta.xcube.calculation` (`{ measure, kind, granularity?, periods? }`). A
+  view's member works too, under the view's name for it (an alias, a
+  prefix).
+- **A running total counts from the start of the query's range:** xcube also
+  filters on the range, which Cube's window keeps (without it, a window counts
+  from the start of the data). Without a range, from the start of the data.
+  So it can't share its query with another period calculation.
+- **On first use.** The first query asking for a measure's calculation records
+  it (table `calculations`), and every instance serves the model with it from
+  then on: the module holding the cube compiles again, once, before that query
+  goes on (about a second for a module of 300 cubes). Later queries don't
+  wait; a new revision keeps the companions.
+- **Correct only where it is.** A calculation is refused for a type it isn't
+  correct for: `pct_of_total`, `running_total` and `moving_average` take
+  `count`, `sum`, `count_distinct` and `count_distinct_approx`; the previous
+  period ones and `rank` any type. A `count_distinct`'s running total counts
+  distinct values so far (a plain rolling measure on the column, which reads
+  the source); a `count`'s or a `sum`'s adds up its periods' (multi-stage,
+  which reads rollups). A measure that is itself multi-stage or rolling takes
+  none.
+- **Refused `400`**, `code: "invalid_calculation"`, with each calculation and
+  its `reason`: `kind`, `not_in_query`, `duplicate` (one per measure),
+  `unknown_measure`, `type`, `granularity` (none, several, or not one of
+  `hour`, `day`, `week`, `month`, `quarter`, `year`), `periods`, or
+  `combination`.
+- **Security.** A companion is its measure's: the folder gate and the cube's
+  access policies cover it, and xcube adds it to explicit `member_level` lists
+  and to views that list its measure. Companions are hidden from `/v1/meta` and
+  the admin meta, and no authored member may hold `__xc_` (`422`).
+- **Rollups.** A companion reads its cube's rollups for its measure where
+  Tesseract can (a moving average of a sum does); nothing is rebuilt.
+
 ### Connections
 
 A model's data sources are pushed to xcube as **connections**, and served to

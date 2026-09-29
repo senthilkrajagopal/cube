@@ -41,6 +41,8 @@ import {
 import type { DataSourceDescription, DataSourceIntrospectionApi } from './types';
 import { PreAggregations } from '@cubejs-backend/query-orchestrator';
 import { initAdminRoutes } from './admin/routes';
+import { isCompanion } from './calcs/companions';
+import { CalculationError } from './calcs/requests';
 import { modelSchemaSuffix } from './config';
 import { Connections } from './connections/connections';
 import { MODULE_KEY, type XcubeRuntime } from './runtime/runtime';
@@ -71,6 +73,22 @@ function allMembersOf(cubes: any[]): any[] {
       segments: config.segments?.map(marked(visible)),
     };
   });
+}
+
+/** A cube's (or view's) config without quick calculations' companions: they are never listed. */
+function withoutCompanions(config: any): any {
+  if (!config || !Array.isArray(config.measures) || !config.measures.some((m: any) => isCompanion(String(m?.name)))) {
+    return config;
+  }
+  return { ...config, measures: config.measures.filter((m: any) => !isCompanion(String(m?.name))) };
+}
+
+/** A meta answer without companions. */
+function hidingCompanions(res: (body: any, options?: any) => any) {
+  return (body: any, options?: any) => res(
+    body && Array.isArray(body.cubes) ? { ...body, cubes: body.cubes.map(withoutCompanions) } : body,
+    options,
+  );
 }
 
 /** An entry of a model's pre-aggregation build queue (`XcubeApiGateway.ownQueue`). */
@@ -201,14 +219,36 @@ export class XcubeApiGateway extends ApiGateway {
           // Not JSON: Cube refuses it as it does.
         }
       }
-      for (const query of Array.isArray(parsed) ? parsed : [parsed]) {
+      const queries = Array.isArray(parsed) ? parsed : [parsed];
+      for (const query of queries) {
         const refused = runtime.refusedFolder(query, context, groups);
         if (refused) {
           throw new CubejsHandlerError(403, 'Forbidden', `None of these groups reaches folder ${refused.folderId} (${refused.cube})`);
         }
       }
+      // Quick calculations: each query asks for its companions in place of their measures.
+      if (queries.some((query: any) => query && typeof query === 'object' && query.calculations !== undefined)) {
+        const planned: any[] = [];
+        for (const query of queries) {
+          planned.push(query && typeof query === 'object' && query.calculations !== undefined
+            ? (await runtime.planQueryCalculations(query, context)).query
+            : query);
+        }
+        return super.getNormalizedQueries(Array.isArray(parsed) ? planned : planned[0], context, persistent, memberExpressions, cacheMode);
+      }
     }
     return super.getNormalizedQueries(inputQuery, context, persistent, memberExpressions, cacheMode);
+  }
+
+  /** A query's calculations that can't be computed are answered `400`, each with its reason. */
+  public override handleError(options: Parameters<ApiGateway['handleError']>[0]) {
+    const { e, context, res, requestStarted } = options;
+    if (e instanceof CalculationError) {
+      this.log({ type: 'Invalid calculations', error: e.message, duration: this.duration(requestStarted) } as any, context);
+      res({ error: e.message, code: 'invalid_calculation', calculations: e.refusals }, { status: 400 });
+      return;
+    }
+    super.handleError(options);
   }
 
   public override initApp(app: ExpressApplication) {
@@ -401,19 +441,23 @@ export class XcubeApiGateway extends ApiGateway {
 
   /** `/v1/meta` of a model served in modules: every module's own answer, merged. */
   public override async meta(args: Parameters<ApiGateway['meta']>[0]) {
-    const modules = this.xcubeRuntime()?.metaModules(args.context);
+    const runtime = this.xcubeRuntime();
+    const res = runtime?.serving ? hidingCompanions(args.res) : args.res;
+    const modules = runtime?.metaModules(args.context);
     if (!modules) {
-      return super.meta(args);
+      return super.meta({ ...args, res });
     }
-    return this.mergedMeta(modules, args.context, args.res, (context, res) => super.meta({ ...args, context, res }));
+    return this.mergedMeta(modules, args.context, res, (context, r) => super.meta({ ...args, context, res: r }));
   }
 
   public override async metaExtended(args: Parameters<ApiGateway['metaExtended']>[0]) {
-    const modules = this.xcubeRuntime()?.metaModules(args.context);
+    const runtime = this.xcubeRuntime();
+    const res = runtime?.serving ? hidingCompanions(args.res) : args.res;
+    const modules = runtime?.metaModules(args.context);
     if (!modules) {
-      return super.metaExtended(args);
+      return super.metaExtended({ ...args, res });
     }
-    return this.mergedMeta(modules, args.context, args.res, (context, res) => super.metaExtended({ ...args, context, res }));
+    return this.mergedMeta(modules, args.context, res, (context, r) => super.metaExtended({ ...args, context, res: r }));
   }
 
   /**
@@ -650,7 +694,7 @@ export class XcubeApiGateway extends ApiGateway {
         includeViewGroups: !extended,
         skipVisibilityPatch: true,
       });
-      const configs = extended ? metaConfig : metaConfig.cubes;
+      const configs = (extended ? metaConfig : metaConfig.cubes).map((c: any) => ({ ...c, config: withoutCompanions(c.config) }));
       const visible = least.hidden ? allMembersOf(configs) : publicMembersOf(configs);
       if (!extended) {
         res({

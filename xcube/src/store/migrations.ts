@@ -306,6 +306,27 @@ export const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    version: 11,
+    name: 'calculations',
+    // Additive: older code serves models without the companions.
+    minReader: 2,
+    sql: (s) => `
+      -- The quick calculations a model has been asked for: each a companion
+      -- measure xcube adds to its cube when it serves the model, from the
+      -- first query asking for it on.
+      CREATE TABLE ${s}.calculations (
+        model        text        NOT NULL,
+        cube         text        NOT NULL,
+        measure      text        NOT NULL,
+        kind         text        NOT NULL,
+        granularity  text        NOT NULL DEFAULT '',
+        periods      integer     NOT NULL DEFAULT 0,
+        requested_at timestamptz NOT NULL DEFAULT now(),
+        PRIMARY KEY (model, cube, measure, kind, granularity, periods)
+      );
+    `,
+  },
 ];
 
 /** The newest schema version this code knows. */

@@ -35,6 +35,8 @@ import { Connections, ConnectionError, type ConnectionInput } from '../connectio
 import { CredentialError, CredentialKeys, type SealedV1 } from '../credentials/credentials';
 import { DRIVERS, isDriverType } from '../connections/drivers';
 import { dataSourcesOf, epochOf, targetOf, withIdentityAliases } from '../connections/aliases';
+import { calcVersion, specKey, withCompanions, type CalcSpec } from '../calcs/companions';
+import { CalculationError, planCalculations, type CalcPlan } from '../calcs/requests';
 import { createListenClient, createPool, type Logger } from '../store/db';
 import { PgOpsStore, type RefreshTick } from '../store/ops';
 import { migrate } from '../store/migrate';
@@ -173,7 +175,17 @@ export interface ServedRevision {
    * and their drivers must be of it.
    */
   identities: ReadonlyMap<string, string>;
+  /** The quick calculations it is served with: companions added to its cubes (`withCompanions`). */
+  calcs: CalcSet;
 }
+
+/** A model's quick calculations, as recorded, and their version. */
+export interface CalcSet {
+  specs: CalcSpec[];
+  version: string | undefined;
+}
+
+export const NO_CALCS: CalcSet = { specs: [], version: undefined };
 
 /** How soon refresh runs noted are written. */
 const TICK_WRITE_MS = 5000;
@@ -196,9 +208,11 @@ const NO_IDENTITIES: ReadonlyMap<string, string> = new Map();
  * connections' identities. Another epoch is another served revision, compiled
  * and switched to as a new revision is, with an orchestrator of its own.
  */
-export function servedKeyOf(head: ModelHead, identities: ReadonlyMap<string, string>): string {
+export function servedKeyOf(head: ModelHead, identities: ReadonlyMap<string, string>, calcs: CalcSet = NO_CALCS): string {
   const epoch = epochOf(identities);
-  return epoch === undefined ? appIdOf(head) : `${appIdOf(head)}~${epoch}`;
+  const key = epoch === undefined ? appIdOf(head) : `${appIdOf(head)}~${epoch}`;
+  // Another set of quick calculations is another served revision, as another epoch is.
+  return calcs.version === undefined ? key : `${key}^${calcs.version}`;
 }
 
 /** The epoch a served revision's key (or an overlay's, over it) names, if any. */
@@ -1411,6 +1425,7 @@ export class XcubeRuntime {
         { files: applied.files, modules: applied.modules },
         { key, id: record.id, version: record.version, base: base.key },
         base.identities,
+        base.calcs,
       );
       served.items = applied.items;
       if (record.connections.length) {
@@ -2273,6 +2288,82 @@ export class XcubeRuntime {
     return this.ops.refreshWorkers(model);
   }
 
+  /** A model's quick calculations, as recorded: none without xcube's own database. */
+  protected async calculationsOf(model: string): Promise<CalcSet> {
+    if (!this.ops) {
+      return NO_CALCS;
+    }
+    const specs = await this.ops.calculations(model);
+    return specs.length ? { specs, version: calcVersion(specs) } : NO_CALCS;
+  }
+
+  /**
+   * Plans a query's `calculations` over the revision a context is pinned to
+   * (`planCalculations`), and serves the model with any companion it hasn't
+   * been asked for yet: recorded for every instance, then compiled here (the
+   * module holding its cube, once) before the query goes on, pinned to the
+   * revision served with it. Throws `CalculationError` for what can't be
+   * computed.
+   */
+  public async planQueryCalculations(query: any, context: any): Promise<CalcPlan> {
+    const revision = this.revisionOfContext(context);
+    if (!revision) {
+      throw new CalculationError([{ measure: null, kind: null, reason: 'unknown_measure', message: 'quick calculations need a model xcube serves' }]);
+    }
+    const plan = planCalculations(query, revision.source.files);
+    const served = new Set(revision.calcs.specs.map(specKey));
+    const missing = plan.specs.filter((spec) => !served.has(specKey(spec)));
+    if (missing.length) {
+      if (!this.ops) {
+        throw unavailable('Quick calculations need xcube\'s database');
+      }
+      const { model } = revision;
+      const started = Date.now();
+      const failedBefore = this.models.get(model)?.failed;
+      await this.ops.addCalculations(model, missing);
+      await this.sync(model);
+      const now = this.models.get(model)?.active;
+      const known = new Set((now?.calcs.specs ?? []).map(specKey));
+      if (!now || !missing.every((spec) => known.has(specKey(spec)))) {
+        // Never left to hold the model back: forgotten again, and the model served as it was.
+        const state = this.models.get(model);
+        const failed = state?.failed;
+        await this.ops.removeCalculations(model, missing);
+        await this.sync(model);
+        if (state && state.failed === failed) {
+          // The model itself didn't fail: only the calculation.
+          state.failed = failedBefore;
+        }
+        throw new CalculationError(missing.map((spec) => ({
+          measure: `${spec.cube}.${spec.measure}`,
+          kind: spec.kind,
+          reason: 'compile',
+          message: `the model couldn't be compiled with it${failed ? `: ${failed.error}` : ''}`,
+        })));
+      }
+      this.log('xcube: served with new quick calculations', {
+        model, calculations: missing.map((spec) => `${spec.cube}.${spec.measure}:${spec.kind}`), waitedMs: Date.now() - started,
+      });
+      await this.repin(context);
+    }
+    return plan;
+  }
+
+  /** Pins a context again to the revision its model serves now, as `pinFor` did: after it was served anew. */
+  protected async repin(context: any) {
+    const pin: Pin | undefined = context?.xcubePin;
+    if (!pin) {
+      return;
+    }
+    const { securityContext } = context;
+    let revision = await this.servingRevision(pin.model, this.revisionOf(securityContext));
+    const overlayId = this.overlayOf(securityContext);
+    if (overlayId !== undefined) {
+      revision = await this.overlayRevision(revision, overlayId);
+    }
+    context.xcubePin = { ...pin, appId: revision.key };
+  }
+
   /** The data sources a model is served over: `default`, its connections', and those its cubes name. */
   public async dataSourcesServing(model: string): Promise<string[]> {
     const names = new Set<string>(['default']);
@@ -2531,13 +2622,14 @@ export class XcubeRuntime {
 
     const previous = state.active;
     const identities = await this.identitiesOf(model);
-    const key = servedKeyOf(head, identities);
+    const calcs = await this.calculationsOf(model);
+    const key = servedKeyOf(head, identities, calcs);
     const retryLater = (state.failed?.appId === key || state.failed?.appId === appIdOf(head)) && Date.now() < state.failed.retryAt;
     if (state.active?.key !== key && !retryLater && !await this.activateHead(head) && !state.active) {
       await this.fallBack(head, state);
     }
     const active = state.active as ServedRevision | undefined;
-    const rekeyed = active ? servedKeyOf(XcubeRuntime.headOf(active), identities) : undefined;
+    const rekeyed = active ? servedKeyOf(XcubeRuntime.headOf(active), identities, calcs) : undefined;
     if (active && active.headKey !== appIdOf(head) && active.key !== rekeyed
       && !(state.failed && state.failed.appId === rekeyed && Date.now() < state.failed.retryAt)) {
       // The current revision doesn't compile: the one served still moves to the connections' new
@@ -2662,7 +2754,8 @@ export class XcubeRuntime {
     for (const [model, state] of [...this.models]) {
       if (state.active && !state.active.overlay) {
         const now = epochOf(await this.identitiesOf(model));
-        if (now !== epochOf(state.active.identities)) {
+        const calcs = (await this.calculationsOf(model)).version;
+        if (now !== epochOf(state.active.identities) || calcs !== state.active.calcs.version) {
           this.sync(model).catch(() => undefined);
         }
       }
@@ -2761,13 +2854,14 @@ export class XcubeRuntime {
     data: RevisionData,
     overlay?: { key: string; id: string; version: number; base: string },
     identities: ReadonlyMap<string, string> = NO_IDENTITIES,
+    calcs: CalcSet = NO_CALCS,
   ): ServedRevision {
-    const key = overlay?.key ?? servedKeyOf(head, identities);
+    const key = overlay?.key ?? servedKeyOf(head, identities, calcs);
     const existing = this.served.get(key);
     if (existing) {
       return existing;
     }
-    const { modules, holders, owner, files } = this.residentsOf(head, key, data, identities);
+    const { modules, holders, owner, files } = this.residentsOf(head, key, data, identities, calcs);
     const epoch = epochOf(identities);
     if (epoch !== undefined) {
       this.epochIdentities.set(`${head.model}/${epoch}`, identities);
@@ -2790,6 +2884,7 @@ export class XcubeRuntime {
       holds: 0,
       mode: head.mode,
       identities,
+      calcs,
       ...(overlay ? { overlay: { id: overlay.id, version: overlay.version, base: overlay.base }, lastUsed: Date.now() } : {}),
     };
     this.served.set(key, revision);
@@ -2807,10 +2902,14 @@ export class XcubeRuntime {
     key: string,
     data: RevisionData,
     identities: ReadonlyMap<string, string>,
+    calcs: CalcSet = NO_CALCS,
   ) {
-    const { files: servedFiles, salts } = withIdentityAliases(data.files, this.movedIdentities(head.model, identities));
+    // Quick calculations' companions first, then aliases by identity: a module either changes has an app id naming it.
+    const companions = withCompanions(data.files, calcs.specs);
+    const { files: servedFiles, salts } = withIdentityAliases(companions.files, this.movedIdentities(head.model, identities));
     const saltOf = (files: SnapshotFile[]) => {
-      const named = files.map((f) => salts.get(f.path)).filter((salt): salt is string => salt !== undefined).sort();
+      const named = files.map((f) => [salts.get(f.path), companions.salts.get(f.path)].filter((salt) => salt !== undefined).join('+'))
+        .filter((salt) => salt !== '').sort();
       return named.length ? `:c${crypto.createHash('sha256').update(named.join('\n'), 'utf8').digest('hex').slice(0, 12)}` : '';
     };
     const resident = (appId: string, moduleId: string, files: SnapshotFile[]): Resident => {
@@ -2880,13 +2979,14 @@ export class XcubeRuntime {
     const { model } = head;
     const state = this.state(model);
     const identities = await this.identitiesOf(model);
-    const key = servedKeyOf(head, identities);
+    const calcs = await this.calculationsOf(model);
+    const key = servedKeyOf(head, identities, calcs);
     if (state.active?.key === key) {
       return true;
     }
 
     await this.recordEnvironmentBases(model, data.files, identities);
-    const revision = this.servedRevision(head, data, undefined, identities);
+    const revision = this.servedRevision(head, data, undefined, identities, calcs);
     const reused = revision.state === 'retiring';
     revision.retireAfter = undefined;
     const drop = () => {
@@ -2929,7 +3029,7 @@ export class XcubeRuntime {
       return false;
     }
     // `rekey`: the revision served now, over its connections' new settings, though the current one failed.
-    const current = (state.target !== undefined && servedKeyOf(state.target, identities) === key)
+    const current = (state.target !== undefined && servedKeyOf(state.target, identities, calcs) === key)
       || (rekey && state.active?.headKey === appIdOf(head));
     if (!current && !(fallback && !state.active)) {
       // Superseded while it compiled: the next read switches to the newer one.

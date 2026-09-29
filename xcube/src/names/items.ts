@@ -2,6 +2,7 @@ import yaml from 'js-yaml';
 
 import { JINJA_SYNTAX } from '../model/snapshot';
 import { GATE_GROUP, namesGateGroup } from '../security/marker';
+import { COMPANION_MARK, isCompanion } from '../calcs/companions';
 
 /** A folder id: `f` then letters and digits, as the client encodes its own ids. The root is `froot`. */
 export const FOLDER_ID = /^f[a-z0-9]{1,40}$/;
@@ -216,6 +217,14 @@ export function parseItem(item: AuthoredItem): { def?: ItemDefinition; errors: I
   }
   if (namesGateGroup(doc)) {
     return fail(`Access policies may not name the group ${GATE_GROUP}: xcube keeps it for the folder gate`);
+  }
+  const marked = [
+    ...namesIn(doc.measures), ...namesIn(doc.dimensions), ...namesIn(doc.segments),
+    ...(Array.isArray(doc.cubes) ? doc.cubes : []).flatMap((c: any) => (Array.isArray(c?.includes) ? c.includes : [])
+      .map((i: any) => (typeof i === 'string' ? i : i?.alias ?? i?.name))),
+  ].filter((name) => typeof name === 'string' && isCompanion(name));
+  if (marked.length) {
+    return fail(`Member names may not hold "${COMPANION_MARK}": xcube keeps it for quick calculations (${marked.join(', ')})`);
   }
 
   const members = new Set<string>([
