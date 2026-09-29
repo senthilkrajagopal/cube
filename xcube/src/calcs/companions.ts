@@ -209,7 +209,8 @@ export function refusalOf(kind: CalcKind, base: any): string | undefined {
     return 'it is a multi-stage or rolling measure itself';
   }
   const type = String(base.type ?? 'number');
-  return CALC_TYPES[kind].includes(type) ? undefined : `a ${type} measure has no correct ${kind.replace(/_/g, ' ')}`;
+  const article = /^[aeiou]/.test(type) ? 'an' : 'a';
+  return CALC_TYPES[kind].includes(type) ? undefined : `${article} ${type} measure has no correct ${kind.replace(/_/g, ' ')}`;
 }
 
 /** Adds companions to the names in an explicit member list that holds their measure. */
