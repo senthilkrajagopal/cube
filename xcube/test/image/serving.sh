@@ -226,3 +226,11 @@ echo "$answer" | grep -q '"via_connection.total":"42"' || { echo "a query throug
 status="$(conn GET /connections/default/health)"
 grep -q '"state":"live"' /tmp/xcube-admin.json || { echo "the connection's health: $(cat /tmp/xcube-admin.json)"; exit 1; }
 echo "Connection check passed: a model's data source served from a connection whose password was sealed to xcube's key."
+
+# The SQL runner, on the same connection: a read, its row cap, and a write refused.
+status="$(conn POST /connections/default/sql '{"sql": "SELECT id, amount FROM public.serving_check ORDER BY id", "runId": "image-check-1", "maxRows": 1}')"
+[ "$status" = 200 ] && grep -q '"rowCount":1' /tmp/xcube-admin.json && grep -q '"truncated":"rows"' /tmp/xcube-admin.json \
+  || { echo "a SQL run answered $status: $(cat /tmp/xcube-admin.json)"; exit 1; }
+status="$(conn POST /connections/default/sql '{"sql": "DELETE FROM public.serving_check", "runId": "image-check-2"}')"
+[ "$status" = 400 ] && grep -q '"code":"not_read_only"' /tmp/xcube-admin.json || { echo "a write answered $status: $(cat /tmp/xcube-admin.json)"; exit 1; }
+echo "SQL runner check passed: read-only SQL on the connection, capped, a write refused."

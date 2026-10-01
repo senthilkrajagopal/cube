@@ -327,6 +327,25 @@ export const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    version: 12,
+    name: 'sql runs',
+    // Additive: older code has no SQL runner.
+    minReader: 2,
+    sql: (s) => `
+      -- The SQL runner's runs while they run, and the instance running each:
+      -- where a cancel goes. A run's row goes when it ends; a stopped
+      -- instance's, once it expires.
+      CREATE TABLE ${s}.sql_runs (
+        run_id     text        PRIMARY KEY,
+        model      text        NOT NULL,
+        instance   text        NOT NULL,
+        target     text        NOT NULL,
+        started_at timestamptz NOT NULL DEFAULT now(),
+        expires_at timestamptz NOT NULL
+      );
+    `,
+  },
 ];
 
 /** The newest schema version this code knows. */

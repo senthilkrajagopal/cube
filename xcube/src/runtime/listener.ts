@@ -12,6 +12,9 @@ export interface Notice {
   connection?: string;
   /** A quick calculation was asked for the first time: the model is served with it. */
   calculations?: boolean;
+  /** A SQL run to cancel, on the instance running it. */
+  sqlCancel?: string;
+  instance?: string;
 }
 
 /** What the listener needs of a `pg.Client`. */
@@ -98,7 +101,7 @@ export class RevisionListener {
       }
       try {
         const {
-          model, rev, permissions, keys, overlay, version, connection,
+          model, rev, permissions, keys, overlay, version, connection, sqlCancel, instance,
         } = JSON.parse(message.payload || '{}');
         if (typeof model === 'string') {
           const notice: Notice = {};
@@ -119,6 +122,10 @@ export class RevisionListener {
           }
           if ((notice.overlay || notice.connection) && typeof version === 'number') {
             notice.version = version;
+          }
+          if (typeof sqlCancel === 'string' && typeof instance === 'string') {
+            notice.sqlCancel = sqlCancel;
+            notice.instance = instance;
           }
           this.options.onNotify(model, notice);
           return;

@@ -647,6 +647,103 @@ descendant's.
 - **Introspection** lists a model's connections, so a data source can be
   browsed before any cube uses it.
 
+### SQL runner
+
+Read-only SQL on a model's data source, on one an overlay brings, or on Cube
+Store, as Cube Cloud's SQL Runner runs it, for the client's server alone
+(routes below). It is raw SQL on the database's tables with the connection's
+own credential: the folder gate and access policies don't apply to it. Who may
+run it is the client's call.
+
+**Read-only, in layers.** Only the connection's own grants make it certain; on
+top of them:
+1. **The check** (`src/sql/classify.ts`). A statement runs only if it is one
+   `SELECT` (with `WITH` and set operations) or an `EXPLAIN` without
+   `ANALYZE`.
+   - Refused anywhere in it: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `UPSERT`
+     and `INTO` (data-modifying CTEs, `SELECT … INTO`, `FOR UPDATE`), and
+     `FOR SHARE`. So is a name spelled as one of them, unless quoted.
+   - Refused per database: the functions that act outside a read-only
+     transaction (PostgreSQL's `pg_terminate_backend`, `dblink`,
+     `set_config`, `pg_read_file`, `query_to_xml` and the like; MySQL's
+     `LOAD_FILE`; Snowflake's `SYSTEM$` functions; BigQuery's
+     `EXTERNAL_QUERY`; SQL Server's `OPENROWSET`, `OPENQUERY` and lock hints;
+     Oracle's `UTL_` and `DBMS_` packages but `DBMS_XPLAN`, `DBMS_LOB` and
+     `DBMS_RANDOM`).
+   - It isn't a grammar. It reads the statement as the database's lexer does,
+     with its strings, quoted names, comments and dollar quotes, so it checks
+     the code the database runs, never text in a string. Where the lexing
+     depends on the database's settings (a backslash in a string, nested
+     comments), the statement must pass every reading. Anything it can't read
+     is refused.
+2. **One statement.** A `;` only at the end. PostgreSQL and Redshift run it
+   through a cursor (the extended protocol, which takes one statement). SQL
+   Server runs a batch without `;`, so a second statement there starts with a
+   refused word, or is a second top-level `SELECT`, which is refused too.
+3. **A transaction that is always rolled back**: read-only on PostgreSQL,
+   Redshift (`BEGIN READ ONLY`), MySQL (`START TRANSACTION READ ONLY`) and
+   Oracle (`SET TRANSACTION READ ONLY`). There it also stops a SELECT whose
+   function writes. On SQL Server it isn't read-only, but rolled back.
+   BigQuery's dry run must call the statement a `SELECT` before it runs.
+   Snowflake and Dremio have the check alone.
+4. **A connection of the run's own**, a pool of one, never one Cube serves
+   with, dropped afterwards: nothing it sets outlives the run.
+
+What only a SELECT-only login closes: a SELECT calling a function that writes,
+on Snowflake (external functions), SQL Server and Dremio; and on Oracle a
+function with an autonomous transaction.
+
+**Caps per run**, sent with each run (R50's by default):
+- **Rows** (`maxRows`, 10,000; at most 100,000): read as they come, one past
+  the cap, and no further. Oracle's are read from a result set, and Dremio's
+  a page of 500 at a time, only to the cap. Cube Store answers every row at
+  once, so a SELECT there is asked for one past the cap by its own top-level
+  `LIMIT`, added or lowered (a subquery would lose its order).
+- **Time** (`timeoutMs`, 30 s; at most 10 minutes), stopped on the database:
+  PostgreSQL's and Redshift's `statement_timeout`, MySQL's
+  `MAX_EXECUTION_TIME` (MariaDB's `max_statement_time`), Snowflake's
+  `STATEMENT_TIMEOUT_IN_SECONDS`, SQL Server's `requestTimeout`, Oracle's
+  `callTimeout`, BigQuery's `jobTimeoutMs`. Then a clock of xcube's, 2 s
+  later, cancels it on the database: Dremio's job through its API. Cube Store
+  has no cancel: its own query timeout stops it.
+- **Bytes** (`maxBytes`, 10 MB; at most 100 MB) of the answer's rows as JSON.
+- BigQuery takes `maxBytesBilled` too: its job fails, without charge, past it.
+- At most 16 runs at once on an instance (`503 busy` past that).
+
+**Cancel.** A run is cancelled by its `runId`, from any instance: the run is
+noted in xcube's database while it runs (`sql_runs`), and a cancel for another
+instance's reaches it through the notification channel. The statement is
+cancelled on the database (`pg_cancel_backend`, `KILL QUERY`, Snowflake's and
+BigQuery's cancels, SQL Server's attention, Oracle's break, Dremio's job
+cancel). One run per `runId` at a time.
+
+**Cube Store**: SELECT and EXPLAIN. It holds every model's rollups.
+- Its `system.cache`, `system.queue` and `system.queue_results` are refused:
+  they hold Cube's cached results and queued queries.
+- Its cache, queue and maintenance commands are refused, as Cube Cloud's
+  runner refuses them.
+- Cube Store 1.7.45 has no `SHOW TABLES`, `SHOW SCHEMAS` or `DESCRIBE`, and its
+  `SHOW CHUNKS` and the like answer every row at once. Read
+  `information_schema.tables` and `.columns`, `system.tables`,
+  `system.partitions`, `system.chunks` and `system.indexes` instead.
+
+**Answers.** Each cell is JSON:
+- binary as `\x` and hex;
+- dates as ISO 8601;
+- numbers as Cube's driver gives them: PostgreSQL's `int8` and `numeric`,
+  MySQL's `BIGINT` and `DECIMAL`, Snowflake's numbers, and every number of SQL
+  Server's, as strings;
+- Cube Store's values as strings.
+
+A column's `type` is the database's name for it, as its driver reports it
+(`int4`, `VAR_STRING`, `NUMBER`), and `null` on Cube Store. `redactedSql` is
+the statement with its strings and numbers as `?` and its comments out.
+
+**Logs** name the model, the target, the run id, the outcome, the row count
+and the duration; never the SQL or the database's message. The database's
+message in an answer has the connection's secrets taken out. It may quote
+values from the SQL.
+
 ### Admin API
 
 For the client's server alone. The routes are under
@@ -985,6 +1082,54 @@ Tests a connection without storing it: `{ driver, authMethod, fields, sealed }`
 | `schemas` | Reads the catalog, where the driver can |
 
 Every error has the connection's secrets taken out.
+
+#### `POST …/connections/{name}/sql`
+
+Runs read-only SQL on a stored connection (see SQL runner). With
+`?overlay={id}`, on that overlay's own data source instead, named as its
+previews name it: `<folderId>__<name>`, a root one by its short name.
+
+```json
+{ "sql": "SELECT …", "runId": "<uuid>", "maxRows": 10000, "timeoutMs": 30000, "maxBytes": 10485760 }
+```
+
+→ `200`:
+
+```json
+{
+  "columns": [{ "name": "id", "type": "int4" }],
+  "rows": [[1]],
+  "rowCount": 1,
+  "truncated": null,
+  "durationMs": 12,
+  "statement": "select",
+  "redactedSql": "SELECT id FROM t WHERE a = ?"
+}
+```
+
+`truncated` is `rows`, `bytes` or `null`; `statement` is `select` or
+`explain`. Otherwise `{ error, code, statement, redactedSql, durationMs? }`:
+
+| Status | `code` | |
+| --- | --- | --- |
+| 400 | `not_read_only` | The check refused it; `statement` is its kind (`insert`, `select` …) |
+| 400 | `several_statements` | |
+| 404 | `unknown_connection`, `unknown_overlay` | |
+| 409 | `run_in_progress` | A run of this `runId` runs |
+| 422 | `timeout`, `cancelled` | Stopped |
+| 422 | `query_failed` | The database's message |
+| 502 | `connect_failed` | |
+| 503 | `busy` | `Retry-After` |
+
+#### `POST …/cubestore/sql`
+
+The same, on Cube Store.
+
+#### `POST …/sql/cancel`
+
+`{ runId }` → `{ model, runId, found }`. It cancels the run on whichever
+instance runs it. `found` says the run was running. The run's own request then
+answers `cancelled`.
 
 #### `GET /v1/semantic/credential-keys`, `POST /v1/semantic/credentials/rewrap`
 

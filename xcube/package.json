@@ -1,6 +1,6 @@
 {
   "name": "xcube",
-  "version": "1.7.45-24",
+  "version": "1.7.45-25",
   "description": "xcube: the runtime side of the wechart integration, as a package over an unmodified Cube",
   "license": "Apache-2.0",
   "private": true,
@@ -42,7 +42,9 @@
     "@cubejs-backend/base-driver": "1.7.45",
     "@cubejs-backend/dremio-driver": "1.7.45",
     "@cubejs-backend/duckdb-driver": "1.7.45",
+    "@cubejs-backend/mssql-driver": "1.7.45",
     "@cubejs-backend/mysql-driver": "1.7.45",
+    "@cubejs-backend/oracle-driver": "1.7.45",
     "@cubejs-backend/postgres-driver": "1.7.45",
     "@cubejs-backend/query-orchestrator": "1.7.45",
     "@cubejs-backend/schema-compiler": "1.7.45",

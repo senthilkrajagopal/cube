@@ -185,4 +185,33 @@ export class PgOpsStore {
     });
     return [...byInstance.values()].sort((a, b) => b.lastTickAt.getTime() - a.lastTickAt.getTime());
   }
+
+  /** Notes a SQL run as running on an instance; `false` while a run of that id still runs. */
+  public async startSqlRun(runId: string, model: string, instance: string, target: string, expiresAt: Date): Promise<boolean> {
+    await this.pool.query(`DELETE FROM ${this.s}.sql_runs WHERE expires_at < now()`);
+    const { rowCount } = await this.pool.query(
+      `INSERT INTO ${this.s}.sql_runs (run_id, model, instance, target, expires_at) VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (run_id) DO NOTHING`,
+      [runId, model, instance, target, expiresAt],
+    );
+    return rowCount === 1;
+  }
+
+  public async endSqlRun(runId: string, instance: string): Promise<void> {
+    await this.pool.query(`DELETE FROM ${this.s}.sql_runs WHERE run_id = $1 AND instance = $2`, [runId, instance]);
+  }
+
+  /** The instance running a model's SQL run, while it runs. */
+  public async sqlRunInstance(runId: string, model: string): Promise<string | null> {
+    const { rows: [row] } = await this.pool.query(
+      `SELECT instance FROM ${this.s}.sql_runs WHERE run_id = $1 AND model = $2 AND expires_at > now()`,
+      [runId, model],
+    );
+    return row?.instance ?? null;
+  }
+
+  /** Tells the instance running a SQL run to cancel it. */
+  public async announceSqlCancel(model: string, runId: string, instance: string): Promise<void> {
+    await this.pool.query('SELECT pg_notify($1, $2)', [channelOf(this.s), JSON.stringify({ model, sqlCancel: runId, instance })]);
+  }
 }

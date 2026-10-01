@@ -216,6 +216,15 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
 
   /** Drops a compiled model from Cube's compiler cache, which disposes it. */
   /** Drops an orchestrator Cube holds: Cube's cache releases it, with its drivers. */
+  /** A Cube Store driver of the caller's own, from Cube's own settings; `null` when Cube uses none. */
+  public async cubeStoreDriver(): Promise<any> {
+    const { externalDriverFactory, externalDbType } = this.options as any;
+    if (typeof externalDriverFactory !== 'function' || (externalDbType && externalDbType !== 'cubestore')) {
+      return null;
+    }
+    return externalDriverFactory();
+  }
+
   public retireOrchestrator(orchestratorId: string) {
     OrchestratorStorageInternals.drop(this.orchestratorStorage, orchestratorId);
   }

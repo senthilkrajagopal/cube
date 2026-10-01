@@ -29,6 +29,7 @@ import { ConnectionError } from '../connections/connections';
 import { CredentialError } from '../credentials/credentials';
 import { MODEL_ID, SnapshotError } from '../model/snapshot';
 import type { QueueEntry } from '../gateway';
+import { SqlRunError, type SqlFailure } from '../sql/runner';
 import { adminAuth } from './auth';
 
 const file = Joi.object({
@@ -181,6 +182,41 @@ const rewrapSchema = Joi.object({
   }))
     .required(),
 });
+
+/** A SQL run's id: wechart's, a UUID. */
+const RUN_ID = /^[A-Za-z0-9_-]{1,64}$/;
+
+/** A SQL run: the statement, and its caps (R50's by default), within xcube's own ceilings. */
+const sqlSchema = Joi.object({
+  sql: Joi.string().min(1).max(100000).required(),
+  runId: Joi.string().pattern(RUN_ID).required(),
+  maxRows: Joi.number().integer().min(1).max(100000)
+    .default(10000),
+  timeoutMs: Joi.number().integer().min(1000).max(600000)
+    .default(30000),
+  maxBytes: Joi.number().integer().min(1024).max(100 * 1024 * 1024)
+    .default(10 * 1024 * 1024),
+  // BigQuery only: its job fails, without charge, past this many bytes billed.
+  maxBytesBilled: Joi.number().integer().min(1).max(Number.MAX_SAFE_INTEGER),
+});
+
+const sqlCancelSchema = Joi.object({
+  runId: Joi.string().pattern(RUN_ID).required(),
+});
+
+/** How each way a SQL run fails is answered. */
+const SQL_STATUS: Record<SqlFailure, number> = {
+  not_read_only: 400,
+  several_statements: 400,
+  unknown_connection: 404,
+  unknown_overlay: 404,
+  run_in_progress: 409,
+  timeout: 422,
+  cancelled: 422,
+  query_failed: 422,
+  connect_failed: 502,
+  busy: 503,
+};
 
 const overlaySchema = Joi.object({
   upserts: Joi.array().max(2000).items(itemSchema).default([]),
@@ -660,6 +696,70 @@ export function initAdminRoutes(
     }
     return req.params.id;
   };
+
+  /**
+   * Runs read-only SQL (`sql/runs.ts`). The answer is the rows, or the
+   * failure with its code; neither the SQL nor the database's message is
+   * logged, only what ran where and how it ended.
+   */
+  const runSql = (route: string, targetOf: (req: Request) => { connection: string; overlay?: string } | { cubeStore: true }) => handle(route, async (req, res) => {
+    const model = modelOf(req);
+    const body = valid<any>(sqlSchema, req.body);
+    const target = targetOf(req);
+    await requireModel(model);
+    const started = Date.now();
+    const logged = {
+      model,
+      target: 'cubeStore' in target ? 'cubestore' : `${target.overlay === undefined ? '' : `overlay ${target.overlay}/`}${target.connection}`,
+      runId: body.runId,
+    };
+    try {
+      const answer = await runtime.runSql(model, target, body);
+      logger('xcube: SQL run', {
+        ...logged, outcome: 'ok', statement: answer.statement, rows: answer.rowCount, truncated: answer.truncated, durationMs: answer.durationMs,
+      });
+      res.json(answer);
+    } catch (e) {
+      if (!(e instanceof SqlRunError)) {
+        throw e;
+      }
+      logger('xcube: SQL run', { ...logged, outcome: e.code, durationMs: Date.now() - started });
+      const status = SQL_STATUS[e.code];
+      if (status === 503) {
+        res.set('Retry-After', '5');
+      }
+      res.status(status).json({
+        error: e.message,
+        code: e.code,
+        statement: e.statement,
+        redactedSql: e.redactedSql,
+        ...(e.durationMs === null ? {} : { durationMs: e.durationMs }),
+      });
+    }
+  });
+
+  app.post(`${base}/connections/:name/sql`, auth, json, runSql('sql', (req) => {
+    const name = connectionNameOf(req);
+    const { overlay } = req.query;
+    if (overlay === undefined) {
+      return { connection: name };
+    }
+    if (typeof overlay !== 'string' || !OVERLAY_ID.test(overlay)) {
+      throw new AdminError(400, 'invalid_overlay_id', 'An overlay id is 1 to 64 of A-Z, a-z, 0-9, _ and -');
+    }
+    return { connection: name, overlay };
+  }));
+
+  app.post(`${base}/cubestore/sql`, auth, json, runSql('cubestore-sql', () => ({ cubeStore: true })));
+
+  app.post(`${base}/sql/cancel`, auth, json, handle('sql-cancel', async (req, res) => {
+    const model = modelOf(req);
+    const body = valid<{ runId: string }>(sqlCancelSchema, req.body);
+    await requireModel(model);
+    const result = await runtime.cancelSql(model, body.runId);
+    logger('xcube: SQL run cancel', { model, runId: body.runId, found: result.found });
+    res.json({ model, runId: body.runId, ...result });
+  }));
 
   app.put(`${base}/overlays/:id`, auth, json, handle('overlays', async (req, res) => {
     const model = modelOf(req);

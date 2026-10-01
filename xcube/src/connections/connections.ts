@@ -312,6 +312,8 @@ export class Connections {
   protected create(connection: Pick<StoredConnection, 'name' | 'driver' | 'authMethod' | 'fields' | 'sealed'>, options: {
     preAggregations: boolean;
     maxPoolSize?: number;
+    /** Settings of Cube's driver over the connection's: a SQL run's timeouts. */
+    config?: Record<string, unknown>;
   }): { driver: any; secrets: string[]; cubeType: string } {
     const driver = connection.driver as DriverType;
     if (!isDriverType(driver)) {
@@ -327,6 +329,7 @@ export class Connections {
           dataSource: connection.name,
           preAggregations: options.preAggregations,
           ...(options.maxPoolSize ? { maxPoolSize: options.maxPoolSize } : {}),
+          ...options.config,
         } as any),
         secrets: values,
         cubeType: DRIVERS[driver].cubeType,
@@ -520,6 +523,18 @@ export class Connections {
     if (connection && this.onChanged) {
       await this.onChanged(model, name);
     }
+  }
+
+  /**
+   * A driver of a SQL run's own for a connection, a model's or an overlay's:
+   * a pool of one, never one Cube serves with, not yet connected. Errors are
+   * redacted of its secrets.
+   */
+  public runnerDriver(
+    connection: Pick<StoredConnection, 'name' | 'driver' | 'authMethod' | 'fields' | 'sealed'>,
+    config: Record<string, unknown>,
+  ): { driver: any; secrets: string[]; cubeType: string } {
+    return this.create(connection, { preAggregations: false, maxPoolSize: 1, config });
   }
 
   /**

@@ -37,6 +37,8 @@ import { DRIVERS, isDriverType } from '../connections/drivers';
 import { dataSourcesOf, epochOf, targetOf, withIdentityAliases } from '../connections/aliases';
 import { calcVersion, specKey, withCompanions, type CalcSpec } from '../calcs/companions';
 import { CalculationError, planCalculations, type CalcPlan } from '../calcs/requests';
+import { SqlRunError, type SessionDialect, type SqlAnswer } from '../sql/runner';
+import { SqlRuns, type SqlRunRequest, type SqlTarget } from '../sql/runs';
 import { createListenClient, createPool, type Logger } from '../store/db';
 import { PgOpsStore, type RefreshTick } from '../store/ops';
 import { migrate } from '../store/migrate';
@@ -96,6 +98,8 @@ export interface ServingCore {
   retireOrchestrator?(orchestratorId: string): void;
   /** Cube's API gateway, whose `sql()` answers probes. */
   xcubeGateway(): { sql(request: any): Promise<void> };
+  /** A Cube Store driver of the caller's own, from Cube's settings; `null` without Cube Store. */
+  cubeStoreDriver?(): Promise<any>;
   logger: (message: string, params?: any) => void;
 }
 
@@ -540,6 +544,9 @@ export class XcubeRuntime {
   /** Each model's data sources, and the drivers Cube holds for them. */
   public readonly connections: Connections;
 
+  /** The SQL runner's runs on this instance. */
+  public readonly sqlRuns: SqlRuns;
+
   protected started = false;
 
   protected stopped = false;
@@ -569,6 +576,7 @@ export class XcubeRuntime {
     );
     // A connection changed: the model's sync serves a new identity as a new epoch.
     this.connections.onChanged = (model) => this.sync(model).catch(() => undefined);
+    this.sqlRuns = new SqlRuns(this.instanceId, () => this.ops, (m, p) => this.log(m, p));
     this.verifier = new TokenVerifier(this.tokens, {
       modelClaim: () => this.options?.modelClaim ?? 'xcubeModel',
       revisionClaim: () => this.options?.revisionClaim ?? 'xcubeRevision',
@@ -1972,6 +1980,67 @@ export class XcubeRuntime {
   }
 
   /**
+   * Runs read-only SQL on a model's data source, on one an overlay brings
+   * (named as its previews name it: `<folderId>__<name>`, a root one by its
+   * short name), or on Cube Store (`sql/runs.ts`).
+   */
+  public async runSql(model: string, on: { connection: string; overlay?: string } | { cubeStore: true }, request: SqlRunRequest): Promise<SqlAnswer> {
+    return this.sqlRuns.run(model, await this.sqlTargetOf(model, on, request), request);
+  }
+
+  /** Cancels a model's SQL run, on whichever instance runs it. */
+  public cancelSql(model: string, runId: string): Promise<{ found: boolean }> {
+    return this.sqlRuns.cancel(model, runId);
+  }
+
+  protected async sqlTargetOf(model: string, on: { connection: string; overlay?: string } | { cubeStore: true }, request: SqlRunRequest): Promise<SqlTarget> {
+    if ('cubeStore' in on) {
+      const core = this.requireCore();
+      if (!core.cubeStoreDriver) {
+        throw new SqlRunError('unknown_connection', 'This Cube has no Cube Store');
+      }
+      return {
+        dialect: 'cubestore',
+        label: 'cubestore',
+        build: async () => {
+          const driver = await core.cubeStoreDriver!();
+          if (!driver) {
+            throw new Error('This Cube has no Cube Store');
+          }
+          return { driver, secrets: [] };
+        },
+      };
+    }
+    const store = this.requireStore();
+    let connection: Pick<import('../store/revisions').StoredConnection, 'name' | 'driver' | 'authMethod' | 'fields' | 'sealed'> | undefined;
+    if (on.overlay !== undefined) {
+      const overlay = await store.overlay(model, on.overlay);
+      if (!overlay) {
+        throw new SqlRunError('unknown_overlay', `No overlay "${on.overlay}": it expired, was dropped, or never was`);
+      }
+      connection = overlay.connections
+        .map((c) => ({ ...c, name: fullNameOf(c.folderId, c.name) }))
+        .find((c) => c.name === on.connection);
+    } else {
+      connection = (await store.connections(model)).find((c) => c.name === on.connection);
+    }
+    if (!connection) {
+      throw new SqlRunError('unknown_connection', `No connection "${on.connection}"${on.overlay === undefined ? '' : ` in overlay "${on.overlay}"`}`);
+    }
+    const found = connection;
+    // The database's own statement timeout, where Cube's driver sets it from its config.
+    const config: Record<string, unknown> = {
+      snowflake: { executionTimeout: Math.ceil(request.timeoutMs / 1000) },
+      mssql: { requestTimeout: request.timeoutMs },
+    }[found.driver] ?? {};
+    return {
+      dialect: (isDriverType(found.driver) ? DRIVERS[found.driver].cubeType : found.driver) as SessionDialect,
+      label: on.overlay === undefined ? found.name : `overlay ${on.overlay}/${found.name}`,
+      build: async () => this.connections.runnerDriver(found, config),
+    };
+  }
+
+  /**
    * Seals secrets again to the active credential key, each with the binding
    * it had: rotation, never a re-bind. An item that doesn't open is answered
    * with an error, never with anything of it.
@@ -2414,6 +2483,12 @@ export class XcubeRuntime {
   // ------------------------------------------------------------ following
 
   protected notified(model: string, notice: Notice = {}) {
+    if (notice.sqlCancel !== undefined) {
+      if (notice.instance === this.instanceId) {
+        this.sqlRuns.cancelHere(notice.sqlCancel);
+      }
+      return;
+    }
     if (notice.connection !== undefined) {
       if (this.admit(model)) {
         this.persistently('a connection', model, () => this.connections.changed(model, notice.connection!));
