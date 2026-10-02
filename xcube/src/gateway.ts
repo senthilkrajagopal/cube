@@ -45,7 +45,9 @@ import { isCompanion } from './calcs/companions';
 import { CalculationError } from './calcs/requests';
 import { modelSchemaSuffix } from './config';
 import { Connections } from './connections/connections';
-import { MODULE_KEY, type XcubeRuntime } from './runtime/runtime';
+import {
+  MODULE_KEY, OVERLAY_ID, OverlaySourceError, type XcubeRuntime,
+} from './runtime/runtime';
 import { ROLE_KEY } from './security/verifier';
 
 /** A UUID derived from text, for the compiler id of a merged meta (the SQL API wants a UUID). */
@@ -745,8 +747,9 @@ export class XcubeApiGateway extends ApiGateway {
       userMiddlewares,
       asyncHandler(async (req, res) => {
         await this.introspect(req, res, async (context) => {
-          const { search } = this.validRequest<{ search?: string }>(dataSourceSchemasRequestSchema, req.query);
-          const introspection = await this.dataSourceIntrospection(context, req.params.dataSource);
+          const { overlay, query } = this.overlayParam(req, context);
+          const { search } = this.validRequest<{ search?: string }>(dataSourceSchemasRequestSchema, query);
+          const introspection = await this.dataSourceIntrospection(context, req.params.dataSource, overlay);
           const schemas = await introspection.schemas();
           return {
             schemas: schemas.filter(name => matchesSearch(name, search)).map(name => ({ name })),
@@ -760,11 +763,12 @@ export class XcubeApiGateway extends ApiGateway {
       userMiddlewares,
       asyncHandler(async (req, res) => {
         await this.introspect(req, res, async (context) => {
+          const { overlay, query } = this.overlayParam(req, context);
           const { schema, ...page } = this.validRequest<DataSourceTablesRequest>(
             dataSourceTablesRequestSchema,
-            req.query,
+            query,
           );
-          const introspection = await this.dataSourceIntrospection(context, req.params.dataSource);
+          const introspection = await this.dataSourceIntrospection(context, req.params.dataSource, overlay);
           return pageOfTables(await introspection.tables(schema), page);
         });
       })
@@ -776,11 +780,12 @@ export class XcubeApiGateway extends ApiGateway {
       userMiddlewares,
       asyncHandler(async (req, res) => {
         await this.introspect(req, res, async (context) => {
+          const { overlay } = this.overlayParam(req, context);
           const { tables } = this.validRequest<DataSourceTableRefsRequest>(
             dataSourceColumnsRequestSchema(),
             req.body,
           );
-          const introspection = await this.dataSourceIntrospection(context, req.params.dataSource);
+          const introspection = await this.dataSourceIntrospection(context, req.params.dataSource, overlay);
           return { tables: await introspection.columns(tables) };
         });
       })
@@ -792,11 +797,12 @@ export class XcubeApiGateway extends ApiGateway {
       userMiddlewares,
       asyncHandler(async (req, res) => {
         await this.introspect(req, res, async (context) => {
+          const { overlay } = this.overlayParam(req, context);
           const { tables, format } = this.validRequest<DataSourceScaffoldRequest>(
             dataSourceScaffoldRequestSchema(),
             req.body,
           );
-          const introspection = await this.dataSourceIntrospection(context, req.params.dataSource);
+          const introspection = await this.dataSourceIntrospection(context, req.params.dataSource, overlay);
           return { cubes: await introspection.scaffold(tables, { format }) };
         });
       })
@@ -821,6 +827,11 @@ export class XcubeApiGateway extends ApiGateway {
       await this.assertApiScope(INTROSPECTION_SCOPE as any, context?.securityContext);
       response(await handler(context), { status: 200 });
     } catch (e: any) {
+      if (e instanceof OverlaySourceError) {
+        // Refused as the SQL runner refuses: a code beside the message.
+        response({ error: e.message, code: e.code }, { status: e.status });
+        return;
+      }
       this.handleError({
         e,
         context,
@@ -829,6 +840,25 @@ export class XcubeApiGateway extends ApiGateway {
         requestStarted,
       });
     }
+  }
+
+  /**
+   * `?overlay=<id>`: the data source is one that overlay brings. For the
+   * service credential alone; the rest of the query string as the route
+   * takes it.
+   */
+  protected overlayParam(req: Request, context: RequestContext): { overlay?: string; query: Record<string, unknown> } {
+    const { overlay, ...query } = (req.query ?? {}) as Record<string, unknown>;
+    if (overlay === undefined) {
+      return { query };
+    }
+    if (typeof overlay !== 'string' || !OVERLAY_ID.test(overlay)) {
+      throw new OverlaySourceError(400, 'invalid_overlay_id', 'An overlay id is 1 to 64 of A-Z, a-z, 0-9, _ and -');
+    }
+    if (!this.xcubeRuntime()?.serving || context?.securityContext?.[ROLE_KEY] !== 'service') {
+      throw new OverlaySourceError(403, 'forbidden', 'An overlay\'s data sources are browsed with the service credential');
+    }
+    return { overlay, query };
   }
 
   protected validRequest<T>(schema: Joi.ObjectSchema, input: unknown): T {
@@ -881,11 +911,18 @@ export class XcubeApiGateway extends ApiGateway {
 
   /**
    * @throws CubejsHandlerError 404 when the data source isn't one the client may browse
+   * @throws OverlaySourceError 404 when the overlay, or its data source, isn't there
    */
   protected async dataSourceIntrospection(
     context: RequestContext,
     dataSource: string,
+    overlay?: string,
   ): Promise<DataSourceIntrospectionApi> {
+    if (overlay !== undefined) {
+      // The overlay's own data source, on its own orchestrator: never a published one of the same name.
+      const pinned = await this.xcubeRuntime()!.overlaySourceContext(context, overlay, dataSource);
+      return this.introspectionFor(await this.getAdapterApi(pinned), dataSource, context.requestId);
+    }
     const known = await this.dataSourceDescriptions(context);
     if (!known.some(description => description.dataSource === dataSource)) {
       throw new CubejsHandlerError(404, 'Not Found', `Unknown data source: '${dataSource}'`);

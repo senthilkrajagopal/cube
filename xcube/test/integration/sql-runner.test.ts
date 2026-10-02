@@ -21,8 +21,10 @@ import express from 'express';
 import request from 'supertest';
 import { Client } from 'pg';
 
+import jwt from 'jsonwebtoken';
+
 import {
-  createConfig, generateCredentialKey, sealSecretV1, XcubeRuntime, XcubeServerCore, type XcubeSettings,
+  createConfig, DEFAULT_TOKENS, generateCredentialKey, sealSecretV1, XcubeRuntime, XcubeServerCore, type XcubeSettings,
 } from '../../src';
 import { initAdminRoutes } from '../../src/admin/routes';
 
@@ -37,6 +39,8 @@ const ORACLE = process.env.XCUBE_TEST_ORACLE;
 jest.setTimeout(180 * 1000);
 
 const ADMIN_TOKEN = 'admin-token-0123456789abcdef-sql-runner';
+const service = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+const serviceJwk = { ...service.publicKey.export({ format: 'jwk' }), kid: 'svc' };
 const PASSWORD_MARK = 'sql-runner-wrong-password-4711';
 
 describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources and Cube Store', () => {
@@ -88,6 +92,7 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
     maxModels: 100,
     modules: { packMin: 1, packMax: 300 },
     credentials: { dir: keysDir, kids: [key.kid], activeKid: key.kid },
+    tokens: { ...DEFAULT_TOKENS, serviceKeys: JSON.stringify({ keys: [serviceJwk] }) },
   });
 
   beforeAll(async () => {
@@ -332,6 +337,44 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
     expect((await run('fsales__scratch', { sql: 'SELECT 1' }).expect(404)).body.code).toBe('unknown_connection');
     expect((await run('default', { sql: 'SELECT 1' }, '?overlay=ws-1').expect(404)).body.code).toBe('unknown_connection');
     expect((await run('fsales__scratch', { sql: 'SELECT 1' }, '?overlay=ws-2').expect(404)).body.code).toBe('unknown_overlay');
+  });
+
+  test('introspection browses an overlay\'s own data source with ?overlay=, never a published one of its name', async () => {
+    const now = () => Math.floor(Date.now() / 1000);
+    const token = (claims: object = { wechartModel: model }) => jwt.sign(
+      { aud: 'xcube-admin', role: 'service', iat: now(), exp: now() + 120, ...claims },
+      service.privateKey.export({ format: 'pem', type: 'pkcs8' }) as string,
+      { algorithm: 'RS256', keyid: 'svc' },
+    );
+    const introspect = (route: string, body?: object, bearer = token()) => {
+      const req = body
+        ? request(server).post(`/cubejs-api/v1/introspection/data-sources/${route}`).send(body)
+        : request(server).get(`/cubejs-api/v1/introspection/data-sources/${route}`);
+      return req.set('Authorization', bearer);
+    };
+    const schemas = await introspect('fsales__scratch/schemas?overlay=ws-1').expect(200);
+    expect(schemas.body.schemas).toContainEqual({ name: 'public' });
+    const tables = await introspect('fsales__scratch/tables?overlay=ws-1&schema=public').expect(200);
+    expect(tables.body.tables.map((t: any) => t.name)).toEqual(['notes']);
+    const columns = await introspect('fsales__scratch/columns?overlay=ws-1', { tables: [{ schema: 'public', table: 'notes' }] }).expect(200);
+    expect(columns.body.tables[0].columns.map((c: any) => [c.name, c.rawType])).toEqual([['id', 'integer'], ['body', 'text']]);
+    const scaffolded = await introspect('fsales__scratch/scaffold?overlay=ws-1', { tables: [{ schema: 'public', table: 'notes' }] }).expect(200);
+    expect(scaffolded.body.cubes).toHaveLength(1);
+
+    // An overlay bringing a `default` of its own, on another database: its own, never the published one.
+    const fields = { ...target, database: workspaceDb };
+    await admin('put', '/overlays/ws-3', { connections: [{ ...pgConnection(undefined, fields), folderId: 'froot', name: 'default' }] }).expect(201);
+    const own = await introspect('default/tables?overlay=ws-3&schema=public').expect(200);
+    expect(own.body.tables.map((t: any) => t.name)).toEqual(['notes']);
+    const published = await introspect(`default/tables?schema=${warehouse}`).expect(200);
+    expect(published.body.tables.map((t: any) => t.name)).toContain('orders');
+
+    // Refused as the SQL route refuses.
+    expect((await introspect('fsales__scratch/schemas').expect(404)).body.error).toMatch(/Unknown data source/);
+    expect((await introspect('default/schemas?overlay=ws-1').expect(404)).body).toMatchObject({ code: 'unknown_connection' });
+    expect((await introspect('fsales__scratch/schemas?overlay=ws-9').expect(404)).body).toMatchObject({ code: 'unknown_overlay' });
+    expect((await introspect('fsales__scratch/schemas?overlay=bad%20id').expect(400)).body).toMatchObject({ code: 'invalid_overlay_id' });
+    expect((await introspect('fsales__scratch/schemas?overlay=ws-1', undefined, token({}))).body).toMatchObject({ code: 'bad_request' });
   });
 
   test('the logs name the run and how it ended, never its SQL', () => {

@@ -1308,6 +1308,19 @@ A data source can be browsed when it is declared in `CUBEJS_DATASOURCES` (or
 is `default` when none are), or when the data model names it. An unknown data
 source answers `404`.
 
+**An overlay's own data source.** With `?overlay={id}`, the `schemas`,
+`tables`, `columns` and `scaffold` routes browse a data source that overlay
+brings, under the service credential alone. It is named as the overlay's
+previews name it: `<folderId>__<name>`, a root one by its short name.
+- The request is pinned to the overlay's version, as a preview of it is, so
+  its catalog is read on the overlay's own orchestrator and driver. A
+  published connection of the same name is never used.
+- Refusals are `{ "error": …, "code": … }`, as the SQL runner's:
+  - `404 unknown_overlay` and `404 unknown_connection`;
+  - `400 invalid_overlay_id`;
+  - `400 bad_request` for a service token naming no model;
+  - `403 forbidden` for any other credential.
+
 Data sources whose driver doesn't load schemas incrementally (Druid, Dremio,
 Firebolt, Hive, ksqlDB, MongoBI, Oracle, Pinot, QuestDB, SQLite, Vertica and
 the generic JDBC driver) are read in full for each request, and their tables

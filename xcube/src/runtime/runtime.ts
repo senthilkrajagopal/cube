@@ -227,6 +227,13 @@ export function epochOfKey(key: string): string | undefined {
 /** An overlay id: what the client names a workspace or a proposal by. */
 export const OVERLAY_ID = /^[A-Za-z0-9_-]{1,64}$/;
 
+/** A refusal to browse a data source an overlay brings: its status, and a code as the SQL runner's. */
+export class OverlaySourceError extends Error {
+  public constructor(public readonly status: number, public readonly code: string, message: string) {
+    super(message);
+  }
+}
+
 /** What pushing an overlay came to. */
 export type OverlayOutcome =
   | { status: 'unknown' | 'mode' | 'too_many' }
@@ -1986,6 +1993,29 @@ export class XcubeRuntime {
    */
   public async runSql(model: string, on: { connection: string; overlay?: string } | { cubeStore: true }, request: SqlRunRequest): Promise<SqlAnswer> {
     return this.sqlRuns.run(model, await this.sqlTargetOf(model, on, request), request);
+  }
+
+  /**
+   * A service context for browsing a data source an overlay brings, named as
+   * its previews name it (`<folderId>__<name>`): pinned to the overlay's
+   * version, as a preview of it is, so that its catalog is read on the
+   * overlay's own orchestrator and driver, never a published connection's.
+   */
+  public async overlaySourceContext(context: any, overlayId: string, dataSource: string): Promise<any> {
+    const model = this.modelOfContext(context);
+    if (model === undefined) {
+      throw new OverlaySourceError(400, 'bad_request', 'Browsing an overlay\'s data source takes a service token naming its model');
+    }
+    const record = await this.overlayRecord(model, overlayId);
+    if (!record) {
+      throw new OverlaySourceError(404, 'unknown_overlay', `No overlay "${overlayId}": it expired, was dropped, or never was`);
+    }
+    if (!record.connections.some((c) => fullNameOf(c.folderId, c.name) === dataSource)) {
+      throw new OverlaySourceError(404, 'unknown_connection', `No connection "${dataSource}" in overlay "${overlayId}"`);
+    }
+    const securityContext = { ...context.securityContext, [this.servingOptions.overlayClaim ?? 'xcubeOverlay']: overlayId };
+    const pin = await this.pinFor({ securityContext });
+    return { ...context, securityContext, authInfo: securityContext, ...pin };
   }
 
   /** Cancels a model's SQL run, on whichever instance runs it. */
