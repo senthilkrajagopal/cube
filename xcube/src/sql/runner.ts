@@ -32,11 +32,15 @@ export interface SqlCaps {
   maxBytesBilled?: number;
 }
 
-export interface SqlAnswer {
+/** The rows a run read: all of them, or those before a cap (`rows`, `bytes`) or a stop (`stopped`). */
+export interface SqlRows {
   columns: SqlColumn[];
   rows: unknown[][];
   rowCount: number;
-  truncated: 'rows' | 'bytes' | null;
+  truncated: 'rows' | 'bytes' | 'stopped' | null;
+}
+
+export interface SqlAnswer extends SqlRows {
   durationMs: number;
   statement: StatementKind;
   redactedSql: string;
@@ -53,6 +57,8 @@ export class SqlRunError extends Error {
     public readonly redactedSql: string | null = null,
     public readonly statement: string | null = null,
     public readonly durationMs: number | null = null,
+    /** A run stopped at its time cap or cancelled: the rows it read before. */
+    public readonly partial: SqlRows | null = null,
   ) {
     super(message);
   }
@@ -136,6 +142,12 @@ export class RowCollector {
   public get full(): boolean {
     return this.truncated !== null;
   }
+
+  /** The rows read before a stop, as they stand: a session let go of may still be adding. */
+  public stopped(): SqlRows {
+    const rows = this.rows.slice();
+    return { columns: this.columns, rows, rowCount: rows.length, truncated: 'stopped' };
+  }
 }
 
 /** A run's connection: the statement run on it, stopped on the database, and let go. */
@@ -189,19 +201,28 @@ async function pgSession(driver: any, dialect: 'postgres' | 'redshift', caps: Sq
   return {
     async run(sql, rows) {
       const cursor = client.query(new Cursor(sql, [], { rowMode: 'array', types: { getTypeParser: driver.getTypeParser } }));
+      const columnsOf = (result: any) => {
+        if (!rows.columns.length && result?.fields) {
+          rows.setColumns(result.fields.map((f: any) => ({
+            name: f.name,
+            type: driver.getPostgresTypeForField?.(f.dataTypeID) ?? `oid ${f.dataTypeID}`,
+          })));
+        }
+      };
+      // Each row as it arrives, not a batch at a time: a stop keeps those read before it.
+      let more = true;
+      cursor.on('row', (row: unknown[], result: any) => {
+        columnsOf(result);
+        more = more && rows.add(row);
+      });
       try {
         for (;;) {
           const batch = batchOf(rows, caps.maxRows);
           const [read, result] = await new Promise<[unknown[][], any]>((resolve, reject) => {
             cursor.read(batch, (err: Error | null, got: unknown[][], res: any) => (err ? reject(err) : resolve([got, res])));
           });
-          if (!rows.columns.length && result?.fields) {
-            rows.setColumns(result.fields.map((f: any) => ({
-              name: f.name,
-              type: driver.getPostgresTypeForField?.(f.dataTypeID) ?? `oid ${f.dataTypeID}`,
-            })));
-          }
-          if (!read.every((row) => rows.add(row)) || read.length < batch) {
+          columnsOf(result);
+          if (!more || read.length < batch) {
             break;
           }
         }
@@ -457,6 +478,9 @@ async function mssqlSession(driver: any): Promise<SqlSession> {
   };
 }
 
+/** Oracle's rows per round trip. */
+const ORACLE_FETCH = 100;
+
 /**
  * Oracle: a connection of the run's own with `callTimeout`, in a read-only
  * transaction, the rows read from a result set to the cap (Cube's driver has
@@ -477,6 +501,9 @@ async function oracleSession(driver: any, caps: SqlCaps): Promise<SqlSession> {
       const result = await conn.execute(sql, [], {
         resultSet: true,
         outFormat: db.OUT_FORMAT_ARRAY,
+        // One round trip per read: a stop loses at most the fetch it interrupts.
+        fetchArraySize: ORACLE_FETCH,
+        prefetchRows: ORACLE_FETCH,
         fetchTypeHandler: (meta: any) => {
           if (meta.dbType === db.DB_TYPE_CLOB || meta.dbType === db.DB_TYPE_NCLOB) {
             return { type: db.STRING };
@@ -488,7 +515,7 @@ async function oracleSession(driver: any, caps: SqlCaps): Promise<SqlSession> {
       const set = result.resultSet;
       try {
         for (;;) {
-          const batch = batchOf(rows, caps.maxRows);
+          const batch = Math.min(ORACLE_FETCH, batchOf(rows, caps.maxRows));
           const read: unknown[][] = await set.getRows(batch);
           if (!read.every((row) => rows.add(row)) || read.length < batch) {
             break;

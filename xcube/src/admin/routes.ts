@@ -723,7 +723,9 @@ export function initAdminRoutes(
       if (!(e instanceof SqlRunError)) {
         throw e;
       }
-      logger('xcube: SQL run', { ...logged, outcome: e.code, durationMs: Date.now() - started });
+      logger('xcube: SQL run', {
+        ...logged, outcome: e.code, ...(e.partial ? { rows: e.partial.rowCount } : {}), durationMs: Date.now() - started,
+      });
       const status = SQL_STATUS[e.code];
       if (status === 503) {
         res.set('Retry-After', '5');
@@ -734,6 +736,8 @@ export function initAdminRoutes(
         statement: e.statement,
         redactedSql: e.redactedSql,
         ...(e.durationMs === null ? {} : { durationMs: e.durationMs }),
+        // A stopped run: the rows read before the stop.
+        ...(e.partial ?? {}),
       });
     }
   });

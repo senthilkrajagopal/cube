@@ -695,8 +695,8 @@ function with an autonomous transaction.
 
 **Caps per run**, sent with each run (R50's by default):
 - **Rows** (`maxRows`, 10,000; at most 100,000): read as they come, one past
-  the cap, and no further. Oracle's are read from a result set, and Dremio's
-  a page of 500 at a time, only to the cap. Cube Store answers every row at
+  the cap, and no further. Oracle's are read from a result set 100 at a time,
+  and Dremio's a page of 500 at a time, only to the cap. Cube Store answers every row at
   once, so a SELECT there is asked for one past the cap by its own top-level
   `LIMIT`, added or lowered (a subquery would lose its order).
 - **Time** (`timeoutMs`, 30 s; at most 10 minutes), stopped on the database:
@@ -709,6 +709,17 @@ function with an autonomous transaction.
 - **Bytes** (`maxBytes`, 10 MB; at most 100 MB) of the answer's rows as JSON.
 - BigQuery takes `maxBytesBilled` too: its job fails, without charge, past it.
 - At most 16 runs at once on an instance (`503 busy` past that).
+
+**A run stopped at its time cap, or cancelled, answers the rows it read
+before**, marked `truncated: "stopped"`, beside its `422` and `code`. How many
+depends on when the database sends them:
+- every row that arrived on PostgreSQL, Redshift and MySQL;
+- SQL Server's in whole 4 KB network packets: a result smaller than one
+  arrives only at its end;
+- Oracle's in whole fetches of 100 rows;
+- none on Snowflake, BigQuery and Dremio while the query runs, since their
+  results come only once it has finished, nor on Cube Store. A stop while
+  their results are being read keeps those read.
 
 **Cancel.** A run is cancelled by its `runId`, from any instance: the run is
 noted in xcube's database while it runs (`sql_runs`), and a cancel for another
@@ -1108,7 +1119,10 @@ previews name it: `<folderId>__<name>`, a root one by its short name.
 ```
 
 `truncated` is `rows`, `bytes` or `null`; `statement` is `select` or
-`explain`. Otherwise `{ error, code, statement, redactedSql, durationMs? }`:
+`explain`. Otherwise `{ error, code, statement, redactedSql, durationMs? }`;
+a `timeout` or `cancelled` also has the rows read before the stop:
+`columns`, `rows`, `rowCount` and `truncated: "stopped"` (no columns when
+none were known yet):
 
 | Status | `code` | |
 | --- | --- | --- |
@@ -1129,7 +1143,7 @@ The same, on Cube Store.
 
 `{ runId }` → `{ model, runId, found }`. It cancels the run on whichever
 instance runs it. `found` says the run was running. The run's own request then
-answers `cancelled`.
+answers `cancelled`, with the rows it read before.
 
 #### `GET /v1/semantic/credential-keys`, `POST /v1/semantic/credentials/rewrap`
 

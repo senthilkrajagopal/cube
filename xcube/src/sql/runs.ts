@@ -3,7 +3,7 @@ import {
   classifySql, SqlRefusal, withRowCap, type SqlDialect,
 } from './classify';
 import {
-  isTimeout, openSession, RowCollector, SqlRunError, type SessionDialect, type SqlAnswer, type SqlCaps, type SqlSession,
+  isTimeout, openSession, RowCollector, SqlRunError, type SessionDialect, type SqlAnswer, type SqlCaps, type SqlRows, type SqlSession,
 } from './runner';
 
 /** What a run runs on: its dialect, and its own driver, built for it. */
@@ -96,7 +96,11 @@ export class SqlRuns {
       throw e;
     }
     const { statement, redactedSql } = classified;
-    const fail = (code: SqlRunError['code'], message: string, durationMs: number | null = null) => new SqlRunError(code, message, redactedSql, statement, durationMs);
+    const fail = (code: SqlRunError['code'], message: string, durationMs: number | null = null, partial: SqlRows | null = null) => new SqlRunError(
+      code, message, redactedSql, statement, durationMs, partial,
+    );
+    // Stopped before anything ran: no rows, and no columns.
+    const none: SqlRows = { columns: [], rows: [], rowCount: 0, truncated: 'stopped' };
 
     if (this.local.has(request.runId)) {
       throw fail('run_in_progress', `Run ${request.runId} is running`);
@@ -126,9 +130,10 @@ export class SqlRuns {
       setTimeout(abandon, CANCEL_GRACE_MS).unref?.();
     };
     this.local.set(request.runId, { model, cancel: () => stop('cancelled') });
-    const stopped = (ranAt: number | null): SqlRunError => (reason === 'timeout'
-      ? fail('timeout', `The statement ran past ${elapsed(request.timeoutMs)} and was stopped${dialect === 'cubestore' ? ' (Cube Store stops it at its own query timeout)' : ''}`, ranAt === null ? null : Date.now() - ranAt)
-      : fail('cancelled', 'The run was cancelled', ranAt === null ? null : Date.now() - ranAt));
+    // A stopped run answers the rows it read before the stop, marked `stopped`.
+    const stopped = (ranAt: number | null, read: SqlRows): SqlRunError => (reason === 'timeout'
+      ? fail('timeout', `The statement ran past ${elapsed(request.timeoutMs)} and was stopped${dialect === 'cubestore' ? ' (Cube Store stops it at its own query timeout)' : ''}`, ranAt === null ? null : Date.now() - ranAt, read)
+      : fail('cancelled', 'The run was cancelled', ranAt === null ? null : Date.now() - ranAt, read));
 
     let built: { driver: any; secrets: string[] } | null = null;
     try {
@@ -139,12 +144,12 @@ export class SqlRuns {
         }), CONNECT_MS, 'Connecting');
       } catch (e: any) {
         if (reason) {
-          throw stopped(null);
+          throw stopped(null, none);
         }
         throw fail('connect_failed', redact(String(e?.message ?? e), built?.secrets ?? []));
       }
       if (reason) {
-        throw stopped(null);
+        throw stopped(null, none);
       }
 
       const ranAt = Date.now();
@@ -158,17 +163,17 @@ export class SqlRuns {
           throw e;
         }
         if (reason) {
-          throw stopped(ranAt);
+          throw stopped(ranAt, rows.stopped());
         }
         if (isTimeout(dialect, e)) {
-          throw fail('timeout', `The statement ran past ${elapsed(request.timeoutMs)} and was stopped`, Date.now() - ranAt);
+          throw fail('timeout', `The statement ran past ${elapsed(request.timeoutMs)} and was stopped`, Date.now() - ranAt, rows.stopped());
         }
         throw fail('query_failed', redact(String(e?.message ?? e), built.secrets), Date.now() - ranAt);
       } finally {
         clearTimeout(clock);
       }
       if (reason) {
-        throw stopped(ranAt);
+        throw stopped(ranAt, rows.stopped());
       }
       return {
         columns: rows.columns,

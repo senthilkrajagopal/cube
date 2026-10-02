@@ -180,7 +180,7 @@ describe('the SQL runner: each database\'s session, on drivers shaped as Cube\'s
     await session.close();
     expect(conn.callTimeout).toBe(30000);
     expect(executed).toEqual(['SET TRANSACTION READ ONLY', 'SELECT a FROM t']);
-    expect(conn.execute.mock.calls[1][2]).toMatchObject({ resultSet: true, outFormat: 4001 });
+    expect(conn.execute.mock.calls[1][2]).toMatchObject({ resultSet: true, outFormat: 4001, fetchArraySize: 100, prefetchRows: 100 });
     expect(conn.execute.mock.calls[1][2].fetchTypeHandler({ dbType: 'clob' })).toEqual({ type: 's' });
     expect(set.getRows).toHaveBeenCalledWith(4);
     expect(rows).toMatchObject({ columns: [{ name: 'A', type: 'NUMBER' }], rows: [[1], [2], [3]], truncated: 'rows' });
@@ -332,6 +332,48 @@ describe('the SQL runner: runs', () => {
     expect(await runs.cancel('m', 'elsewhere')).toEqual({ found: true });
     expect(registry.announced).toEqual([{ model: 'm', runId: 'elsewhere', instance: 'there' }]);
     expect(await runs.cancel('m', 'gone')).toEqual({ found: false });
+  });
+
+  test('a run stopped at its time cap, or cancelled, answers the rows it read before, marked stopped', async () => {
+    // A SQL Server-shaped driver: three rows, then nothing until it is cancelled.
+    const slow = (): SqlTarget => ({
+      dialect: 'mssql',
+      label: 'mssql',
+      build: async () => ({
+        secrets: [],
+        driver: {
+          release: jest.fn(),
+          initialConnectPromise: Promise.resolve({
+            transaction: () => ({
+              begin: async () => undefined,
+              rollback: async () => undefined,
+              request: () => {
+                const asked: any = new EventEmitter();
+                asked.query = () => setImmediate(() => {
+                  asked.emit('recordset', [{ name: 'n', type: { declaration: 'int' } }]);
+                  [1, 2, 3].forEach((n) => asked.emit('row', [n]));
+                });
+                asked.cancel = () => setImmediate(() => {
+                  asked.emit('error', Object.assign(new Error('Canceled.'), { code: 'ECANCEL' }));
+                  asked.emit('done');
+                });
+                return asked;
+              },
+            }),
+          }),
+        },
+      }),
+    });
+    const runs = new SqlRuns('here', () => null, () => undefined);
+    const read = { columns: [{ name: 'n', type: 'int' }], rows: [[1], [2], [3]], rowCount: 3, truncated: 'stopped' };
+    await expect(runs.run('m', slow(), request({ sql: 'SELECT n FROM t', runId: 't1', timeoutMs: 10, maxRows: 10 })))
+      .rejects.toMatchObject({ code: 'timeout', partial: read });
+    const running = runs.run('m', slow(), request({ sql: 'SELECT n FROM t', runId: 'c1', maxRows: 10 }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await runs.cancel('m', 'c1');
+    await expect(running).rejects.toMatchObject({ code: 'cancelled', partial: read });
+    // A refusal, or a failure, has none.
+    await expect(runs.run('m', slow(), request({ sql: 'DELETE FROM t', runId: 'd1' }))).rejects.toMatchObject({ code: 'not_read_only', partial: null });
   });
 
   test('one run per id, and at most so many at once on an instance', async () => {

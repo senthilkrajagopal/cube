@@ -256,11 +256,28 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
     expect(Date.now() - started).toBeLessThan(5000);
   });
 
+  test('a run stopped at its time cap answers the rows read before, marked stopped', async () => {
+    const res = await run('default', {
+      sql: 'SELECT g, CASE WHEN g > 3 THEN pg_sleep(3)::text END AS slept FROM generate_series(1, 10) g', timeoutMs: 2000,
+    }).expect(422);
+    expect(res.body).toMatchObject({
+      code: 'timeout',
+      columns: [{ name: 'g', type: 'int4' }, { name: 'slept', type: 'text' }],
+      rows: [[1, null], [2, null], [3, null]],
+      rowCount: 3,
+      truncated: 'stopped',
+    });
+    // Stopped before a row: none, and the columns as far as known.
+    const none = await run('default', { sql: 'SELECT pg_sleep(5)::text AS slept', timeoutMs: 1000 }).expect(422);
+    expect(none.body).toMatchObject({ code: 'timeout', rows: [], rowCount: 0, truncated: 'stopped' });
+  });
+
   test('a run is cancelled by its id, here or from another instance, and stops on the database', async () => {
     const cancelFrom = async (at: http.Server) => {
       const runId = crypto.randomUUID();
-      const running = admin('post', '/connections/default/sql', { runId, sql: 'SELECT pg_sleep(20) AS slept' }).then((r) => r);
-      for (let i = 0; i < 50 && !(await sql('SELECT 1 FROM pg_stat_activity WHERE query = \'SELECT pg_sleep(20) AS slept\'')).length; i++) {
+      const slow = 'SELECT g, CASE WHEN g > 2 THEN pg_sleep(20)::text END AS slept FROM generate_series(1, 5) g';
+      const running = admin('post', '/connections/default/sql', { runId, sql: slow }).then((r) => r);
+      for (let i = 0; i < 50 && !(await sql(`SELECT 1 FROM pg_stat_activity WHERE query = '${slow}'`)).length; i++) {
         await sleep(100);
       }
       const started = Date.now();
@@ -268,9 +285,10 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
       expect(cancelled.body).toEqual({ model, runId, found: true });
       const res = await running;
       expect(res.status).toBe(422);
-      expect(res.body).toMatchObject({ code: 'cancelled' });
+      // The rows read before the cancel come back with it, from either instance.
+      expect(res.body).toMatchObject({ code: 'cancelled', rows: [[1, null], [2, null]], rowCount: 2, truncated: 'stopped' });
       expect(Date.now() - started).toBeLessThan(5000);
-      expect(await sql('SELECT 1 FROM pg_stat_activity WHERE query = \'SELECT pg_sleep(20) AS slept\'')).toEqual([]);
+      expect(await sql(`SELECT 1 FROM pg_stat_activity WHERE query = '${slow}'`)).toEqual([]);
     };
     await cancelFrom(server);
     await cancelFrom(otherServer);
