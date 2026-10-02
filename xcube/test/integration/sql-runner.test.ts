@@ -267,9 +267,11 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
       rowCount: 3,
       truncated: 'stopped',
     });
-    // Stopped before a row: none, and the columns as far as known.
+    // Stopped before a row: none, but the columns the server described.
     const none = await run('default', { sql: 'SELECT pg_sleep(5)::text AS slept', timeoutMs: 1000 }).expect(422);
-    expect(none.body).toMatchObject({ code: 'timeout', rows: [], rowCount: 0, truncated: 'stopped' });
+    expect(none.body).toMatchObject({
+      code: 'timeout', columns: [{ name: 'slept', type: 'text' }], rows: [], rowCount: 0, truncated: 'stopped',
+    });
   });
 
   test('a run is cancelled by its id, here or from another instance, and stops on the database', async () => {

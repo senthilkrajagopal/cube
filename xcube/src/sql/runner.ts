@@ -209,6 +209,14 @@ async function pgSession(driver: any, dialect: 'postgres' | 'redshift', caps: Sq
           })));
         }
       };
+      // The columns as soon as the server describes them, before any row: a stop then still has them.
+      const describe = cursor.handleRowDescription?.bind(cursor);
+      if (describe) {
+        cursor.handleRowDescription = (msg: any) => {
+          describe(msg);
+          columnsOf(msg);
+        };
+      }
       // Each row as it arrives, not a batch at a time: a stop keeps those read before it.
       let more = true;
       cursor.on('row', (row: unknown[], result: any) => {
