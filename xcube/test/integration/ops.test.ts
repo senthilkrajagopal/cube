@@ -182,7 +182,8 @@ describeWithDatabase('operations: the build queue, hidden cubes and the refresh 
     expect(answer.notCancelled).toEqual([{ key: running.key, reason: 'processing' }, { key: 'no-such-key', reason: 'gone' }]);
     // A processing one, when asked to.
     const stopped = (await admin(m.queued, 'post', '/pre-aggregations/queue/cancel', { keys: [running.key], processing: true }).expect(200)).body;
-    expect(stopped.cancelled).toEqual([{ key: running.key, preAggregation: running.preAggregation, status: 'processing' }]);
+    // Stopped: its query cancelled on the source, at the queue's heartbeat (`builds.test.ts`).
+    expect(stopped.cancelled).toEqual([{ key: running.key, preAggregation: running.preAggregation, status: 'processing', build: 'stopped' }]);
     const left = (await admin(m.queued, 'get', '/pre-aggregations/queue').expect(200)).body.queue.map((e: any) => e.key);
     expect(left).not.toContain(waiting.key);
     expect(left).not.toContain(running.key);

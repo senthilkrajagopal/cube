@@ -10,6 +10,7 @@ import type { DriverFactoryByDataSource } from '@cubejs-backend/query-orchestrat
 // Only a type in the package's index: the class is needed to read its protected cache.
 import { OrchestratorStorage } from '@cubejs-backend/server-core/dist/src/core/OrchestratorStorage';
 
+import { stoppableExternal, stoppableSource } from './builds/stop';
 import { CatalogQueues } from './catalog/queue';
 import { Connections } from './connections/connections';
 import { globalRuntime, runtimeOf } from './config';
@@ -78,16 +79,19 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
         },
       })
       : driver);
+    // A build the queue's cancel takes out while it builds is stopped: its source query
+    // cancelled, and none of its tables committed (`builds/stop.ts`).
+    const log = (message: string, params?: object) => this.logger(message, params || {});
     const tracked: DriverFactoryByDataSource = async (dataSource, preAggregations) => {
       const driver: any = await getDriver(dataSource, preAggregations);
       if (driver?.__xcubeConnection) {
         connections.add(driver);
       }
-      return guarded(driver);
+      return stoppableSource(guarded(driver), log);
     };
     const external = (options as any).externalDriverFactory as (() => Promise<any>) | undefined;
     const orchestratorApi = super.createOrchestratorApi(tracked, external
-      ? { ...options, externalDriverFactory: async () => guarded(await external()) } as OrchestratorApiOptions
+      ? { ...options, externalDriverFactory: async () => stoppableExternal(guarded(await external())) } as OrchestratorApiOptions
       : options);
     const release = orchestratorApi.release.bind(orchestratorApi);
     orchestratorApi.release = async () => {

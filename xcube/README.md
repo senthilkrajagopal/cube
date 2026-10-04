@@ -1038,11 +1038,29 @@ queue with others). Oldest first:
 #### `POST …/pre-aggregations/queue/cancel`
 
 `{ "keys": [...], "processing": false }` cancels entries of the model's queue:
-`{ "cancelled": [{ key, preAggregation, status }], "notCancelled": [{ key, reason }] }`,
-`reason` being `processing` or `gone`.
+`{ "cancelled": [{ key, preAggregation, status, build? }], "notCancelled": [{ key, reason }] }`,
+`reason` being `processing`, `gone` or `finished`.
 - A queued entry is taken out of the queue.
-- A processing one only with `"processing": true`: it is taken out, and the
-  instance building it stops the build at its queue's next heartbeat (8 s).
+- A processing one only with `"processing": true`. It is taken out, and the
+  instance building it stops the build at once if it is the one asked, else
+  at its queue's next heartbeat (8 s). How it stops:
+  - its query is cancelled on the source: PostgreSQL's with
+    `pg_cancel_backend`, and others with their driver's own cancel, where its
+    build call has one; a stream already reading is cut;
+  - none of it is kept: its upload to Cube Store is refused, and a table it
+    made anyway, in Cube Store or in the source, is dropped;
+  - it fails with `xcube stopped this build: …`, which Cube's jobs API
+    reports as `failure: xcube stopped this build: …`.
+- **The answer waits for the outcome,** up to two heartbeats (20 s). A
+  processing entry is answered:
+  - under `cancelled` with `build`: `stopped`, `failed` (it failed of its own
+    first: no version either), or `stopping` (no outcome within the wait;
+    read the jobs API);
+  - or under `notCancelled` as `finished`: it ended before the stop reached
+    it, and its version stands.
+- **Where a driver's build call has no cancel,** its query may run on in the
+  database. No table of it is kept, and the build still fails as stopped.
+  Checked on PostgreSQL alone.
 - **A build the refresh worker queued comes back.** The worker's next run
   (every 30 s) finds the rollup still due, its refresh key unchanged, and
   queues it again, under the same key: the key is the refresh key's value.

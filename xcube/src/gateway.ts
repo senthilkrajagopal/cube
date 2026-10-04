@@ -43,7 +43,8 @@ import { PreAggregations } from '@cubejs-backend/query-orchestrator';
 import { initAdminRoutes } from './admin/routes';
 import { isCompanion } from './calcs/companions';
 import { CalculationError } from './calcs/requests';
-import { modelSchemaSuffix } from './config';
+import { modelSchemaSuffix, QUEUE_HEART_BEAT_S } from './config';
+import { STOPPED } from './builds/stop';
 import { Connections } from './connections/connections';
 import {
   MODULE_KEY, OVERLAY_ID, OverlaySourceError, type XcubeRuntime,
@@ -130,6 +131,39 @@ function publicMembersOf(cubes: any[]): any[] {
       segments: config.segments?.filter(visible),
     }))
     .filter((config) => config.measures?.length || config.dimensions?.length || config.segments?.length);
+}
+
+/** How long a cancel waits for a processing build to stop: two of the queue's heartbeats, and some. */
+const STOP_WAIT_MS = (QUEUE_HEART_BEAT_S * 2 + 4) * 1000;
+
+/**
+ * What came of a processing build the queue's cancel took out, from the
+ * status its loader records: `stopped` (it failed as stopped), `failed` (it
+ * failed of itself), `finished` (it landed: it was `building`, and its status
+ * went), or `stopping` (none of those within the wait).
+ */
+export async function buildOutcome(
+  status: () => Promise<{ status?: string; error?: string } | null>,
+  waitMs = STOP_WAIT_MS,
+): Promise<'stopped' | 'failed' | 'finished' | 'stopping'> {
+  let building = false;
+  for (const until = Date.now() + waitMs; ;) {
+    const now = await status().catch(() => undefined);
+    if (now?.status === 'failure') {
+      return now.error === STOPPED ? 'stopped' : 'failed';
+    }
+    if (now?.status === 'building') {
+      building = true;
+    } else if (now === null && building) {
+      return 'finished';
+    }
+    if (Date.now() >= until) {
+      return 'stopping';
+    }
+    await new Promise((resolve) => {
+      setTimeout(resolve, 250);
+    });
+  }
 }
 
 /** The API scope the introspection routes are in. */
@@ -418,15 +452,23 @@ export class XcubeApiGateway extends ApiGateway {
    * processing one only with `processing` (its instance stops it at its next
    * heartbeat). Says why any wasn't: processing, or already gone.
    */
+  /**
+   * Cancels entries of a model's build queue. A processing one is stopped by
+   * the instance building it at its queue's next heartbeat (`builds/stop.ts`):
+   * the answer waits for that, up to two heartbeats, and says what came of
+   * it. A build that ended before the stop reached it made its version: it is
+   * answered under `notCancelled`, `finished`.
+   */
   public async ownCancel(model: string, keys: string[], processing: boolean): Promise<{
-    cancelled: { key: string; preAggregation: string | null; status: 'queued' | 'processing' }[];
-    notCancelled: { key: string; reason: 'processing' | 'gone' }[];
+    cancelled: { key: string; preAggregation: string | null; status: 'queued' | 'processing'; build?: 'stopped' | 'failed' | 'stopping' }[];
+    notCancelled: { key: string; reason: 'processing' | 'gone' | 'finished' }[];
   }> {
     const runtime = this.xcubeRuntime()!;
     const orchestratorApi = await this.getAdapterApi(await runtime.adminContext(model) as RequestContext);
     const entries = new Map((await this.ownQueue(model)).map((entry) => [entry.key, entry]));
-    const cancelled: { key: string; preAggregation: string | null; status: 'queued' | 'processing' }[] = [];
-    const notCancelled: { key: string; reason: 'processing' | 'gone' }[] = [];
+    const cancelled: { key: string; preAggregation: string | null; status: 'queued' | 'processing'; build?: 'stopped' | 'failed' | 'stopping' }[] = [];
+    const notCancelled: { key: string; reason: 'processing' | 'gone' | 'finished' }[] = [];
+    const stopping: QueueEntry[] = [];
     for (const key of [...new Set(keys)]) {
       const entry = entries.get(key);
       if (!entry) {
@@ -435,9 +477,24 @@ export class XcubeApiGateway extends ApiGateway {
         notCancelled.push({ key, reason: 'processing' });
       } else {
         await orchestratorApi.cancelPreAggregationQueriesFromQueue([key], entry.dataSource);
-        cancelled.push({ key, preAggregation: entry.preAggregation, status: entry.status });
+        if (entry.status === 'processing') {
+          stopping.push(entry);
+        } else {
+          cancelled.push({ key, preAggregation: entry.preAggregation, status: entry.status });
+        }
       }
     }
+    const preAggregations = orchestratorApi.getQueryOrchestrator().getPreAggregations();
+    const outcomes = await Promise.all(stopping.map((entry) => buildOutcome(
+      () => (entry.targetTable ? preAggregations.getPreAggregationBuildStatus(entry.targetTable) : Promise.resolve(null)),
+    )));
+    stopping.forEach((entry, i) => {
+      if (outcomes[i] === 'finished') {
+        notCancelled.push({ key: entry.key, reason: 'finished' });
+      } else {
+        cancelled.push({ key: entry.key, preAggregation: entry.preAggregation, status: 'processing', build: outcomes[i] as 'stopped' | 'failed' | 'stopping' });
+      }
+    });
     return { cancelled, notCancelled };
   }
 
