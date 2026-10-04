@@ -114,7 +114,7 @@ token="$(node -e '
   const part = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
   const body = `${part({ alg: "HS256", typ: "JWT" })}.${part({ wechartModel: "check", wechartRevision: Number(process.argv[2]) })}`;
   console.log(`${body}.${crypto.createHmac("sha256", process.argv[1]).update(body).digest("base64url")}`);
-' "$API_SECRET" "$revision")"
+' -- "$API_SECRET" "$revision")"
 
 answer="$(curl -s -D /tmp/xcube-headers.txt -H "Authorization: $token" -H 'Content-Type: application/json' \
   --data '{"query": {"measures": ["serving_check.total"]}}' "$CUBE_URL/cubejs-api/v1/load")"
@@ -145,7 +145,7 @@ token="$(node -e '
   const part = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
   const body = `${part({ alg: "HS256", typ: "JWT" })}.${part({ wechartModel: "items", wechartRevision: Number(process.argv[2]) })}`;
   console.log(`${body}.${crypto.createHmac("sha256", process.argv[1]).update(body).digest("base64url")}`);
-' "$API_SECRET" "$revision")"
+' -- "$API_SECRET" "$revision")"
 answer="$(curl -s -H "Authorization: $token" -H 'Content-Type: application/json' \
   --data '{"query": {"measures": ["fsub__doubled.total"]}}' "$CUBE_URL/cubejs-api/v1/load")"
 echo "$answer" | head -c 300; echo
@@ -198,11 +198,12 @@ echo "Overlay check passed: a workspace's change previewed through its overlay, 
 # Slice 6: a model whose default data source is a connection, its password
 # sealed (by the image's own code, as the client's browser would) to the key.
 target='{"host": "'"$PG_HOST"'", "port": 5432, "database": "test", "ssl": false}'
+# `--` ends node's options: a key's x may start with `-`.
 sealed="$(docker run --rm --network "$DOCKER_NETWORK" --entrypoint node "$IMAGE" -e '
   const { sealSecretV1 } = require("/cube/node_modules/xcube/dist/src/credentials/credentials");
   const [x, kid, target] = process.argv.slice(1);
   console.log(JSON.stringify(sealSecretV1(x, kid, "postgres", "password", JSON.parse(target), "test")));
-' "$(sed -E 's/.*"x":"([^"]+)".*/\1/' "$keys/credential.jwk")" "$credential_kid" "$target")"
+' -- "$(sed -E 's/.*"x":"([^"]+)".*/\1/' "$keys/credential.jwk")" "$credential_kid" "$target")"
 conn() {
   curl -s -o /tmp/xcube-admin.json -w '%{http_code}' -X "$1" \
     -H "Authorization: Bearer $service" -H 'Content-Type: application/json' \
@@ -219,7 +220,7 @@ conn_token="$(node -e '
   const part = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
   const body = `${part({ alg: "HS256", typ: "JWT" })}.${part({ wechartModel: "conn", wechartRevision: Number(process.argv[2]) })}`;
   console.log(`${body}.${crypto.createHmac("sha256", process.argv[1]).update(body).digest("base64url")}`);
-' "$API_SECRET" "$conn_revision")"
+' -- "$API_SECRET" "$conn_revision")"
 answer="$(curl -s -H "Authorization: $conn_token" -H 'Content-Type: application/json' \
   --data '{"query": {"measures": ["via_connection.total"]}}' "$CUBE_URL/cubejs-api/v1/load")"
 echo "$answer" | grep -q '"via_connection.total":"42"' || { echo "a query through the connection got: $(echo "$answer" | head -c 300)"; exit 1; }
