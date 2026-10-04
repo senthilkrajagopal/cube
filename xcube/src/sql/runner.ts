@@ -59,6 +59,8 @@ export class SqlRunError extends Error {
     public readonly durationMs: number | null = null,
     /** A run stopped at its time cap or cancelled: the rows it read before. */
     public readonly partial: SqlRows | null = null,
+    /** A stopped run the database runs on (Cube Store): when it ends at the latest. */
+    public readonly endsBy: Date | null = null,
   ) {
     super(message);
   }
@@ -155,6 +157,8 @@ export interface SqlSession {
   run(sql: string, rows: RowCollector): Promise<void>;
   /** Stops the statement on the database, as far as it can; never throws. */
   cancel(): Promise<void>;
+  /** Where the database can't stop a statement (Cube Store): resolves once it has really ended; never rejects. */
+  ended?(): Promise<void>;
   /** Rolls back, and lets the connection go; never throws. */
   close(): Promise<void>;
 }
@@ -594,11 +598,18 @@ async function dremioSession(driver: any): Promise<SqlSession> {
  * Cube Store: a connection of the run's own. It answers every row at once,
  * so a SELECT is asked for at most the cap's one row more (`withRowCap`);
  * its values come as strings, and it reports no types.
+ *
+ * It can't stop a query: each runs in a task of its own, on however its
+ * connection ends, until it finishes or Cube Store's own query timeout
+ * (`CUBESTORE_QUERY_TIMEOUT`) stops it. Its answer, on the connection kept
+ * open, says when that is.
  */
 async function cubeStoreSession(driver: any): Promise<SqlSession> {
+  let pending: Promise<any> | null = null;
   return {
     async run(sql, rows) {
-      const answer: any = await driver.query(sql, []);
+      pending = Promise.resolve(driver.query(sql, []));
+      const answer: any = await pending;
       const length = Number(answer?.length ?? 0);
       const names = length ? Object.keys(answer[0]) : [];
       rows.setColumns(names.map((name) => ({ name, type: null })));
@@ -609,8 +620,10 @@ async function cubeStoreSession(driver: any): Promise<SqlSession> {
       }
     },
     async cancel() {
-      // Cube Store has no cancel: the connection goes, and its own query timeout stops the query.
-      await quietly(() => driver.release());
+      // Nothing stops it: see `ended`.
+    },
+    ended() {
+      return pending ? pending.then(() => undefined, () => undefined) : Promise.resolve();
     },
     async close() {
       await quietly(() => driver.release());

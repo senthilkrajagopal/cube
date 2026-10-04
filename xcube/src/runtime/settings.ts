@@ -24,6 +24,8 @@ export interface XcubeSettings {
   catchUpMs: number;
   /** How often each instance re-writes its report of each connection it holds a live driver for. */
   connectionHeartbeatMs?: number;
+  /** Cube Store's own query timeout, as set on it (`CUBESTORE_QUERY_TIMEOUT`): when a SQL run it runs on ends at the latest. */
+  cubeStoreQueryTimeoutMs?: number;
   /** Bearer tokens the admin routes accept. */
   adminTokens: string[];
   /** Most models one process keeps state for; a model beyond it is refused. */
@@ -107,6 +109,13 @@ function number(env: NodeJS.ProcessEnv, name: string, fallback: number): number 
 /** Every 10 minutes: a report within the hour then means an instance running. */
 export const DEFAULT_CONNECTION_HEARTBEAT_MS = 10 * 60 * 1000;
 
+function cubeStoreTimeout(seconds: number): number {
+  if (seconds < 1 || seconds > 86400) {
+    throw new Error('XCUBE_CUBESTORE_QUERY_TIMEOUT must be from 1 to 86400 seconds, as CUBESTORE_QUERY_TIMEOUT is set on Cube Store');
+  }
+  return seconds;
+}
+
 function heartbeat(ms: number): number {
   if (ms < 10000 || ms > 30 * 60 * 1000) {
     throw new Error('XCUBE_CONNECTION_HEARTBEAT_MS must be from 10000 to 1800000: well within the hour a report counts for');
@@ -176,6 +185,7 @@ export function settingsFromEnv(env: NodeJS.ProcessEnv = process.env): XcubeSett
     compileWaitMs: number(env, 'XCUBE_COMPILE_WAIT_MS', 120000),
     catchUpMs: number(env, 'XCUBE_CATCH_UP_MS', 10000),
     connectionHeartbeatMs: heartbeat(number(env, 'XCUBE_CONNECTION_HEARTBEAT_MS', DEFAULT_CONNECTION_HEARTBEAT_MS)),
+    cubeStoreQueryTimeoutMs: cubeStoreTimeout(number(env, 'XCUBE_CUBESTORE_QUERY_TIMEOUT', 120)) * 1000,
     adminTokens,
     maxModels: number(env, 'XCUBE_MAX_MODELS', 1000),
     modules: {

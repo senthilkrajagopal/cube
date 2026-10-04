@@ -8,6 +8,7 @@
  *   INTROSPECTION_TEST_MYSQL       a MySQL as host:port (user root, password test, database test)
  *   XCUBE_TEST_DREMIO_URL          a Dremio Software, its first user made by connection-drivers.test.ts or here
  *   XCUBE_TEST_CUBESTORE           a Cube Store as host:port (docker run cubejs/cubestore)
+ *   XCUBE_TEST_CUBESTORE_QUERY_TIMEOUT  its CUBESTORE_QUERY_TIMEOUT in seconds; at most 30 runs the run-on case
  *   XCUBE_TEST_MSSQL               a SQL Server as host:port (user sa, password Xcube-test-Pass1)
  *   XCUBE_TEST_ORACLE              an Oracle as host:port (gvenzl/oracle-free: PDB FREEPDB1, user xcube, password xcube_test_pass1)
  */
@@ -33,6 +34,8 @@ const describeWithDatabase = DATABASE_URL ? describe : describe.skip;
 const MYSQL = process.env.INTROSPECTION_TEST_MYSQL;
 const DREMIO_URL = process.env.XCUBE_TEST_DREMIO_URL;
 const CUBESTORE = process.env.XCUBE_TEST_CUBESTORE;
+/** The Cube Store's own CUBESTORE_QUERY_TIMEOUT in seconds: a short one (at most 30) runs the run-on case. */
+const CUBESTORE_TIMEOUT = Number(process.env.XCUBE_TEST_CUBESTORE_QUERY_TIMEOUT ?? 120);
 const MSSQL = process.env.XCUBE_TEST_MSSQL;
 const ORACLE = process.env.XCUBE_TEST_ORACLE;
 
@@ -93,6 +96,7 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
     modules: { packMin: 1, packMax: 300 },
     credentials: { dir: keysDir, kids: [key.kid], activeKid: key.kid },
     tokens: { ...DEFAULT_TOKENS, serviceKeys: JSON.stringify({ keys: [serviceJwk] }) },
+    cubeStoreQueryTimeoutMs: CUBESTORE_TIMEOUT * 1000,
   });
 
   beforeAll(async () => {
@@ -182,6 +186,7 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
     fields: { ...fields, user: url.username },
     sealed: { password: seal(password, fields) },
   });
+  const cubeStoreQuery = (text: string) => cubeStore.query(text, []);
   const run = (name: string, body: object, query = '') => admin('post', `/connections/${name}/sql${query}`, { runId: crypto.randomUUID(), ...body });
   const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -488,6 +493,53 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
     const res = await running;
     return { code: res.body.code, ms: Date.now() - started };
   };
+
+  (CUBESTORE && CUBESTORE_TIMEOUT <= 30 ? test : test.skip)('Cube Store runs a stopped query on: stopping until it ends, as both instances see', async () => {
+    await cubeStoreQuery(`CREATE TABLE sqlr_${suffix}.big (a int)`);
+    await cubeStoreQuery(`INSERT INTO sqlr_${suffix}.big (a) VALUES ${Array.from({ length: 2000 }, (_x, i) => `(${i})`).join(', ')}`);
+    const slow = `SELECT count(*) AS n FROM sqlr_${suffix}.big a CROSS JOIN sqlr_${suffix}.big b CROSS JOIN sqlr_${suffix}.big c WHERE a.a + b.a + c.a = 7`;
+    const state = async (runId: string, at: http.Server = server) => (await admin('get', `/sql/runs/${runId}`, undefined, at).expect(200)).body;
+    const untilEnded = async (runId: string) => {
+      for (let i = 0; i < CUBESTORE_TIMEOUT * 10 + 100 && (await state(runId)).state !== 'ended'; i++) {
+        await sleep(100);
+      }
+      return Date.now();
+    };
+    try {
+      // At the time cap: answered at once, and stopping until Cube Store's own timeout ends it.
+      const runId = crypto.randomUUID();
+      const started = Date.now();
+      const res = await admin('post', '/cubestore/sql', { runId, sql: slow, timeoutMs: 1000 }).expect(422);
+      expect(res.body).toMatchObject({ code: 'timeout', rows: [], truncated: 'stopped', stillRunning: true });
+      expect(Date.now() - started).toBeLessThan(5000);
+      const endsBy = new Date(res.body.endsBy).getTime();
+      expect(endsBy - started).toBeGreaterThan(CUBESTORE_TIMEOUT * 1000 - 2000);
+      expect(await state(runId)).toEqual({ model, runId, state: 'stopping', endsBy: res.body.endsBy });
+      expect(await state(runId, otherServer)).toEqual({ model, runId, state: 'stopping', endsBy: res.body.endsBy });
+      await admin('post', '/cubestore/sql', { runId, sql: 'SELECT 1' }).expect(409);
+      const ended = await untilEnded(runId);
+      expect(ended).toBeLessThan(endsBy + 6000);
+      expect(ended - started).toBeGreaterThan(CUBESTORE_TIMEOUT * 1000 - 2000);
+      expect(await state(runId, otherServer)).toEqual({ model, runId, state: 'ended' });
+
+      // Cancelled: the same.
+      const cancelId = crypto.randomUUID();
+      const running = admin('post', '/cubestore/sql', { runId: cancelId, sql: slow }).then((r) => r);
+      await sleep(1000);
+      expect((await admin('post', '/sql/cancel', { runId: cancelId }, otherServer).expect(200)).body.found).toBe(true);
+      const answer = await running;
+      expect(answer.status).toBe(422);
+      expect(answer.body).toMatchObject({ code: 'cancelled', stillRunning: true });
+      expect((await state(cancelId)).state).toBe('stopping');
+      await untilEnded(cancelId);
+      // A run that answers is ended at once.
+      const quick = crypto.randomUUID();
+      await admin('post', '/cubestore/sql', { runId: quick, sql: 'SELECT 1 AS n' }).expect(200);
+      expect(await state(quick)).toEqual({ model, runId: quick, state: 'ended' });
+    } finally {
+      await cubeStoreQuery(`DROP TABLE sqlr_${suffix}.big`).catch(() => undefined);
+    }
+  });
 
   (MSSQL ? test : test.skip)('SQL Server: a batch stays one statement; the caps, the time cap and a cancel', async () => {
     const [host, port] = MSSQL!.split(':');

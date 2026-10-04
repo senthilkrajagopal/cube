@@ -583,7 +583,7 @@ export class XcubeRuntime {
     );
     // A connection changed: the model's sync serves a new identity as a new epoch.
     this.connections.onChanged = (model) => this.sync(model).catch(() => undefined);
-    this.sqlRuns = new SqlRuns(this.instanceId, () => this.ops, (m, p) => this.log(m, p));
+    this.sqlRuns = new SqlRuns(this.instanceId, () => this.ops, (m, p) => this.log(m, p), settings.cubeStoreQueryTimeoutMs ?? 120000);
     this.verifier = new TokenVerifier(this.tokens, {
       modelClaim: () => this.options?.modelClaim ?? 'xcubeModel',
       revisionClaim: () => this.options?.revisionClaim ?? 'xcubeRevision',
@@ -2021,6 +2021,11 @@ export class XcubeRuntime {
   /** Cancels a model's SQL run, on whichever instance runs it. */
   public cancelSql(model: string, runId: string): Promise<{ found: boolean }> {
     return this.sqlRuns.cancel(model, runId);
+  }
+
+  /** Where a model's SQL run is, on whichever instance runs it: running, stopping (Cube Store runs it on), or ended. */
+  public sqlRunState(model: string, runId: string) {
+    return this.sqlRuns.state(model, runId);
   }
 
   protected async sqlTargetOf(model: string, on: { connection: string; overlay?: string } | { cubeStore: true }, request: SqlRunRequest): Promise<SqlTarget> {

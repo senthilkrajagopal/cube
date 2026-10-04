@@ -346,6 +346,18 @@ export const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    version: 13,
+    name: 'sql runs stopping',
+    // Additive: older code reads and writes the columns it names.
+    minReader: 2,
+    sql: (s) => `
+      -- A Cube Store run answered as stopped, which Cube Store runs on: when
+      -- it was stopped, and when it ends at the latest.
+      ALTER TABLE ${s}.sql_runs ADD COLUMN stopped_at timestamptz;
+      ALTER TABLE ${s}.sql_runs ADD COLUMN ends_by timestamptz;
+    `,
+  },
 ];
 
 /** The newest schema version this code knows. */

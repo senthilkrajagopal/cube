@@ -210,6 +210,25 @@ export class PgOpsStore {
     return row?.instance ?? null;
   }
 
+  /** Notes a SQL run as stopped but run on by Cube Store, until `endsBy` at the latest. */
+  public async stopSqlRun(runId: string, instance: string, endsBy: Date): Promise<void> {
+    await this.pool.query(
+      `UPDATE ${this.s}.sql_runs SET stopped_at = now(), ends_by = $3::timestamptz,
+         expires_at = GREATEST(expires_at, $3::timestamptz + interval '1 minute')
+       WHERE run_id = $1 AND instance = $2`,
+      [runId, instance, endsBy],
+    );
+  }
+
+  /** A model's SQL run while it runs, or runs on stopped: `null` once it has ended. */
+  public async sqlRunState(runId: string, model: string): Promise<{ stopped: boolean; endsBy: Date | null } | null> {
+    const { rows: [row] } = await this.pool.query(
+      `SELECT stopped_at, ends_by FROM ${this.s}.sql_runs WHERE run_id = $1 AND model = $2 AND expires_at > now()`,
+      [runId, model],
+    );
+    return row ? { stopped: row.stopped_at !== null, endsBy: row.ends_by ? new Date(row.ends_by) : null } : null;
+  }
+
   /** Tells the instance running a SQL run to cancel it. */
   public async announceSqlCancel(model: string, runId: string, instance: string): Promise<void> {
     await this.pool.query('SELECT pg_notify($1, $2)', [channelOf(this.s), JSON.stringify({ model, sqlCancel: runId, instance })]);

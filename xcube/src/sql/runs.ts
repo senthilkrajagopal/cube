@@ -29,6 +29,16 @@ export interface SqlRunRegistry {
   sqlRunInstance(runId: string, model: string): Promise<string | null>;
   /** Tells the instance running a run to cancel it. */
   announceSqlCancel(model: string, runId: string, instance: string): Promise<void>;
+  /** Notes a run as stopped but run on by the database (Cube Store), until `endsBy` at the latest. */
+  stopSqlRun(runId: string, instance: string, endsBy: Date): Promise<void>;
+  /** A model's run while it runs, or runs on stopped: `null` once it has ended. */
+  sqlRunState(runId: string, model: string): Promise<{ stopped: boolean; endsBy: Date | null } | null>;
+}
+
+/** Where a run is: running, stopped but run on by the database until `endsBy` at the latest, or ended. */
+export interface SqlRunState {
+  state: 'running' | 'stopping' | 'ended';
+  endsBy?: string;
 }
 
 /** Connecting has its own limit, as the connection test's. */
@@ -42,6 +52,9 @@ const CANCEL_GRACE_MS = 5000;
 
 /** How long letting a run's connection go may take before the answer goes without it. */
 const CLOSE_MS = 10000;
+
+/** How long past its expected end a stopped Cube Store run is waited on. */
+const ENDS_GRACE_MS = 5000;
 
 /** At most this many runs at once on one instance: each holds up to its byte cap of rows, beside the queries it serves. */
 export const MAX_RUNS = 16;
@@ -66,10 +79,15 @@ function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<
 export class SqlRuns {
   protected readonly local = new Map<string, { model: string; cancel: () => void }>();
 
+  /** Runs answered as stopped that Cube Store runs on, until each ends: by run id. */
+  protected readonly stopping = new Map<string, { model: string; endsBy: Date }>();
+
   public constructor(
     protected readonly instanceId: string,
     protected readonly registry: () => SqlRunRegistry | null,
     protected readonly log: (message: string, params?: Record<string, unknown>) => void,
+    /** Cube Store's own query timeout (`CUBESTORE_QUERY_TIMEOUT`): when a query it runs on ends at the latest. */
+    protected readonly cubeStoreTimeoutMs: number = 120000,
   ) {}
 
   public get running(): number {
@@ -96,13 +114,17 @@ export class SqlRuns {
       throw e;
     }
     const { statement, redactedSql } = classified;
-    const fail = (code: SqlRunError['code'], message: string, durationMs: number | null = null, partial: SqlRows | null = null) => new SqlRunError(
-      code, message, redactedSql, statement, durationMs, partial,
-    );
+    const fail = (
+      code: SqlRunError['code'],
+      message: string,
+      durationMs: number | null = null,
+      partial: SqlRows | null = null,
+      endsBy: Date | null = null,
+    ) => new SqlRunError(code, message, redactedSql, statement, durationMs, partial, endsBy);
     // Stopped before anything ran: no rows, and no columns.
     const none: SqlRows = { columns: [], rows: [], rowCount: 0, truncated: 'stopped' };
 
-    if (this.local.has(request.runId)) {
+    if (this.local.has(request.runId) || this.stopping.has(request.runId)) {
       throw fail('run_in_progress', `Run ${request.runId} is running`);
     }
     if (this.local.size >= MAX_RUNS) {
@@ -116,6 +138,8 @@ export class SqlRuns {
 
     let reason: 'timeout' | 'cancelled' | null = null;
     let session: SqlSession | null = null;
+    // Cube Store runs a stopped query on: the run answers at once, and its connection waits for the end.
+    let runsOn: Date | null = null;
     let abandon: () => void = () => undefined;
     const abandoned = new Promise<'abandoned'>((resolve) => {
       abandon = () => resolve('abandoned');
@@ -126,14 +150,22 @@ export class SqlRuns {
       }
       reason = why;
       session?.cancel().catch(() => undefined);
-      // A statement that won't stop is left to its connection's end.
-      setTimeout(abandon, CANCEL_GRACE_MS).unref?.();
+      // A statement that won't stop is left to its connection's end; one nothing stops, at once.
+      setTimeout(abandon, session?.ended ? 0 : CANCEL_GRACE_MS).unref?.();
     };
     this.local.set(request.runId, { model, cancel: () => stop('cancelled') });
-    // A stopped run answers the rows it read before the stop, marked `stopped`.
-    const stopped = (ranAt: number | null, read: SqlRows): SqlRunError => (reason === 'timeout'
-      ? fail('timeout', `The statement ran past ${elapsed(request.timeoutMs)} and was stopped${dialect === 'cubestore' ? ' (Cube Store stops it at its own query timeout)' : ''}`, ranAt === null ? null : Date.now() - ranAt, read)
-      : fail('cancelled', 'The run was cancelled', ranAt === null ? null : Date.now() - ranAt, read));
+    // A stopped run answers the rows it read before the stop, marked `stopped`; on Cube Store,
+    // which runs the query on, when it ends at the latest.
+    const stopped = (ranAt: number | null, read: SqlRows): SqlRunError => {
+      const took = ranAt === null ? null : Date.now() - ranAt;
+      if (ranAt !== null && session?.ended) {
+        runsOn = new Date(ranAt + this.cubeStoreTimeoutMs);
+      }
+      const onward = runsOn ? `; Cube Store can't stop a query, and runs it on until it ends, by ${runsOn.toISOString()} at the latest` : '';
+      return reason === 'timeout'
+        ? fail('timeout', `The statement ran past ${elapsed(request.timeoutMs)} and was stopped${onward}`, took, read, runsOn)
+        : fail('cancelled', `The run was cancelled${onward}`, took, read, runsOn);
+    };
 
     let built: { driver: any; secrets: string[] } | null = null;
     try {
@@ -186,17 +218,70 @@ export class SqlRuns {
       };
     } finally {
       this.local.delete(request.runId);
-      // A connection that won't let go never holds the answer.
-      await withTimeout(Promise.resolve(session?.close()), CLOSE_MS, 'Closing').catch(() => undefined);
-      await withTimeout(Promise.resolve(built?.driver?.release?.()), CLOSE_MS, 'Releasing').catch(() => undefined);
-      if (built) {
-        built.secrets.length = 0;
-      }
-      if (registry) {
-        await registry.endSqlRun(request.runId, this.instanceId)
-          .catch((e) => this.log('xcube: could not note a SQL run\'s end', { runId: request.runId, error: e.message }));
+      if (runsOn && session?.ended) {
+        // Noted as stopping before the answer, for every instance; let go only once Cube Store has ended it.
+        await this.runOn(model, request.runId, session, built, runsOn);
+      } else {
+        await this.letGo(request.runId, session, built);
       }
     }
+  }
+
+  /** Closes a run's connection, lets its driver go, and notes its end. */
+  protected async letGo(runId: string, session: SqlSession | null, built: { driver: any; secrets: string[] } | null) {
+    // A connection that won't let go never holds the answer.
+    await withTimeout(Promise.resolve(session?.close()), CLOSE_MS, 'Closing').catch(() => undefined);
+    await withTimeout(Promise.resolve(built?.driver?.release?.()), CLOSE_MS, 'Releasing').catch(() => undefined);
+    if (built) {
+      built.secrets.length = 0;
+    }
+    const registry = this.registry();
+    if (registry) {
+      await registry.endSqlRun(runId, this.instanceId)
+        .catch((e) => this.log('xcube: could not note a SQL run\'s end', { runId, error: e.message }));
+    }
+  }
+
+  /**
+   * A stopped run the database runs on: noted as stopping, here and in the
+   * store, until the database answers it, or a little past when it should
+   * have at the latest. Its connection stays open to hear that answer.
+   */
+  protected async runOn(model: string, runId: string, session: SqlSession, built: { driver: any; secrets: string[] } | null, endsBy: Date) {
+    this.stopping.set(runId, { model, endsBy });
+    await this.registry()?.stopSqlRun(runId, this.instanceId, endsBy)
+      .catch((e) => this.log('xcube: could not note a SQL run as stopping', { runId, error: e.message }));
+    (async () => {
+      let timer: NodeJS.Timeout | undefined;
+      await Promise.race([
+        session.ended!(),
+        new Promise((resolve) => {
+          timer = setTimeout(resolve, Math.max(0, endsBy.getTime() + ENDS_GRACE_MS - Date.now()));
+          timer.unref?.();
+        }),
+      ]);
+      clearTimeout(timer);
+      this.stopping.delete(runId);
+      await this.letGo(runId, session, built);
+      this.log('xcube: SQL run ended in the database', { model, runId });
+    })().catch((e) => this.log('xcube: a stopped SQL run could not be followed to its end', { runId, error: e.message }));
+  }
+
+  /** Where a model's run is: running, stopped but run on by the database, or ended (or never was). */
+  public async state(model: string, runId: string): Promise<SqlRunState> {
+    const here = this.local.get(runId);
+    if (here) {
+      return here.model === model ? { state: 'running' } : { state: 'ended' };
+    }
+    const onward = this.stopping.get(runId);
+    if (onward) {
+      return onward.model === model ? { state: 'stopping', endsBy: onward.endsBy.toISOString() } : { state: 'ended' };
+    }
+    const found = await this.registry()?.sqlRunState(runId, model);
+    if (!found) {
+      return { state: 'ended' };
+    }
+    return found.stopped ? { state: 'stopping', ...(found.endsBy ? { endsBy: found.endsBy.toISOString() } : {}) } : { state: 'running' };
   }
 
   /**
@@ -205,6 +290,10 @@ export class SqlRuns {
    * `cancelled`.
    */
   public async cancel(model: string, runId: string): Promise<{ found: boolean }> {
+    if (this.stopping.get(runId)?.model === model) {
+      // Stopped already; Cube Store runs it on, and nothing more stops it.
+      return { found: true };
+    }
     const here = this.local.get(runId);
     if (here) {
       if (here.model !== model) {

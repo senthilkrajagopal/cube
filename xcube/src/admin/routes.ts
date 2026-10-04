@@ -738,6 +738,8 @@ export function initAdminRoutes(
         ...(e.durationMs === null ? {} : { durationMs: e.durationMs }),
         // A stopped run: the rows read before the stop.
         ...(e.partial ?? {}),
+        // Cube Store runs a stopped query on: until when at the latest (see …/sql/runs/{runId}).
+        ...(e.endsBy ? { stillRunning: true, endsBy: e.endsBy.toISOString() } : {}),
       });
     }
   });
@@ -755,6 +757,16 @@ export function initAdminRoutes(
   }));
 
   app.post(`${base}/cubestore/sql`, auth, json, runSql('cubestore-sql', () => ({ cubeStore: true })));
+
+  app.get(`${base}/sql/runs/:runId`, auth, handle('sql-run', async (req, res) => {
+    const model = modelOf(req);
+    const { runId } = req.params;
+    if (!RUN_ID.test(runId)) {
+      throw new AdminError(400, 'bad_request', 'A run id is 1 to 64 of A-Z, a-z, 0-9, _ and -');
+    }
+    await requireModel(model);
+    res.json({ model, runId, ...await runtime.sqlRunState(model, runId) });
+  }));
 
   app.post(`${base}/sql/cancel`, auth, json, handle('sql-cancel', async (req, res) => {
     const model = modelOf(req);

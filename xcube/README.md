@@ -175,6 +175,7 @@ In both modes:
 | `XCUBE_COMPILE_QUEUE` | `4` | Imports and checks that may wait to compile; more answer `503` |
 | `XCUBE_COMPILE_WAIT_MS` | `120000` | How long one may wait |
 | `XCUBE_CATCH_UP_MS` | `10000` | How long a request naming a newer revision waits for it |
+| `XCUBE_CUBESTORE_QUERY_TIMEOUT` | `120` | Cube Store's own query timeout in seconds, as set on it (`CUBESTORE_QUERY_TIMEOUT`): when a stopped SQL run that Cube Store runs on ends at the latest |
 | `XCUBE_CONNECTION_HEARTBEAT_MS` | `600000` | How often an instance re-writes its report of each connection it holds a driver for (10 s to 30 min), so a report within the hour means an instance running |
 | `CUBEJS_TRANSPILATION_WORKER_THREADS_COUNT` | `2` | Cube's; the image sets it when unset, as unset a compile can take gigabytes |
 
@@ -705,7 +706,7 @@ function with an autonomous transaction.
   `STATEMENT_TIMEOUT_IN_SECONDS`, SQL Server's `requestTimeout`, Oracle's
   `callTimeout`, BigQuery's `jobTimeoutMs`. Then a clock of xcube's, 2 s
   later, cancels it on the database: Dremio's job through its API. Cube Store
-  has no cancel: its own query timeout stops it.
+  can't stop a query (below).
 - **Bytes** (`maxBytes`, 10 MB; at most 100 MB) of the answer's rows as JSON.
 - BigQuery takes `maxBytesBilled` too: its job fails, without charge, past it.
 - At most 16 runs at once on an instance (`503 busy` past that).
@@ -737,6 +738,21 @@ cancel). One run per `runId` at a time.
   `SHOW CHUNKS` and the like answer every row at once. Read
   `information_schema.tables` and `.columns`, `system.tables`,
   `system.partitions`, `system.chunks` and `system.indexes` instead.
+- **Cube Store can't stop a query.** Each query runs in a task of its own,
+  until it finishes or Cube Store's own query timeout stops it.
+  - Closing its connection doesn't stop it.
+  - Neither its protocol nor its SQL has a cancel.
+  - Its one limit is process-wide: `CUBESTORE_QUERY_TIMEOUT`, 120 s by
+    default.
+
+  So a Cube Store run stopped at its time cap, or cancelled, is answered at
+  once, as `422 timeout` or `cancelled`, with `stillRunning: true` and
+  `endsBy`: when Cube Store's timeout ends it at the latest (the run's start
+  plus `XCUBE_CUBESTORE_QUERY_TIMEOUT`).
+  - Until Cube Store answers it, the run keeps its connection open, and is
+    `stopping` on every instance (`GET …/sql/runs/{runId}`). Its `runId`
+    stays taken.
+  - It is `ended` once Cube Store answers, or 5 s past `endsBy`.
 
 **Answers.** Each cell is JSON:
 - binary as `\x` and hex;
@@ -1143,7 +1159,16 @@ The same, on Cube Store.
 
 `{ runId }` → `{ model, runId, found }`. It cancels the run on whichever
 instance runs it. `found` says the run was running. The run's own request then
-answers `cancelled`, with the rows it read before.
+answers `cancelled`, with the rows it read before. A Cube Store run is answered
+`cancelled` too, but Cube Store runs its query on (see SQL runner).
+
+#### `GET …/sql/runs/{runId}`
+
+`{ model, runId, state, endsBy? }`, from any instance. `state` is one of:
+- `running`;
+- `stopping`: a Cube Store run answered as stopped that Cube Store runs on,
+  until `endsBy` at the latest;
+- `ended`: it has ended, or never was.
 
 #### `GET /v1/semantic/credential-keys`, `POST /v1/semantic/credentials/rewrap`
 

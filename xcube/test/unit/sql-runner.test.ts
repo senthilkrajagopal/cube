@@ -266,6 +266,8 @@ describe('the SQL runner: runs', () => {
       announceSqlCancel: async (model, runId, instance) => {
         announced.push({ model, runId, instance });
       },
+      stopSqlRun: async () => undefined,
+      sqlRunState: async (runId, model) => (runs.get(runId)?.model === model ? { stopped: false, endsBy: null } : null),
     };
     return registry;
   };
@@ -374,6 +376,29 @@ describe('the SQL runner: runs', () => {
     await expect(running).rejects.toMatchObject({ code: 'cancelled', partial: read });
     // A refusal, or a failure, has none.
     await expect(runs.run('m', slow(), request({ sql: 'DELETE FROM t', runId: 'd1' }))).rejects.toMatchObject({ code: 'not_read_only', partial: null });
+  });
+
+  test('Cube Store runs a stopped query on: the run answers at once, stopping until its end, then ended', async () => {
+    let finish: () => void = () => undefined;
+    const target = cubeStoreTarget(() => new Promise((resolve) => {
+      finish = () => resolve([]);
+    }));
+    const runs = new SqlRuns('here', () => null, () => undefined, 60000);
+    const started = Date.now();
+    const answer = await runs.run('m', target, request({ runId: 's1', timeoutMs: 10 })).catch((e) => e);
+    expect(answer).toMatchObject({ code: 'timeout', partial: { rows: [], truncated: 'stopped' }, message: expect.stringMatching(/runs it on/) });
+    expect(Date.now() - started).toBeLessThan(4000);
+    expect(answer.endsBy.getTime()).toBeGreaterThanOrEqual(started + 60000);
+    expect(await runs.state('m', 's1')).toEqual({ state: 'stopping', endsBy: answer.endsBy.toISOString() });
+    expect(await runs.state('other', 's1')).toEqual({ state: 'ended' });
+    // Its id is taken until the query ends; cancelling it again finds it stopped.
+    await expect(runs.run('m', target, request({ runId: 's1' }))).rejects.toMatchObject({ code: 'run_in_progress' });
+    expect(await runs.cancel('m', 's1')).toEqual({ found: true });
+    expect(target.released).not.toHaveBeenCalled();
+    finish();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(await runs.state('m', 's1')).toEqual({ state: 'ended' });
+    expect(target.released).toHaveBeenCalled();
   });
 
   test('one run per id, and at most so many at once on an instance', async () => {
