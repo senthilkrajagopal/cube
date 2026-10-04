@@ -211,12 +211,20 @@ export class PgOpsStore {
   }
 
   /** Notes a SQL run as stopped but run on by Cube Store, until `endsBy` at the latest. */
-  public async stopSqlRun(runId: string, instance: string, endsBy: Date): Promise<void> {
+  public async stopSqlRun(runId: string, instance: string, endsBy: Date | null): Promise<void> {
     await this.pool.query(
       `UPDATE ${this.s}.sql_runs SET stopped_at = now(), ends_by = $3::timestamptz,
-         expires_at = GREATEST(expires_at, $3::timestamptz + interval '1 minute')
+         expires_at = GREATEST(expires_at, COALESCE($3::timestamptz, now()) + interval '2 minutes')
        WHERE run_id = $1 AND instance = $2`,
       [runId, instance, endsBy],
+    );
+  }
+
+  /** Keeps a stopping SQL run's note while its instance follows it: it lapses within minutes of the instance stopping. */
+  public async touchSqlRun(runId: string, instance: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE ${this.s}.sql_runs SET expires_at = GREATEST(expires_at, now() + interval '2 minutes') WHERE run_id = $1 AND instance = $2`,
+      [runId, instance],
     );
   }
 

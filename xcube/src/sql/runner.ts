@@ -59,8 +59,8 @@ export class SqlRunError extends Error {
     public readonly durationMs: number | null = null,
     /** A run stopped at its time cap or cancelled: the rows it read before. */
     public readonly partial: SqlRows | null = null,
-    /** A stopped run the database runs on (Cube Store): when it ends at the latest. */
-    public readonly endsBy: Date | null = null,
+    /** A stopped run the database runs on (Cube Store): when it ends at the latest, `endsBy: null` when nothing bounds it. */
+    public readonly runsOn: { endsBy: Date | null } | null = null,
   ) {
     super(message);
   }
@@ -159,6 +159,8 @@ export interface SqlSession {
   cancel(): Promise<void>;
   /** Where the database can't stop a statement (Cube Store): resolves once it has really ended; never rejects. */
   ended?(): Promise<void>;
+  /** Whether the database's own query timeout ends the statement (Cube Store's select workers), once it has run. */
+  endsAtTimeout?(): boolean;
   /** Rolls back, and lets the connection go; never throws. */
   close(): Promise<void>;
 }
@@ -595,6 +597,36 @@ async function dremioSession(driver: any): Promise<SqlSession> {
 }
 
 /**
+ * Whether Cube Store's own query timeout ends a query, from its logical plan
+ * (`EXPLAIN`). A query over its tables runs on a select worker (under
+ * `ClusterSend`), whose process Cube Store kills at its timeout. The router
+ * runs the rest itself (VALUES, information_schema, system tables, and any
+ * join above a `ClusterSend`), and its timeout can't stop that: work that
+ * never yields runs to its end, the timeout with it.
+ */
+export function endsAtCubeStoreTimeout(plan: string): boolean {
+  const lines = plan.split('\n').filter((l) => l.trim()).map((l) => ({ depth: l.length - l.trimStart().length, text: l.trim() }));
+  if (!lines.some((l) => l.text.startsWith('ClusterSend'))) {
+    return false;
+  }
+  return lines.every((line, i) => {
+    if (!/^(Cross)?Join\b/.test(line.text)) {
+      return true;
+    }
+    // Its ancestors: each line before it less indented than the last one found.
+    for (let k = i - 1, { depth } = line; k >= 0; k--) {
+      if (lines[k].depth < depth) {
+        if (lines[k].text.startsWith('ClusterSend')) {
+          return true;
+        }
+        ({ depth } = lines[k]);
+      }
+    }
+    return false;
+  });
+}
+
+/**
  * Cube Store: a connection of the run's own. It answers every row at once,
  * so a SELECT is asked for at most the cap's one row more (`withRowCap`);
  * its values come as strings, and it reports no types.
@@ -606,8 +638,16 @@ async function dremioSession(driver: any): Promise<SqlSession> {
  */
 async function cubeStoreSession(driver: any): Promise<SqlSession> {
   let pending: Promise<any> | null = null;
+  let killable = false;
   return {
     async run(sql, rows) {
+      if (!/^\s*explain\b/i.test(sql)) {
+        // Its plan says where it runs: only work on select workers ends at Cube Store's timeout.
+        const plan: any = await driver.query(`EXPLAIN ${sql}`, []).catch(() => null);
+        killable = Boolean(plan?.length) && endsAtCubeStoreTimeout(String(plan[0]?.['logical plan'] ?? ''));
+      } else {
+        killable = true;
+      }
       pending = Promise.resolve(driver.query(sql, []));
       const answer: any = await pending;
       const length = Number(answer?.length ?? 0);
@@ -624,6 +664,9 @@ async function cubeStoreSession(driver: any): Promise<SqlSession> {
     },
     ended() {
       return pending ? pending.then(() => undefined, () => undefined) : Promise.resolve();
+    },
+    endsAtTimeout() {
+      return killable;
     },
     async close() {
       await quietly(() => driver.release());

@@ -738,21 +738,41 @@ cancel). One run per `runId` at a time.
   `SHOW CHUNKS` and the like answer every row at once. Read
   `information_schema.tables` and `.columns`, `system.tables`,
   `system.partitions`, `system.chunks` and `system.indexes` instead.
-- **Cube Store can't stop a query.** Each query runs in a task of its own,
-  until it finishes or Cube Store's own query timeout stops it.
+- **Cube Store can't stop a query.** Each query runs in a task of its own.
   - Closing its connection doesn't stop it.
   - Neither its protocol nor its SQL has a cancel.
-  - Its one limit is process-wide: `CUBESTORE_QUERY_TIMEOUT`, 120 s by
-    default.
+- **Its timeout ends only part of the work.** Its one limit,
+  `CUBESTORE_QUERY_TIMEOUT` (120 s by default), is process-wide, and what it
+  ends depends on where the query runs:
+  - **On a select worker:** a query over its tables. Its plan has the work
+    under `ClusterSend`. Cube Store kills the worker's process at the
+    timeout.
+  - **On the router:** everything else. That is `VALUES`, its
+    `information_schema` and system tables, and any join above a
+    `ClusterSend`. The timeout can't stop the router's work: work that never
+    yields runs to its end, the timeout with it. Its catalog queries have no
+    timeout at all. A cross join of `VALUES` stopped at a 30 s cap computed
+    for 37 minutes, and other queries starved.
 
-  So a Cube Store run stopped at its time cap, or cancelled, is answered at
-  once, as `422 timeout` or `cancelled`, with `stillRunning: true` and
-  `endsBy`: when Cube Store's timeout ends it at the latest (the run's start
-  plus `XCUBE_CUBESTORE_QUERY_TIMEOUT`).
-  - Until Cube Store answers it, the run keeps its connection open, and is
-    `stopping` on every instance (`GET …/sql/runs/{runId}`). Its `runId`
-    stays taken.
-  - It is `ended` once Cube Store answers, or 5 s past `endsBy`.
+  xcube reads a Cube Store SELECT's plan (`EXPLAIN`) before running it. A run
+  stopped at its time cap, or cancelled, is answered at once, as `422 timeout`
+  or `cancelled`, with `stillRunning: true` and `endsBy`:
+  - `endsBy` is when Cube Store's timeout ends it at the latest (the run's
+    start plus `XCUBE_CUBESTORE_QUERY_TIMEOUT`), for a plan whose joins all
+    run on select workers;
+  - `endsBy` is `null` for one the router runs: nothing bounds it.
+
+  Until Cube Store answers it, the run keeps its connection open, and is
+  `stopping` on every instance (`GET …/sql/runs/{runId}`).
+  - Its `runId` stays taken.
+  - Its note in xcube's database is kept every minute while its instance
+    follows it, so it lapses within minutes if that instance stops.
+- **When it is `ended`.** It is `ended` once Cube Store answers it. That is
+  when its work has ended: a select worker answers once killed, and the
+  router only once the work is done.
+  - With an `endsBy`, it is also `ended` 5 s past it, by when the worker has
+    been killed.
+  - Without one, xcube follows it for up to 24 hours.
 
 **Answers.** Each cell is JSON:
 - binary as `\x` and hex;
@@ -1167,7 +1187,8 @@ answers `cancelled`, with the rows it read before. A Cube Store run is answered
 `{ model, runId, state, endsBy? }`, from any instance. `state` is one of:
 - `running`;
 - `stopping`: a Cube Store run answered as stopped that Cube Store runs on,
-  until `endsBy` at the latest;
+  until `endsBy` at the latest, or, with no `endsBy`, to its end however long
+  that takes;
 - `ended`: it has ended, or never was.
 
 #### `GET /v1/semantic/credential-keys`, `POST /v1/semantic/credentials/rewrap`

@@ -738,8 +738,8 @@ export function initAdminRoutes(
         ...(e.durationMs === null ? {} : { durationMs: e.durationMs }),
         // A stopped run: the rows read before the stop.
         ...(e.partial ?? {}),
-        // Cube Store runs a stopped query on: until when at the latest (see …/sql/runs/{runId}).
-        ...(e.endsBy ? { stillRunning: true, endsBy: e.endsBy.toISOString() } : {}),
+        // Cube Store runs a stopped query on: until when at the latest, `null` when nothing bounds it (see …/sql/runs/{runId}).
+        ...(e.runsOn ? { stillRunning: true, endsBy: e.runsOn.endsBy?.toISOString() ?? null } : {}),
       });
     }
   });

@@ -2,7 +2,7 @@ import { EventEmitter } from 'events';
 import { Readable } from 'stream';
 
 import {
-  cellOf, openSession, RowCollector, SqlRunError, type SqlCaps,
+  cellOf, endsAtCubeStoreTimeout, openSession, RowCollector, SqlRunError, type SqlCaps,
 } from '../../src/sql/runner';
 import { MAX_RUNS, SqlRuns, type SqlRunRegistry, type SqlTarget } from '../../src/sql/runs';
 
@@ -35,6 +35,19 @@ describe('the SQL runner: cells and caps', () => {
     expect(byBytes.add(['x'.repeat(20)])).toBe(true);
     expect(byBytes.add(['y'.repeat(20)])).toBe(false);
     expect(byBytes.truncated).toBe('bytes');
+  });
+});
+
+describe('Cube Store\'s plans: which its timeout ends', () => {
+  test('a query on its tables runs on a select worker, which its timeout ends; the router\'s own work, nothing', () => {
+    // As Cube Store 1.7.45 explains them.
+    expect(endsAtCubeStoreTimeout('Projection, [n]\n  Aggregate\n    ClusterSend, indices: [[26], [26]]\n      Join on: []\n        SubqueryAlias\n          Scan probe.t\n        SubqueryAlias\n          Scan probe.t')).toBe(true);
+    expect(endsAtCubeStoreTimeout('Projection, [n]\n  Aggregate\n    Join on: []\n      Join on: []\n        SubqueryAlias\n          Values\n        SubqueryAlias\n          Values')).toBe(false);
+    expect(endsAtCubeStoreTimeout('Projection, [n]\n  Aggregate\n    Join on: []\n      SubqueryAlias\n        Scan information_schema.columns, source: InfoSchemaTableProvider(table: Columns)')).toBe(false);
+    // A join above its select workers is the router's.
+    expect(endsAtCubeStoreTimeout('Projection\n  Join on: []\n    ClusterSend, indices: [[1]]\n      Scan s.t\n    Values')).toBe(false);
+    expect(endsAtCubeStoreTimeout('Projection\n  ClusterSend, indices: [[1]]\n    Scan s.t')).toBe(true);
+    expect(endsAtCubeStoreTimeout('')).toBe(false);
   });
 });
 
@@ -225,8 +238,11 @@ describe('the SQL runner: each database\'s session, on drivers shaped as Cube\'s
 });
 
 describe('the SQL runner: runs', () => {
-  /** A Cube Store-shaped driver: answers every row at once, or waits until let go. */
-  const cubeStoreTarget = (answer: () => Promise<any[]>, secrets: string[] = []): SqlTarget & { released: jest.Mock; sent: string[] } => {
+  /** A plan Cube Store runs on a select worker, and one its router runs. */
+  const WORKER_PLAN = 'Projection, [n]\n  Aggregate\n    ClusterSend, indices: [[1]]\n      Scan s.t, source: CubeTable';
+  const ROUTER_PLAN = 'Projection, [n]\n  Aggregate\n    Join on: []\n      Values\n      Values';
+  /** A Cube Store-shaped driver: answers its plan, then every row at once, or waits until let go. */
+  const cubeStoreTarget = (answer: () => Promise<any[]>, secrets: string[] = [], plan = WORKER_PLAN): SqlTarget & { released: jest.Mock; sent: string[] } => {
     const released = jest.fn();
     const sent: string[] = [];
     return {
@@ -237,6 +253,9 @@ describe('the SQL runner: runs', () => {
       build: async () => ({
         driver: {
           query: (sql: string) => {
+            if (/^EXPLAIN /.test(sql)) {
+              return Promise.resolve([{ 'logical plan': plan }]);
+            }
             sent.push(sql);
             return answer();
           },
@@ -267,6 +286,7 @@ describe('the SQL runner: runs', () => {
         announced.push({ model, runId, instance });
       },
       stopSqlRun: async () => undefined,
+      touchSqlRun: async () => undefined,
       sqlRunState: async (runId, model) => (runs.get(runId)?.model === model ? { stopped: false, endsBy: null } : null),
     };
     return registry;
@@ -388,8 +408,8 @@ describe('the SQL runner: runs', () => {
     const answer = await runs.run('m', target, request({ runId: 's1', timeoutMs: 10 })).catch((e) => e);
     expect(answer).toMatchObject({ code: 'timeout', partial: { rows: [], truncated: 'stopped' }, message: expect.stringMatching(/runs it on/) });
     expect(Date.now() - started).toBeLessThan(4000);
-    expect(answer.endsBy.getTime()).toBeGreaterThanOrEqual(started + 60000);
-    expect(await runs.state('m', 's1')).toEqual({ state: 'stopping', endsBy: answer.endsBy.toISOString() });
+    expect(answer.runsOn.endsBy.getTime()).toBeGreaterThanOrEqual(started + 60000);
+    expect(await runs.state('m', 's1')).toEqual({ state: 'stopping', endsBy: answer.runsOn.endsBy.toISOString() });
     expect(await runs.state('other', 's1')).toEqual({ state: 'ended' });
     // Its id is taken until the query ends; cancelling it again finds it stopped.
     await expect(runs.run('m', target, request({ runId: 's1' }))).rejects.toMatchObject({ code: 'run_in_progress' });
@@ -400,6 +420,22 @@ describe('the SQL runner: runs', () => {
     expect(await runs.state('m', 's1')).toEqual({ state: 'ended' });
     expect(target.released).toHaveBeenCalled();
   });
+
+  test('a query its router runs isn\'t bounded by Cube Store\'s timeout: stopping, with no endsBy, until Cube Store answers', async () => {
+    let finish: () => void = () => undefined;
+    const target = cubeStoreTarget(() => new Promise((resolve) => {
+      finish = () => resolve([]);
+    }), [], ROUTER_PLAN);
+    const runs = new SqlRuns('here', () => null, () => undefined, 10);
+    const answer = await runs.run('m', target, request({ runId: 'r1', timeoutMs: 10 })).catch((e) => e);
+    expect(answer).toMatchObject({ code: 'timeout', runsOn: { endsBy: null }, message: expect.stringMatching(/nothing bounds it/) });
+    // Well past the timeout and its grace: still stopping, as Cube Store hasn't answered.
+    await new Promise((resolve) => setTimeout(resolve, 5200));
+    expect(await runs.state('m', 'r1')).toEqual({ state: 'stopping' });
+    finish();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(await runs.state('m', 'r1')).toEqual({ state: 'ended' });
+  }, 15000);
 
   test('one run per id, and at most so many at once on an instance', async () => {
     const runs = new SqlRuns('here', () => null, () => undefined);
