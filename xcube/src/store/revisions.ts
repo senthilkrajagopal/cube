@@ -196,7 +196,7 @@ export class SecurityModeError extends Error {
 /** A folder that still holds items can't leave the tree. */
 export class FolderInUseError extends Error {
   public constructor(public readonly folders: string[]) {
-    super(`Folders still holding items can't be removed: ${folders.join(', ')}`);
+    super(`Folders still holding items or data sources can't be removed: ${folders.join(', ')}`);
   }
 }
 
@@ -823,7 +823,7 @@ export class PgRevisionStore implements RevisionStore {
     return { version: versionOf(row.keys_version), issuer: row.keys_issuer, keys: rows.map((r) => r.jwk) };
   }
 
-  /** Under the model's row lock: refuses to drop a folder the current revision still has items in. */
+  /** Under the model's row lock: refuses to drop a folder the current revision still has items in, or a data source. */
   protected async replaceFolders(client: PoolClient, model: string, folders: Folder[], keeping?: PublishedItem[]) {
     const { s } = this;
     const ids = new Set(folders.map((f) => f.id));
@@ -839,6 +839,9 @@ export class PgRevisionStore implements RevisionStore {
       );
       used = rows.map((row) => row.folder_id);
     }
+    // A data source in a folder that goes would be orphaned: it holds the folder too.
+    const { rows: sources } = await client.query(`SELECT DISTINCT folder_id FROM ${s}.connections WHERE model = $1`, [model]);
+    used = [...new Set([...used, ...sources.map((row) => row.folder_id)])];
     const orphaned = used.filter((id) => !ids.has(id)).sort();
     if (orphaned.length) {
       throw new FolderInUseError(orphaned);

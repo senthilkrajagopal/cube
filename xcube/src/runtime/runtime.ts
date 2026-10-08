@@ -3615,6 +3615,40 @@ export class XcubeRuntime {
     });
   }
 
+  /**
+   * A model's folder tree as xcube holds it: each folder's parent and allowed
+   * groups, and how many items of the current revision and data sources it
+   * holds, which keep it from going. What a client that missed a change
+   * merges its own tree with, to catch up (`README`, "Catching up").
+   */
+  public async folderTree(model: string) {
+    const store = this.requireStore();
+    const permissions = await store.permissions(model);
+    if (!permissions) {
+      return null;
+    }
+    const folders = await store.folders(model);
+    const head = await store.head(model);
+    const items = head?.mode === 'items' ? await this.itemsAt(head) : [];
+    const connections = await store.connections(model);
+    const groups = new Map(permissions.folders.map((f) => [f.id, f.allowedGroups]));
+    const count = (list: { folderId: string }[], id: string) => list.filter((x) => x.folderId === id).length;
+    return {
+      model,
+      revision: head?.revision ?? null,
+      security: permissions.security,
+      permissionsVersion: permissions.version,
+      hash: folderTreeHash(folders),
+      folders: folders.map((f) => ({
+        id: f.id,
+        parentId: f.parentId,
+        allowedGroups: groups.get(f.id) ?? [],
+        items: count(items, f.id),
+        dataSources: count(connections, f.id),
+      })),
+    };
+  }
+
   public async putFolders(model: string, folders: Folder[], security?: boolean) {
     const problems = FolderTree.check(folders);
     if (problems.length) {

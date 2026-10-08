@@ -491,6 +491,15 @@ export function initAdminRoutes(
     }
   }));
 
+  app.get(`${base}/folders`, auth, handle('folders', async (req, res) => {
+    const model = modelOf(req);
+    const tree = await runtime.folderTree(model);
+    if (!tree) {
+      throw new AdminError(404, 'unknown_model', `Unknown model "${model}"`);
+    }
+    res.json(tree);
+  }));
+
   app.put(`${base}/folders`, auth, json, handle('folders', async (req, res) => {
     const model = modelOf(req);
     const body = valid<any>(foldersSchema, req.body);

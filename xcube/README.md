@@ -977,6 +977,36 @@ goes up only when security or a folder's groups changed.
 | `409` | `mode`: security on for a model holding a file set |
 | `409` | `older_instances`: security turned on while an xcube before schema version 4 is connected (`instances`) |
 
+#### `GET …/folders`
+
+The folder tree as xcube holds it, for a client that may have missed a change:
+
+```json
+{ "model": "dev", "revision": 42, "security": true, "permissionsVersion": 7, "hash": "…",
+  "folders": [{ "id": "fold", "parentId": "froot", "allowedGroups": ["g-sales"], "items": 1, "dataSources": 1 }] }
+```
+
+- `items` counts the current revision's items in the folder, and
+  `dataSources` the data sources it holds. Either keeps the folder from
+  going (`409 folder_in_use`), for `PUT …/folders` and an items snapshot
+  alike.
+- `hash` is what `PUT …/folders` answers for the same tree.
+- `404 unknown_model` for a model xcube doesn't hold.
+
+**Catching up.** A client whose tree lost a folder that xcube's still holds
+things in (it was deleted while xcube missed it) catches up in this order.
+Each step is valid on its own, so a catch-up cut short resumes from the
+start:
+1. `GET …/folders`.
+2. `PUT …/folders` with the client's tree, plus each folder xcube holds
+   items or data sources in, under its parent there.
+3. `PUT …/connections/{name}` for the client's data sources.
+4. `PUT …/snapshot` with the client's items and step 2's tree. The old
+   folders' items go.
+5. `DELETE …/connections/{name}` for the data sources the client doesn't
+   have, unused now.
+6. `PUT …/folders` with the client's tree. The old folders go.
+
 #### `PUT …/keys`
 
 Replaces the public keys the model's user tokens are signed with:

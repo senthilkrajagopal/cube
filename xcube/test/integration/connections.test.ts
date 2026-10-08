@@ -505,6 +505,61 @@ describeWithDatabase('connections: data sources served from sealed credentials',
     await admin('get', '/connections/default/health').expect(200);
   });
 
+  test('a folder deleted while xcube missed it, still holding a cube and its data source, is caught up in one pass', async () => {
+    const at = (method: 'put' | 'post' | 'get' | 'delete', route: string, body?: object) => {
+      const req = request(server)[method](`/cubejs-api/v1/semantic/models/catchup${route}`).set('Authorization', `Bearer ${ADMIN_TOKEN}`);
+      return body ? req.send(body) : req;
+    };
+    const salesOn = (name: string, dataSource: string) => ({
+      kind: 'cube', name, yaml: `cubes:\n  - name: ${name}\n    data_source: ${dataSource}\n    sql_table: ${warehouse}.orders\n    measures:\n      - name: total\n        sql: amount\n        type: sum\n`,
+    });
+    const root = { id: 'froot', parentId: null };
+    // What xcube last heard: fold, holding old_sales on its own old_wh.
+    await at('put', '/folders', { folders: [root, { id: 'fold', parentId: 'froot' }] }).expect(200);
+    await at('put', '/connections/default', { ...connection(role, 'second-password'), baseVersion: null }).expect(200);
+    await at('put', '/connections/old_wh', { ...connection(role, 'second-password'), folderId: 'fold', baseVersion: null }).expect(200);
+    await at('put', '/snapshot', { baseRevision: null, folders: [root, { id: 'fold', parentId: 'froot' }], items: [{ ...salesOn('old_sales', 'old_wh'), folderId: 'fold' }] }).expect(201);
+
+    // wechart now: fold deleted; fnew holding new_sales on its own new_wh.
+    const theirs = [root, { id: 'fnew', parentId: 'froot' }];
+    const theirItems = [{ ...salesOn('new_sales', 'new_wh'), folderId: 'fnew' }];
+    // Pushed as it is, the tree is refused, as wechart saw.
+    expect((await at('put', '/folders', { folders: theirs }).expect(409)).body).toMatchObject({ code: 'folder_in_use', folders: ['fold'] });
+
+    // 1. xcube's tree, with what each folder holds.
+    const held = (await at('get', '/folders').expect(200)).body;
+    expect(held.folders).toEqual([
+      { id: 'fold', parentId: 'froot', allowedGroups: [], items: 1, dataSources: 1 },
+      { id: 'froot', parentId: null, allowedGroups: [], items: 0, dataSources: 1 },
+    ]);
+    // 2. Their tree, keeping the folders xcube's still hold things in, under their parents.
+    const theirIds = new Set(theirs.map((f) => f.id));
+    const union = [...theirs, ...held.folders.filter((f: any) => !theirIds.has(f.id) && (f.items || f.dataSources)).map((f: any) => ({ id: f.id, parentId: f.parentId }))];
+    await at('put', '/folders', { folders: union }).expect(200);
+    // 3. Their data sources.
+    await at('put', '/connections/new_wh', { ...connection(role, 'second-password'), folderId: 'fnew', baseVersion: null }).expect(200);
+    // 4. Their items. A snapshot dropping fold now would orphan old_wh: refused, nothing taken.
+    const head = (await at('get', '/revision').expect(200)).body.current.revision;
+    expect((await at('put', '/snapshot', { baseRevision: head, folders: theirs, items: theirItems }).expect(409)).body)
+      .toMatchObject({ code: 'folder_in_use', folders: ['fold'] });
+    const landed = await at('put', '/snapshot', { baseRevision: head, folders: union, items: theirItems }).expect(201);
+    // 5. Their data sources' extras, unused now.
+    await at('delete', '/connections/old_wh').expect(204);
+    // 6. Their tree.
+    await at('put', '/folders', { folders: theirs }).expect(200);
+
+    const after = (await at('get', '/folders').expect(200)).body;
+    expect(after.folders.map((f: any) => [f.id, f.parentId, f.items, f.dataSources])).toEqual([['fnew', 'froot', 1, 1], ['froot', null, 0, 1]]);
+    expect((await at('get', '/connections').expect(200)).body.connections.map((c: any) => c.name)).toEqual(['default', 'new_wh']);
+    const answer = await request(server).get('/cubejs-api/v1/load')
+      .query({ query: JSON.stringify({ measures: ['new_sales.total'] }) })
+      .set('Authorization', jwt.sign({ wechartModel: 'catchup', wechartRevision: landed.body.revision }, API_SECRET));
+    expect({ status: answer.status, error: answer.body.error }).toEqual({ status: 200, error: undefined });
+    expect(answer.body.data[0]['new_sales.total']).toBe('42');
+    // An unknown model has no tree.
+    expect((await request(server).get('/cubejs-api/v1/semantic/models/nobody/folders').set('Authorization', `Bearer ${ADMIN_TOKEN}`).expect(404)).body.code).toBe('unknown_model');
+  });
+
   describe('an overlay\'s own data sources (AC-280)', () => {
     const preview = (overlay: string, measure = 'orders.total') => request(server).get('/cubejs-api/v1/load')
       .query({ query: JSON.stringify({ measures: [measure] }) })
