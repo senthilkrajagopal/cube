@@ -3,7 +3,7 @@ import { prepareCompiler } from '@cubejs-backend/schema-compiler';
 
 import { chainsIn, chainsInFString } from '../../src/names/expr';
 import { FolderTree, type AuthoredItem, type PublishedItem } from '../../src/names/items';
-import { aliasOf, filesOf, itemsHash, publish, titleOf } from '../../src/names/publish';
+import { aliasOf, filesOf, itemsHash, outOfRange, publish, titleOf } from '../../src/names/publish';
 
 const tree = new FolderTree([
   { id: 'froot', parentId: null },
@@ -68,7 +68,7 @@ function doc(item: PublishedItem): any {
   return (parsed.cubes ?? parsed.views)[0];
 }
 
-const byName = (items: PublishedItem[], fullName: string) => items.find((i) => i.fullName === fullName)!;
+const byName = (items: PublishedItem[], name: string) => items.find((i) => i.name === name)!;
 
 describe('expressions', () => {
   test('chains in load position only: not in strings, lambda parameters or keyword arguments', () => {
@@ -87,48 +87,26 @@ describe('expressions', () => {
 });
 
 describe('publish', () => {
-  test('root items keep their names; xcube adds only where they came from', () => {
-    const { items, errors } = publish({ tree, current: [], upserts: [customers, orders('froot')], deletes: [] });
+  test('items keep their names in every folder; xcube adds only where they came from', () => {
+    const { items, errors } = publish({ tree, current: [], upserts: [customers, orders('feu')], deletes: [] });
     expect(errors).toEqual([]);
     const o = doc(byName(items, 'orders'));
+    expect(byName(items, 'orders').fullName).toBe('orders');
     expect(o.name).toBe('orders');
     expect(o.title).toBeUndefined();
     expect(o.sql_alias).toBeUndefined();
     expect(o.joins[0]).toMatchObject({ name: 'customers', sql: '{CUBE}.customer_id = {customers.id}' });
-    expect(o.meta).toEqual({ xcube: { folderId: 'froot', shortName: 'orders' } });
+    expect(o.measures[1].sql).toBe("{FILTER_PARAMS.orders.created_at.filter(lambda a, b: f'{CUBE}.created_at >= {a}')} + amount");
+    expect(o.meta).toEqual({ xcube: { folderId: 'feu', shortName: 'orders' } });
     expect(byName(items, 'orders').bindings).toEqual({ customers: 'customers', orders: 'orders' });
+    expect(filesOf(items).map((f) => f.path).sort()).toEqual(['customers.yml', 'orders.yml']);
   });
 
-  test('a folder item gets its prefix, title and alias, and binds nearest-first', () => {
-    const localCustomers = { ...customers, folderId: 'fsales' };
+  test('views: join paths and prefixes are the cubes\' own names', () => {
     const { items, errors } = publish({
       tree,
       current: [],
-      upserts: [customers, localCustomers, orders('feu'), orders('fops')],
-      deletes: [],
-    });
-    expect(errors).toEqual([]);
-
-    const eu = doc(byName(items, 'feu__orders'));
-    expect(eu.title).toBe('Orders');
-    expect(eu.sql_alias).toBe('feu__orders');
-    expect(eu.joins[0]).toMatchObject({
-      name: 'fsales__customers',
-      sql: '{CUBE}.customer_id = {fsales__customers.id}',
-    });
-    expect(eu.measures[0].drill_members).toEqual(['id', 'fsales__customers.city']);
-    expect(eu.measures[1].sql).toBe("{FILTER_PARAMS.feu__orders.created_at.filter(lambda a, b: f'{CUBE}.created_at >= {a}')} + amount");
-    expect(eu.pre_aggregations[0].dimensions).toEqual(['fsales__customers.city']);
-
-    // ops has no customers of its own: the root's.
-    expect(doc(byName(items, 'fops__orders')).joins[0].name).toBe('customers');
-  });
-
-  test('views: join paths, and the short cube name kept for prefixed members', () => {
-    const { items, errors } = publish({
-      tree,
-      current: [],
-      upserts: [customers, orders('fsales'), view('fsales', 'overview', [
+      upserts: [customers, orders('fsales'), view('feu', 'overview', [
         '    cubes:',
         '      - join_path: orders',
         '        includes: [count]',
@@ -142,39 +120,21 @@ describe('publish', () => {
       deletes: [],
     });
     expect(errors).toEqual([]);
-    const v = doc(byName(items, 'fsales__overview'));
-    expect(v.cubes).toEqual([
-      { join_path: 'fsales__orders', includes: ['count'], prefix: true, alias: 'orders' },
-      { join_path: 'fsales__orders.customers', includes: ['city'], prefix: true, alias: 'buyer' },
+    expect(doc(byName(items, 'overview')).cubes).toEqual([
+      { join_path: 'orders', includes: ['count'], prefix: true },
+      { join_path: 'orders.customers', includes: ['city'], prefix: true, alias: 'buyer' },
     ]);
   });
 
-  test('refuses a name no folder on the path holds, and a removal something still refers to', () => {
+  test('refuses a name the model doesn\'t hold, and a removal something still refers to, naming no folder', () => {
     const lonely = publish({ tree, current: [], upserts: [orders('fops')], deletes: [] });
-    expect(lonely.errors.map((e) => e.message)).toEqual([
-      'The join to "customers" names no cube in a folder on this item\'s path',
-    ]);
+    expect(lonely.errors.map((e) => e.message)).toEqual(['The join to "customers" names no cube of the model']);
 
     const { items } = publish({ tree, current: [], upserts: [customers, orders('fsales')], deletes: [] });
     const removal = publish({ tree, current: items, upserts: [], deletes: [{ folderId: 'froot', name: 'customers' }] });
     expect(removal.errors).toEqual([{
-      folderId: 'froot',
-      name: 'customers',
-      kind: 'reference',
-      message: 'froot/customers can\'t be removed or renamed: fsales/orders refers to it',
+      folderId: 'froot', name: 'customers', kind: 'reference', message: 'customers can\'t be removed: orders refers to it',
     }]);
-  });
-
-  test('keeps an item\'s bindings until it is published again (no rebinding)', () => {
-    const first = publish({ tree, current: [], upserts: [customers, orders('feu')], deletes: [] });
-    expect(doc(byName(first.items, 'feu__orders')).joins[0].name).toBe('customers');
-
-    // A nearer customers appears; feu/orders keeps the root's until it is published again.
-    const second = publish({ tree, current: first.items, upserts: [{ ...customers, folderId: 'fsales' }], deletes: [] });
-    expect(doc(byName(second.items, 'feu__orders')).joins[0].name).toBe('customers');
-
-    const third = publish({ tree, current: second.items, upserts: [orders('feu')], deletes: [] });
-    expect(doc(byName(third.items, 'feu__orders')).joins[0].name).toBe('fsales__customers');
   });
 
   test('an item must be in a known folder', () => {
@@ -193,47 +153,63 @@ describe('publish', () => {
       current: [],
       upserts: [
         { folderId: 'froot', name: 'a', kind: 'cube', yaml: 'cubes:\n  - name: b\n    sql_table: t\n' },
-        { folderId: 'froot', name: 'Bad__Name', kind: 'cube', yaml: 'cubes: []' },
         { folderId: 'froot', name: 'c', kind: 'cube', yaml: 'cubes:\n  - name: c\n    sql: "{{ x }}"\n' },
         { folderId: 'froot', name: 'e', kind: 'cube', yaml: 'cubes:\n  - name: e\n   bad: [\n' },
         { folderId: 'froot', name: 'f', kind: 'view', yaml: 'cubes:\n  - name: f\n' },
       ],
       deletes: [],
     });
-    expect(errors.map((e) => [e.name, e.kind])).toEqual([['a', 'item'], ['Bad__Name', 'item'], ['c', 'item'], ['e', 'yaml'], ['f', 'item']]);
-    expect(errors[3].line).toBeGreaterThan(0);
+    expect(errors.map((e) => [e.name, e.kind])).toEqual([['a', 'item'], ['c', 'item'], ['e', 'yaml'], ['f', 'item']]);
+    expect(errors[2].line).toBeGreaterThan(0);
   });
 
-  test('aliases: long names get a stable hash, and long pre-aggregation stems a short alias', () => {
-    const longFolder = 'f0123456789abcdef0123456789abcdef';
-    const longTree = new FolderTree([{ id: 'froot', parentId: null }, { id: longFolder, parentId: 'froot' }]);
-    const { items, errors } = publish({ tree: longTree, current: [], upserts: [customers, orders(longFolder)], deletes: [] });
+  test('the grammar: a letter, then letters, digits and single underscores, at most 40, no reserved word in any case', () => {
+    const named = (name: string) => publish({
+      tree, current: [], upserts: [{ folderId: 'froot', name, kind: 'cube', yaml: `cubes:\n  - name: ${name}\n    sql_table: t\n` }], deletes: [],
+    }).errors.map((e) => e.message);
+    for (const ok of ['orders', 'OrderItems', 'Orders_2024', 'a', `a${'b'.repeat(39)}`, 'cube_stats', 'classes']) {
+      expect([ok, named(ok)]).toEqual([ok, []]);
+    }
+    for (const bad of ['a__b', 'orders_', '_orders', '2orders', 'order-items', 'order items', `a${'b'.repeat(40)}`]) {
+      expect([bad, named(bad)]).toEqual([bad, [expect.stringMatching(/is not a valid name/)]]);
+    }
+    // Python's keywords (with None, True and False) and the names Cube resolves before a cube's.
+    for (const reserved of ['class', 'Class', 'None', 'none', 'True', 'false', 'CUBE', 'cube', 'Table', 'security_context', 'SECURITY_CONTEXT',
+      'securityContext', 'FILTER_PARAMS', 'filter_group', 'SQL_UTILS', 'USER_CONTEXT', 'compile_context']) {
+      expect([reserved, named(reserved)]).toEqual([reserved, [`"${reserved}" is a reserved word and can't be a name`]]);
+    }
+  });
+
+  test('aliases: a long name over a long pre-aggregation stem gets a stable hash, and a long pre-aggregation a short alias', () => {
+    const long = 'customer_lifetime_orders_by_region';
+    const longOrders = cube('fsales', long, orders('fsales').yaml.split('\n').slice(2).join('\n').replace('{FILTER_PARAMS.orders.', `{FILTER_PARAMS.${long}.`));
+    const { items, errors } = publish({ tree, current: [], upserts: [customers, longOrders], deletes: [] });
     expect(errors).toEqual([]);
-    const o = doc(byName(items, `${longFolder}__orders`));
-    expect(o.sql_alias).toBe(aliasOf(`${longFolder}__orders`));
+    const o = doc(byName(items, long));
     expect(o.sql_alias).toMatch(/^x[a-z2-7]{7}$/);
     expect(`${o.sql_alias}_by_city`.length).toBeLessThanOrEqual(25);
-
-    // A view there too: its members are measured against its short alias, not its full name.
-    // `created_at` is a time dimension: with Cube's granularity suffix, the full name's member alias passes 63.
-    const overview = view(longFolder, 'sales_overview', '    cubes:\n      - join_path: orders\n        includes:\n          - amount\n          - created_at\n');
-    expect(`${longFolder}__sales_overview__created_at_quarter`.length).toBeGreaterThan(63);
-    const withView = publish({ tree: longTree, current: [], upserts: [customers, orders(longFolder), overview], deletes: [] });
-    expect(withView.errors).toEqual([]);
-    const v = doc(byName(withView.items, `${longFolder}__sales_overview`));
-    expect(v.sql_alias).toBe(aliasOf(`${longFolder}__sales_overview`));
-    expect(v.sql_alias).toMatch(/^x[a-z2-7]{7}$/);
+    // A short one keeps its name, whatever its folder.
+    expect(doc(byName(publish({ tree, current: [], upserts: [customers, orders('feu')], deletes: [] }).items, 'orders')).sql_alias).toBeUndefined();
     expect(titleOf('order_items')).toBe('Order Items');
     expect(titleOf('user_id')).toBe('User ID');
   });
 
-  test('the resolved model compiles in Cube, and queries use the full names', async () => {
-    const { items, errors } = publish({
-      tree,
-      current: [],
-      upserts: [customers, { ...customers, folderId: 'fsales' }, orders('feu'), orders('froot')],
-      deletes: [],
-    });
+  test('a name with upper case gets its lower-case form as its alias, so Cube\'s snake-casing can\'t make two names one', () => {
+    const upper = cube('fsales', 'OrderItems', '    sql_table: t\n    measures:\n      - name: count\n        type: count\n');
+    const lower = cube('fops', 'order_items', '    sql_table: t\n    measures:\n      - name: count\n        type: count\n');
+    const caps = cube('froot', 'ORDERS', '    sql_table: t\n    measures:\n      - name: count\n        type: count\n');
+    const { items, errors } = publish({ tree, current: [], upserts: [upper, lower, caps], deletes: [] });
+    expect(errors).toEqual([]);
+    expect(doc(byName(items, 'OrderItems')).sql_alias).toBe('orderitems');
+    expect(doc(byName(items, 'order_items')).sql_alias).toBeUndefined();
+    // Cube's own snake-casing would make it o_r_d_e_r_s.
+    expect(doc(byName(items, 'ORDERS')).sql_alias).toBe('orders');
+    expect(doc(byName(items, 'OrderItems')).title).toBeUndefined();
+  });
+
+  test('the resolved model compiles in Cube, and queries use the bare names', async () => {
+    const upper = cube('fops', 'OrderItems', '    sql_table: t\n    dimensions:\n      - name: id\n        sql: id\n        type: number\n        primary_key: true\n    measures:\n      - name: count\n        type: count\n');
+    const { items, errors } = publish({ tree, current: [], upserts: [{ ...customers, folderId: 'fsales' }, orders('feu'), upper], deletes: [] });
     expect(errors).toEqual([]);
     const files = filesOf(items);
     const { compiler, cubeEvaluator, joinGraph } = prepareCompiler({
@@ -241,191 +217,144 @@ describe('publish', () => {
       dataSchemaFiles: async () => files.map(({ path, content }) => ({ fileName: path, content })),
     }, { standalone: true, allowNodeRequire: false });
     await compiler.compile();
-    expect(Object.keys(cubeEvaluator.cubeList.reduce((all: any, c: any) => ({ ...all, [c.name]: true }), {})).sort())
-      .toEqual(['customers', 'feu__orders', 'fsales__customers', 'orders']);
-    expect(cubeEvaluator.byPath('measures', 'feu__orders.count')).toBeDefined();
-    expect(joinGraph.buildJoin(['feu__orders', 'fsales__customers'])).toBeTruthy();
+    expect(cubeEvaluator.cubeList.map((c: any) => c.name).sort()).toEqual(['OrderItems', 'customers', 'orders']);
+    expect(cubeEvaluator.byPath('measures', 'orders.count')).toBeDefined();
+    expect(cubeEvaluator.byPath('measures', 'OrderItems.count')).toBeDefined();
+    expect(joinGraph.buildJoin(['orders', 'customers'])).toBeTruthy();
   });
 });
 
-describe('the rewrite corpus', () => {
-  const corpusTree = new FolderTree([{ id: 'froot', parentId: null }, { id: 'fsales', parentId: 'froot' }]);
+describe('one name per model (R71)', () => {
+  const published = publish({ tree, current: [], upserts: [customers, orders('fsales')], deletes: [] }).items;
+  const simpleCube = (folderId: string, name: string) => cube(folderId, name, '    sql_table: t\n    measures:\n      - name: count\n        type: count\n');
 
-  const root = cube('froot', 'customers', [
-    '    sql_table: public.customers',
-    '    dimensions:',
-    '      - name: id',
-    '        sql: id',
-    '        type: number',
-    '        primary_key: true',
-    '      - name: name',
-    '        sql: name',
-    '        type: string',
-    '    measures:',
-    '      - name: count',
-    '        type: count',
-    '    pre_aggregations:',
-    '      - name: by_name',
-    '        dimensions: [name]',
-    '        measures: [count]',
-    '',
-  ].join('\n'));
-
-  // `clash`: a member named as the cube it joins, to check the member-first rule; Cube itself can't
-  // then reach that cube through the member's name, so the compile check leaves it out.
-  const base = (clash: boolean) => cube('fsales', 'base_orders', [
-    '    sql_table: public.orders',
-    '    dimensions:',
-    '      - name: id',
-    '        sql: id',
-    '        type: number',
-    '        primary_key: true',
-    ...(clash ? ['      - name: customers', '        sql: customer_id', '        type: number'] : []),
-    '',
-  ].join('\n'));
-
-  const corpusOrders = (clash: boolean) => cube('fsales', 'orders', [
-    '    extends: base_orders',
-    '    joins:',
-    '      - name: customers',
-    '        sql: "{CUBE}.customer_id = {customers}.id"',
-    '        relationship: many_to_one',
-    '    dimensions:',
-    '      - name: status',
-    '        sql: "{CUBE}.status"',
-    '        type: string',
-    '      - name: created_at',
-    '        sql: created_at',
-    '        type: time',
-    '      - name: buyer',
-    '        sql: "{customers.name} || \' \' || \'customers.name\'"',
-    '        type: string',
-    ...(clash ? [
-      '      - name: own_customer_column',
-      '        sql: "{CUBE.customers} + {orders.customers}"',
-      '        type: number',
-    ] : []),
-    '      - name: status_case',
-    '        type: string',
-    '        case:',
-    '          when:',
-    '            - sql: "{CUBE}.status = \'a\'"',
-    '              label: A',
-    '          else:',
-    '            label: B',
-    '      - name: link',
-    '        sql: id',
-    '        type: number',
-    '        links:',
-    '          - name: open',
-    '            label: Open',
-    '            url: "{customers.name}"',
-    '    segments:',
-    '      - name: big',
-    '        sql: "{CUBE}.amount > 10 AND {customers.name} IS NOT NULL"',
-    '    measures:',
-    '      - name: count',
-    '        type: count',
-    '      - name: count_by_buyer',
-    '        type: count',
-    '        filters:',
-    '          - sql: "{customers.name} <> \'\'"',
-    '      - name: count_last_year',
-    '        type: count',
-    '        multi_stage: true',
-    '        sql: "{count}"',
-    '        time_shift:',
-    '          - time_dimension: created_at',
-    '            interval: 1 year',
-    '            type: prior',
-    '      - name: filtered',
-    '        sql: "{FILTER_PARAMS.orders.created_at.filter(lambda customers, b: f\'{customers} <= {b}\')}"',
-    '        type: number',
-    '    hierarchies:',
-    '      - name: path',
-    '        levels: [status, customers.name]',
-    '    pre_aggregations:',
-    '      - name: main',
-    '        measures: [count]',
-    '        dimensions: [status, customers.name]',
-    '        time_dimension: created_at',
-    '        granularity: day',
-    '      - name: joined',
-    '        type: rollup_join',
-    '        measures: [count]',
-    '        dimensions: [customers.name]',
-    '        rollups: [customers.by_name, main]',
-    '    access_policy:',
-    '      - group: "*"',
-    '        row_level:',
-    '          filters:',
-    '            - member: orders.status',
-    '              operator: equals',
-    '              values: ["customers"]',
-    '        member_level:',
-    '          includes: [orders.count, status]',
-    '',
-  ].join('\n'));
-
-  const summary = view('fsales', 'summary', [
-    '    cubes:',
-    '      - join_path: orders',
-    '        includes: [count, status]',
-    '      - join_path: orders.customers',
-    '        includes: [name]',
-    '        prefix: true',
-    '    default_filters:',
-    '      - member: orders.status',
-    '        operator: equals',
-    '        values: [a]',
-    '',
-  ].join('\n'));
-
-  const published = (clash = true) => {
-    const result = publish({ tree: corpusTree, current: [], upserts: [root, base(clash), corpusOrders(clash), summary], deletes: [] });
-    expect(result.errors).toEqual([]);
-    return result.items;
-  };
-
-  test('every construct that names another cube is rewritten, and nothing else', () => {
-    const items = published();
-    const o = doc(byName(items, 'fsales__orders'));
-    const dim = (n: string) => o.dimensions.find((d: any) => d.name === n);
-    const measure = (n: string) => o.measures.find((m: any) => m.name === n);
-
-    expect(o.extends).toBe('fsales__base_orders');
-    expect(o.joins[0]).toMatchObject({ name: 'customers', sql: '{CUBE}.customer_id = {customers}.id' });
-    // Root names are bare; the string literal is untouched.
-    expect(dim('buyer').sql).toBe("{customers.name} || ' ' || 'customers.name'");
-    // `customers` is an inherited member of orders, so after `CUBE.` and `orders.` it stays a member.
-    expect(dim('own_customer_column').sql).toBe('{CUBE.customers} + {fsales__orders.customers}');
-    expect(dim('link').links[0].url).toBe('{customers.name}');
-    expect(measure('filtered').sql).toBe("{FILTER_PARAMS.fsales__orders.created_at.filter(lambda customers, b: f'{customers} <= {b}')}");
-    expect(o.hierarchies[0].levels).toEqual(['status', 'customers.name']);
-    expect(o.pre_aggregations[1].rollups).toEqual(['customers.by_name', 'main']);
-    expect(o.access_policy[0].row_level.filters[0]).toMatchObject({ member: 'fsales__orders.status', values: ['customers'] });
-    expect(o.access_policy[0].member_level.includes).toEqual(['fsales__orders.count', 'status']);
-
-    const v = doc(byName(items, 'fsales__summary'));
-    expect(v.cubes).toEqual([
-      { join_path: 'fsales__orders', includes: ['count', 'status'] },
-      { join_path: 'fsales__orders.customers', includes: ['name'], prefix: true, alias: 'customers' },
-    ]);
-    expect(v.default_filters[0].member).toBe('fsales__orders.status');
-    expect(byName(items, 'fsales__orders').bindings).toEqual({
-      base_orders: 'fsales__base_orders', customers: 'customers', orders: 'fsales__orders',
-    });
+  test('a name in use, in any case, is refused, naming the caller\'s item and never the other\'s folder', () => {
+    for (const name of ['orders', 'Orders', 'ORDERS']) {
+      const { errors } = publish({ tree, current: published, upserts: [simpleCube('fops', name)], deletes: [] });
+      expect(errors).toEqual([{ folderId: 'fops', name, kind: 'name_in_use', message: `The name "${name}" is already in use` }]);
+      expect(JSON.stringify(errors)).not.toContain('fsales');
+    }
   });
 
-  test('the corpus compiles in Cube', async () => {
-    const files = filesOf(published(false));
-    const { compiler, cubeEvaluator } = prepareCompiler({
-      localPath: () => '/nowhere',
-      dataSchemaFiles: async () => files.map(({ path, content }) => ({ fileName: path, content })),
-    }, { standalone: true, allowNodeRequire: false });
-    await compiler.compile();
-    expect(cubeEvaluator.byPath('dimensions', 'fsales__summary.customers_name')).toBeDefined();
-    expect(cubeEvaluator.byPath('measures', 'fsales__orders.count_by_buyer')).toBeDefined();
+  test('a landed name never changes, not even its case', () => {
+    const { errors } = publish({ tree, current: published, upserts: [{ ...orders('fsales'), name: 'Orders', yaml: orders('fsales').yaml.replace('name: orders', 'name: Orders') }], deletes: [] });
+    expect(errors).toEqual([{
+      folderId: 'fsales', name: 'Orders', kind: 'name_in_use', message: 'The name "Orders" is in use as "orders": a landed name can\'t change, not even its case',
+    }]);
+  });
+
+  test('an edit in its own folder is the item\'s, and a delete then a new item of its name may land', () => {
+    expect(publish({ tree, current: published, upserts: [orders('fsales')], deletes: [] }).errors).toEqual([]);
+    const gone = publish({ tree, current: published, upserts: [], deletes: [{ folderId: 'fsales', name: 'orders' }] });
+    expect(gone.errors).toEqual([]);
+    const again = publish({ tree, current: gone.items, upserts: [orders('fops')], deletes: [] });
+    expect(again.errors).toEqual([]);
+    expect(byName(again.items, 'orders').folderId).toBe('fops');
+  });
+
+  test('a move in one changeset is the same item: a delete of A/orders and an upsert of B/orders (2.7)', () => {
+    const withView = publish({ tree, current: published, upserts: [view('feu', 'summary', '    cubes:\n      - join_path: orders\n        includes: [count]\n')], deletes: [] });
+    expect(withView.errors).toEqual([]);
+    // Up to the root: still on summary's path.
+    const moved = publish({ tree, current: withView.items, upserts: [orders('froot')], deletes: [{ folderId: 'fsales', name: 'orders' }] });
+    expect(moved.errors).toEqual([]);
+    expect(byName(moved.items, 'orders').folderId).toBe('froot');
+    expect(doc(byName(moved.items, 'orders')).meta.xcube.folderId).toBe('froot');
+    // What refers to it is untouched: it still means orders.
+    expect(byName(moved.items, 'summary')).toBe(byName(withView.items, 'summary'));
+    // Without the delete, the same upsert is a clash.
+    expect(publish({ tree, current: withView.items, upserts: [orders('froot')], deletes: [] }).errors[0].kind).toBe('name_in_use');
+    // A delete must name where the item is.
+    expect(publish({ tree, current: withView.items, upserts: [], deletes: [{ folderId: 'fops', name: 'orders' }] }).errors[0].message).toBe('There is no such item to delete');
+  });
+
+  test('one changeset may not hold two items of one name, in any case', () => {
+    const { errors } = publish({ tree, current: [], upserts: [simpleCube('fsales', 'stock'), simpleCube('fops', 'Stock')], deletes: [] });
+    expect(errors).toEqual([expect.objectContaining({ name: 'Stock', kind: 'name_in_use', message: expect.stringMatching(/holds two items named "Stock"/) })]);
+  });
+
+  test('a view\'s split views take names too', () => {
+    const split = view('feu', 'overview', '    cubes:\n      - join_path: orders\n        includes: [count]\n        split: true\n');
+    const clash = publish({ tree, current: published, upserts: [simpleCube('fops', 'overview_orders'), split], deletes: [] });
+    expect(clash.errors).toEqual([expect.objectContaining({ name: 'overview', kind: 'name_in_use', message: 'Its split view "overview_orders" would take a name already in use' })]);
+    const landed = publish({ tree, current: published, upserts: [split], deletes: [] });
+    expect(landed.errors).toEqual([]);
+    expect(publish({ tree, current: landed.items, upserts: [simpleCube('fops', 'Overview_Orders')], deletes: [] }).errors)
+      .toEqual([expect.objectContaining({ name: 'Overview_Orders', kind: 'name_in_use' })]);
+  });
+
+  test('extends names a cube up the path; an item never extends itself', () => {
+    const child = cube('feu', 'big_orders', '    extends: orders\n');
+    const { items, errors } = publish({ tree, current: published, upserts: [child], deletes: [] });
+    expect(errors).toEqual([]);
+    expect(doc(byName(items, 'big_orders')).extends).toBe('orders');
+    expect(doc(byName(items, 'big_orders')).sql_alias).toBe('big_orders');
+    const self = publish({ tree, current: [], upserts: [cube('fops', 'loop', '    extends: loop\n    sql_table: t\n')], deletes: [] });
+    expect(self.errors.map((e) => e.message)).toEqual(['It extends itself']);
+  });
+
+  test('names are matched exactly, as Cube matches them: {amount} stays a member beside a cube Amount', () => {
+    const amount = simpleCube('fops', 'Amount');
+    const withMember = cube('fsales', 'sales', '    sql_table: t\n    dimensions:\n      - name: amount\n        sql: amount\n        type: number\n    measures:\n      - name: total\n        sql: "{amount}"\n        type: sum\n');
+    const { items, errors } = publish({ tree, current: [], upserts: [amount, withMember], deletes: [] });
+    expect(errors).toEqual([]);
+    expect(doc(byName(items, 'sales')).measures[0].sql).toBe('{amount}');
+    expect(byName(items, 'sales').bindings).toEqual({});
+  });
+});
+
+describe('every reference stays on the referrer\'s folder path (R72)', () => {
+  // The tree: froot → fsales → feu, and froot → fops.
+  const simpleCube = (folderId: string, name: string) => cube(folderId, name, '    sql_table: t\n    dimensions:\n      - name: id\n        sql: id\n        type: number\n        primary_key: true\n    measures:\n      - name: count\n        type: count\n');
+  const refusal = (folderId: string, name: string, target: string) => ({
+    folderId, name, kind: 'reference_range', message: `It refers to "${target}", which isn't in its folder or one of its ancestors`,
+  });
+
+  test('a join to a sibling branch is refused, naming the referrer and never the other\'s folder', () => {
+    const { errors } = publish({ tree, current: [], upserts: [{ ...customers, folderId: 'fops' }, orders('fsales')], deletes: [] });
+    expect(errors).toEqual([refusal('fsales', 'orders', 'customers')]);
+    expect(JSON.stringify(errors)).not.toContain('fops');
+  });
+
+  test('a view over a cube in a sibling branch is refused, each join path segment counted', () => {
+    const v = view('fops', 'overview', '    cubes:\n      - join_path: orders\n        includes: [count]\n');
+    expect(publish({ tree, current: [], upserts: [customers, orders('fsales'), v], deletes: [] }).errors).toEqual([refusal('fops', 'overview', 'orders')]);
+    const path = view('fsales', 'overview', '    cubes:\n      - join_path: orders.customers\n        includes: [city]\n');
+    expect(publish({ tree, current: [], upserts: [{ ...customers, folderId: 'fops' }, orders('fsales'), path], deletes: [] }).errors)
+      .toEqual([refusal('fsales', 'orders', 'customers'), refusal('fsales', 'overview', 'customers')]);
+  });
+
+  test('extends from a sibling branch is refused', () => {
+    const { errors } = publish({ tree, current: [], upserts: [simpleCube('fsales', 'base'), cube('fops', 'child', '    extends: base\n')], deletes: [] });
+    expect(errors).toEqual([refusal('fops', 'child', 'base')]);
+  });
+
+  test('{cube.member} and FILTER_PARAMS references are counted', () => {
+    const member = cube('fops', 'stats', '    sql_table: t\n    measures:\n      - name: n\n        sql: "{orders.count}"\n        type: number\n');
+    const params = cube('fops', 'params', '    sql: "SELECT * FROM t WHERE {FILTER_PARAMS.orders.status.filter(\'status\')}"\n    measures:\n      - name: n\n        type: count\n');
+    const { errors } = publish({ tree, current: [], upserts: [customers, orders('fsales'), member, params], deletes: [] });
+    expect(errors).toEqual([refusal('fops', 'stats', 'orders'), refusal('fops', 'params', 'orders')]);
+  });
+
+  test('the same references up the path are allowed', () => {
+    const v = view('feu', 'overview', '    cubes:\n      - join_path: orders.customers\n        includes: [city]\n');
+    const child = cube('feu', 'child', '    extends: orders\n');
+    const member = cube('feu', 'stats', '    sql_table: t\n    measures:\n      - name: n\n        sql: "{orders.count} + {customers.count}"\n        type: number\n');
+    const { errors } = publish({ tree, current: [], upserts: [customers, orders('fsales'), v, child, member], deletes: [] });
+    expect(errors).toEqual([]);
+  });
+
+  test('a move that strands a referrer is refused, naming the referrer: in a changeset, and by a folder push (outOfRange)', () => {
+    const landed = publish({ tree, current: [], upserts: [customers, orders('fsales')], deletes: [] });
+    expect(landed.errors).toEqual([]);
+    // customers moved from the root to fops: orders, in fsales, can no longer reach it.
+    const moved = publish({ tree, current: landed.items, upserts: [{ ...customers, folderId: 'fops' }], deletes: [{ folderId: 'froot', name: 'customers' }] });
+    expect(moved.errors).toEqual([refusal('fsales', 'orders', 'customers')]);
+    // fsales moved under fops: orders still reaches the root's customers. customers under fsales, moved: stranded.
+    const withLocal = publish({ tree, current: [], upserts: [{ ...customers, folderId: 'fsales' }, orders('feu')], deletes: [] }).items;
+    const under = (id: string, parentId: string) => new FolderTree([...tree.folders.filter((f) => f.id !== id), { id, parentId }]);
+    expect(outOfRange(withLocal, under('feu', 'fops'), []).items).toEqual(['orders']);
+    expect(outOfRange(withLocal, under('fsales', 'fops'), [])).toEqual({ cubes: [], items: [] });
   });
 });
 
@@ -451,7 +380,7 @@ describe('review findings', () => {
   ].filter((l) => l !== '').join('\n'));
 
   test('a pre-aggregation with indexes never gets an alias: the cube\'s alias shortens instead, or it is refused', () => {
-    const withIndexes = simple('fsales', 'orders', [
+    const withIndexes = simple('fsales', 'regional_orders', [
       '    pre_aggregations:',
       '      - name: orders_by_day',
       '        measures: [count]',
@@ -463,7 +392,7 @@ describe('review findings', () => {
     ].join('\n'));
     const { items, errors } = publish({ tree, current: [], upserts: [withIndexes], deletes: [] });
     expect(errors).toEqual([]);
-    const o = doc(byName(items, 'fsales__orders'));
+    const o = doc(byName(items, 'regional_orders'));
     expect(o.sql_alias).toMatch(/^x[a-z2-7]{7}$/);
     expect(o.pre_aggregations[0].sql_alias).toBeUndefined();
 
@@ -489,91 +418,70 @@ describe('review findings', () => {
     expect(`${a.sql_alias}_${a.pre_aggregations[0].sql_alias}`.length).toBeLessThanOrEqual(25);
   });
 
-  test('legacy snake_case *_references keys are rewritten, as Cube camelizes them', () => {
-    const withReferences = simple('fsales', 'orders', [
-      '    joins:',
-      '      - name: customers',
-      '        sql: "{CUBE}.id = {customers.id}"',
-      '        relationship: many_to_one',
-      '    pre_aggregations:',
-      '      - name: main',
-      '        measure_references: [count]',
-      '        dimension_references: [customers.city]',
-    ].join('\n'));
-    const { items, errors } = publish({ tree, current: [], upserts: [simple('froot', 'customers'), simple('fsales', 'customers'), withReferences], deletes: [] });
-    expect(errors).toEqual([]);
-    expect(doc(byName(items, 'fsales__orders')).pre_aggregations[0].dimension_references).toEqual(['fsales__customers.city']);
-  });
-
-  test('.sql after a cube is its SQL, even with an item named sql in scope', () => {
+  test('.sql after a cube is its SQL, even with an item named sql in the model', () => {
     const user = simple('fsales', 'orders', [
       '      - name: from_customers',
       '        sql: "{customers.sql()}"',
       '        type: number',
-    ].join('\n').replace('    measures:', '    measures:'));
-    const { items, errors } = publish({ tree, current: [], upserts: [simple('froot', 'customers'), simple('fsales', 'sql'), user], deletes: [] });
-    expect(errors).toEqual([]);
-    expect(doc(byName(items, 'fsales__orders')).measures[1].sql).toBe('{customers.sql()}');
-  });
-
-  test('an override reaches its ancestor\'s namesake through extends and join paths', () => {
-    const override = cube('fsales', 'orders', '    extends: orders\n');
-    const overview = view('fops', 'orders', '    cubes:\n      - join_path: orders\n        includes: [count]\n');
-    const { items, errors } = publish({ tree, current: [], upserts: [simple('froot', 'orders'), override, overview], deletes: [] });
-    expect(errors).toEqual([]);
-    expect(doc(byName(items, 'fsales__orders')).extends).toBe('orders');
-    expect(doc(byName(items, 'fops__orders')).cubes[0].join_path).toBe('orders');
-  });
-
-  test('a full name written by hand is refused: refer by short name', () => {
-    const sneaky = simple('fops', 'orders', [
-      '      - name: from_sales',
-      '        sql: "{fsales__customers.id}"',
-      '        type: number',
     ].join('\n'));
-    const { errors } = publish({ tree, current: [], upserts: [simple('fsales', 'customers'), sneaky], deletes: [] });
-    expect(errors.map((e) => e.message)).toEqual(['"fsales__customers" is a full name; refer to it by its short name']);
+    const { items, errors } = publish({ tree, current: [], upserts: [simple('froot', 'customers'), simple('fops', 'sql'), user], deletes: [] });
+    expect(errors).toEqual([]);
+    expect(doc(byName(items, 'orders')).measures[1].sql).toBe('{customers.sql()}');
+    expect(byName(items, 'orders').bindings).toEqual({ customers: 'customers' });
   });
 
-  test('members a prefixed view includes are length-checked', () => {
-    const longMember = 'average_order_value_bucket_for_lifetime_segment';
+  test('a member\'s SQL alias is length-checked, its cube\'s alias shortened first', () => {
+    const longMember = 'average_order_value_for_lifetime';
     const withAmount = simple('fsales', 'customers', [
       '      - name: amount',
       '        sql: amount',
       '        type: sum',
     ].join('\n'));
-    const v = view('fsales', 'overview', `    cubes:\n      - join_path: customers\n        includes:\n          - name: amount\n            alias: ${longMember}\n        prefix: true\n`);
-    const { errors } = publish({ tree, current: [], upserts: [withAmount, v], deletes: [] });
-    expect(errors.map((e) => e.message)).toEqual([expect.stringMatching(new RegExp(`Member customers_${longMember}'s SQL alias would be longer than 63`))]);
+    const long = 'customers_overview_for_the_sales_team';
+    const v = view('fsales', long, `    cubes:\n      - join_path: customers\n        includes:\n          - name: amount\n            alias: ${longMember}\n        prefix: true\n`);
+    const { items, errors } = publish({ tree, current: [], upserts: [withAmount, v], deletes: [] });
+    expect(errors).toEqual([]);
+    expect(doc(byName(items, long)).sql_alias).toMatch(/^x[a-z2-7]{7}$/);
+    const longer = view('fsales', 'overview', `    cubes:\n      - join_path: customers\n        includes:\n          - name: amount\n            alias: ${longMember}_and_more_still_longer\n        prefix: true\n`);
+    expect(publish({ tree, current: [], upserts: [withAmount, longer], deletes: [] }).errors.map((e) => e.message))
+      .toEqual([expect.stringMatching(new RegExp(`Member customers_${longMember}_and_more_still_longer's SQL alias would be longer than 63`))]);
   });
 });
 
 describe('overlays', () => {
   const published = publish({ tree, current: [], upserts: [customers, orders('fsales')], deletes: [] }).items;
 
-  test('an overlay item\'s names resolve in the overlay first, then along its folder path (AC-281)', () => {
-    // A copy of customers from fops, which isn't on feu's path, and a new item targeting feu.
-    const copied = { ...customers, folderId: 'fops' };
-    const { items, errors, changed } = publish({
-      tree, current: published, upserts: [copied, orders('feu')], deletes: [], overlay: true,
-    });
+  test('an overlay item with a published item\'s name is its edit, wherever either is (2.6)', () => {
+    // A copy of customers in another folder stands in for the published one.
+    const copied = { ...customers, folderId: 'fsales', yaml: `${customers.yaml}    title: Clients\n` };
+    const { items, errors, changed } = publish({ tree, current: published, upserts: [copied, orders('feu')], deletes: [], overlay: true });
     expect(errors).toEqual([]);
-    expect(changed.sort()).toEqual(['feu/orders', 'fops/customers']);
-    expect(byName(items, 'feu__orders').bindings).toMatchObject({ customers: 'fops__customers' });
-    // Published items keep their own bindings.
-    expect(byName(items, 'fsales__orders').bindings).toMatchObject({ customers: 'customers' });
+    expect(changed.sort()).toEqual(['customers', 'orders']);
+    expect(items.map((i) => `${i.folderId}/${i.name}`).sort()).toEqual(['feu/orders', 'fsales/customers']);
+    expect(doc(byName(items, 'customers')).title).toBe('Clients');
   });
 
-  test('without the overlay, the same items resolve nearest-first as ever', () => {
-    const { items } = publish({ tree, current: published, upserts: [{ ...customers, folderId: 'fops' }, orders('feu')], deletes: [] });
-    expect(byName(items, 'feu__orders').bindings).toMatchObject({ customers: 'customers' });
+  test('its own items\' references are held to their path; published items it stands in under are checked when it lands', () => {
+    // orders (published, in fsales) refers to customers; a copy in fops is off orders' path.
+    const copied = { ...customers, folderId: 'fops' };
+    expect(publish({ tree, current: published, upserts: [copied], deletes: [], overlay: true }).errors).toEqual([]);
+    expect(publish({ tree, current: published, upserts: [copied], deletes: [{ folderId: 'froot', name: 'customers' }] }).errors)
+      .toEqual([expect.objectContaining({ name: 'orders', kind: 'reference_range' })]);
+    // Its own item off its path is refused at push.
+    expect(publish({ tree, current: published, upserts: [orders('fops'), { ...customers, folderId: 'fsales' }], deletes: [], overlay: true }).errors)
+      .toEqual([expect.objectContaining({ folderId: 'fops', name: 'orders', kind: 'reference_range' })]);
   });
 
-  test('an overlay may not hold two items of one name', () => {
+  test('without the overlay, the same upserts are clashes', () => {
+    const { errors } = publish({ tree, current: published, upserts: [{ ...customers, folderId: 'fops' }], deletes: [] });
+    expect(errors.map((e) => e.kind)).toEqual(['name_in_use']);
+  });
+
+  test('an overlay may not hold two items of one name, in any case', () => {
     const { errors } = publish({
-      tree, current: published, upserts: [{ ...customers, folderId: 'fops' }, { ...customers, folderId: 'feu' }], deletes: [], overlay: true,
+      tree, current: published, upserts: [{ ...customers, folderId: 'fops' }, { ...customers, folderId: 'feu', name: 'Customers', yaml: customers.yaml.replace('name: customers', 'name: Customers') }], deletes: [], overlay: true,
     });
-    expect(errors[0].message).toMatch(/holds two items named "customers"/);
+    expect(errors[0]).toMatchObject({ kind: 'name_in_use', message: expect.stringMatching(/holds two items named "Customers"/) });
   });
 });
 
@@ -582,13 +490,12 @@ describe('data sources', () => {
   const sources = [
     { folderId: 'froot', name: 'default' },
     { folderId: 'fsales', name: 'warehouse' },
-    { folderId: 'fsales', name: 'default' },
     { folderId: 'fops', name: 'lake' },
   ];
   const cubeWith = (folderId: string, name: string, extra = '') => cube(folderId, name, `    sql_table: t\n${extra}    dimensions:\n      - name: id\n        sql: id\n        type: number\n        primary_key: true\n`);
-  const dataSourceOf = (items: PublishedItem[], fullName: string) => doc(byName(items, fullName)).data_source;
+  const dataSourceOf = (items: PublishedItem[], name: string) => doc(byName(items, name)).data_source;
 
-  test('a cube\'s data source binds nearest-first from its folder, never to a sibling\'s or a descendant\'s (AC-273)', () => {
+  test('a cube may use a data source in its folder or an ancestor, written as named; one elsewhere is refused (4.1)', () => {
     const { items, errors } = publish({
       tree,
       current: [],
@@ -597,89 +504,120 @@ describe('data sources', () => {
       upserts: [cubeWith('feu', 'a', '    data_source: warehouse\n'), cubeWith('froot', 'b', '    data_source: default\n')],
     });
     expect(errors).toEqual([]);
-    expect(dataSourceOf(items, 'feu__a')).toBe('fsales__warehouse');
+    expect(dataSourceOf(items, 'a')).toBe('warehouse');
     expect(dataSourceOf(items, 'b')).toBe('default');
     const sibling = publish({ tree, current: [], deletes: [], dataSources: sources, upserts: [cubeWith('feu', 'c', '    data_source: lake\n')] });
-    expect(sibling.errors[0].message).toMatch(/uses the data source "lake", which no folder on this item's path holds/);
-    const full = publish({ tree, current: [], deletes: [], dataSources: sources, upserts: [cubeWith('feu', 'c', '    data_source: fsales__warehouse\n')] });
-    expect(full.errors[0].message).toMatch(/is a full name/);
+    expect(sibling.errors).toEqual([{
+      folderId: 'feu', name: 'c', kind: 'data_source_range', message: 'It uses the data source "lake", which isn\'t in its folder or one of its ancestors',
+    }]);
+    expect(JSON.stringify(sibling.errors)).not.toContain('fops');
+    const unknown = publish({ tree, current: [], deletes: [], dataSources: sources, upserts: [cubeWith('feu', 'c', '    data_source: Warehouse\n')] });
+    expect(unknown.errors.map((e) => [e.kind, e.message])).toEqual([['reference', 'It uses the data source "Warehouse", which the model doesn\'t hold']]);
   });
 
-  test('a cube naming none gets the nearest default; the root\'s is left unwritten; one that extends inherits (AC-310)', () => {
+  test('a cube naming none uses the root\'s default, left unwritten; one that extends inherits its parent\'s', () => {
     const { items, errors } = publish({
       tree,
       current: [],
       deletes: [],
       dataSources: sources,
-      upserts: [cubeWith('feu', 'a'), cubeWith('fops', 'b'), cube('feu', 'child', '    extends: a\n')],
+      upserts: [cubeWith('feu', 'a'), cubeWith('fsales', 'w', '    data_source: warehouse\n'), cube('feu', 'child', '    extends: w\n')],
     });
     expect(errors).toEqual([]);
-    expect(dataSourceOf(items, 'feu__a')).toBe('fsales__default');
-    expect(dataSourceOf(items, 'fops__b')).toBeUndefined();
-    expect(dataSourceOf(items, 'feu__child')).toBeUndefined();
+    expect(dataSourceOf(items, 'a')).toBeUndefined();
+    expect(dataSourceOf(items, 'child')).toBeUndefined();
+  });
+
+  test('an inherited data source is held to the rule too, naming the child and its parent (4.4)', () => {
+    // A child off its parent's path is refused for both: R72's reference, and the data source it inherits.
+    const { errors } = publish({
+      tree,
+      current: [],
+      deletes: [],
+      dataSources: sources,
+      upserts: [cubeWith('fsales', 'w', '    data_source: warehouse\n'), cube('fops', 'child', '    extends: w\n')],
+    });
+    expect(errors).toEqual([{
+      folderId: 'fops', name: 'child', kind: 'reference_range', message: 'It refers to "w", which isn\'t in its folder or one of its ancestors',
+    }, {
+      folderId: 'fops',
+      name: 'child',
+      kind: 'data_source_range',
+      message: 'It uses the data source "warehouse" (through w, which it extends), which isn\'t in its folder or one of its ancestors',
+    }]);
+    // A parent moved onto another data source can't carry a kept child out of range.
+    const landed = publish({
+      tree, current: [], deletes: [], dataSources: sources, upserts: [cubeWith('froot', 'p'), cube('fsales', 'kid', '    extends: p\n')],
+    });
+    expect(landed.errors).toEqual([]);
+    const withRootLake = [...sources, { folderId: 'fops', name: 'lake2' }];
+    const moved = publish({ tree, current: landed.items, deletes: [], dataSources: withRootLake, upserts: [cubeWith('froot', 'p', '    data_source: lake2\n')] });
+    expect(moved.errors.map((e) => [e.name, e.kind]).sort()).toEqual([['kid', 'data_source_range'], ['p', 'data_source_range']]);
+  });
+
+  test('outOfRange: the cubes a folder push or a data source moved would carry out of range', () => {
+    const { items } = publish({
+      tree,
+      current: [],
+      deletes: [],
+      dataSources: sources,
+      upserts: [cubeWith('feu', 'a', '    data_source: warehouse\n'), cube('feu', 'child', '    extends: a\n'), cubeWith('fops', 'b')],
+    });
+    expect(outOfRange(items, tree, sources)).toEqual({ cubes: [], items: [] });
+    // warehouse moved into feu: still in range. Into fops: a and child out of it.
+    expect(outOfRange(items, tree, sources.map((s) => (s.name === 'warehouse' ? { ...s, folderId: 'feu' } : s)))).toEqual({ cubes: [], items: [] });
+    expect(outOfRange(items, tree, sources.map((s) => (s.name === 'warehouse' ? { ...s, folderId: 'fops' } : s))).cubes).toEqual(['a', 'child']);
+    // feu moved under fops: away from warehouse.
+    const moved = new FolderTree([...tree.folders.filter((f) => f.id !== 'feu'), { id: 'feu', parentId: 'fops' }]);
+    expect(outOfRange(items, moved, sources).cubes).toEqual(['a', 'child']);
   });
 
   test('without connections, data_source is left as written', () => {
     const { items } = publish({ tree, current: [], deletes: [], upserts: [cubeWith('feu', 'a', '    data_source: anything\n')] });
-    expect(dataSourceOf(items, 'feu__a')).toBe('anything');
+    expect(dataSourceOf(items, 'a')).toBe('anything');
   });
 
-  test('a cube\'s alias names the data source it is bound to, so another binding is another SQL and another rollup table', () => {
-    const aliasOfItem = (items: PublishedItem[], fullName: string) => doc(byName(items, fullName)).sql_alias;
-    const onRoot = publish({ tree, current: [], deletes: [], dataSources: sources, upserts: [cubeWith('fops', 'a'), cubeWith('froot', 'r')] });
-    // Cube's default, as before: the plain alias, or none at the root.
-    expect(aliasOfItem(onRoot.items, 'fops__a')).toBe('fops__a');
-    expect(aliasOfItem(onRoot.items, 'r')).toBeUndefined();
-    const nearer = publish({ tree, current: [], deletes: [], dataSources: sources, upserts: [cubeWith('feu', 'a')] });
+  test('a cube\'s alias names the data source it uses, so another data source is another SQL and another rollup table', () => {
+    const aliasOfItem = (items: PublishedItem[], name: string) => doc(byName(items, name)).sql_alias;
+    const plain = publish({ tree, current: [], deletes: [], dataSources: sources, upserts: [cubeWith('feu', 'a')] });
+    expect(aliasOfItem(plain.items, 'a')).toBeUndefined();
     const named = publish({ tree, current: [], deletes: [], dataSources: sources, upserts: [cubeWith('feu', 'a', '    data_source: warehouse\n')] });
-    const [onDefault, onWarehouse] = [aliasOfItem(nearer.items, 'feu__a'), aliasOfItem(named.items, 'feu__a')];
-    expect(onDefault).toBe(aliasOf('feu__a', 'fsales__default'));
-    expect(onWarehouse).toBe(aliasOf('feu__a', 'fsales__warehouse'));
-    expect(new Set([onDefault, onWarehouse, 'feu__a']).size).toBe(3);
-    // A root cube on a data source of its own is aliased by it too; an alias the author wrote is kept.
-    const rooted = publish({ tree, current: [], deletes: [], upserts: [cubeWith('froot', 'r', '    data_source: lake\n'), cubeWith('feu', 'b', '    sql_alias: mine\n    data_source: lake\n')] });
-    expect(aliasOfItem(rooted.items, 'r')).toBe(aliasOf('r', 'lake'));
-    expect(aliasOfItem(rooted.items, 'feu__b')).toBe('mine');
+    expect(aliasOfItem(named.items, 'a')).toBe(aliasOf('a', 'warehouse'));
+    expect(aliasOf('a', 'warehouse')).not.toBe('a');
+    // An alias the author wrote is kept.
+    const mine = publish({ tree, current: [], deletes: [], dataSources: sources, upserts: [cubeWith('feu', 'b', '    sql_alias: mine\n    data_source: warehouse\n')] });
+    expect(aliasOfItem(mine.items, 'b')).toBe('mine');
   });
 
   test('a cube that extends another is aliased by the data source it inherits, and never shares its parent\'s alias', () => {
-    const aliasOfItem = (items: PublishedItem[], fullName: string) => doc(byName(items, fullName)).sql_alias;
-    const withRootLake = [...sources, { folderId: 'froot', name: 'lake' }];
+    const aliasOfItem = (items: PublishedItem[], name: string) => doc(byName(items, name)).sql_alias;
     const first = publish({
       tree,
       current: [],
       deletes: [],
-      dataSources: withRootLake,
+      dataSources: sources,
       upserts: [
-        cubeWith('feu', 'base', '    data_source: warehouse\n'),
+        cubeWith('fsales', 'base', '    data_source: warehouse\n'),
         cube('feu', 'child', '    extends: base\n'),
-        cubeWith('froot', 'rbase', '    data_source: lake\n'),
-        cube('froot', 'rchild', '    extends: rbase\n'),
         cubeWith('froot', 'abase', '    sql_alias: ab\n'),
         cube('froot', 'achild', '    extends: abase\n'),
       ],
     });
     expect(first.errors).toEqual([]);
-    // Children are aliased by the data source they inherit, never sharing their parent's alias.
-    expect(aliasOfItem(first.items, 'feu__child')).toBe(aliasOf('feu__child', 'fsales__warehouse'));
-    expect(aliasOfItem(first.items, 'rbase')).toBe(aliasOf('rbase', 'lake'));
-    expect(aliasOfItem(first.items, 'rchild')).toBe(aliasOf('rchild', 'lake'));
-    // On Cube's default, a root child under an authored alias has its own name, not the parent's `ab`.
+    expect(aliasOfItem(first.items, 'child')).toBe(aliasOf('child', 'warehouse'));
+    // On Cube's default, a child under an authored alias has its own name, not the parent's `ab`.
     expect(aliasOfItem(first.items, 'abase')).toBe('ab');
     expect(aliasOfItem(first.items, 'achild')).toBe('achild');
 
-    // The parent alone published onto another data source: the kept child follows, its alias only.
-    const again = publish({
-      tree, current: first.items, deletes: [], dataSources: withRootLake, upserts: [cubeWith('feu', 'base')],
-    });
+    // The parent alone published onto Cube's default: the kept child follows, its alias only.
+    const again = publish({ tree, current: first.items, deletes: [], dataSources: sources, upserts: [cubeWith('fsales', 'base')] });
     expect(again.errors).toEqual([]);
-    expect(aliasOfItem(again.items, 'feu__base')).toBe(aliasOf('feu__base', 'fsales__default'));
-    expect(aliasOfItem(again.items, 'feu__child')).toBe(aliasOf('feu__child', 'fsales__default'));
-    expect(again.changed).toEqual(expect.arrayContaining(['feu/base', 'feu/child']));
-    expect(byName(again.items, 'feu__child').bindings).toEqual(byName(first.items, 'feu__child').bindings);
+    expect(aliasOfItem(again.items, 'base')).toBeUndefined();
+    expect(aliasOfItem(again.items, 'child')).toBe('child');
+    expect(again.changed).toEqual(expect.arrayContaining(['base', 'child']));
+    expect(byName(again.items, 'child').bindings).toEqual(byName(first.items, 'child').bindings);
     // What doesn't change isn't touched.
-    expect(again.changed).not.toContain('froot/rchild');
-    expect(byName(again.items, 'rchild')).toBe(byName(first.items, 'rchild'));
+    expect(again.changed).not.toContain('achild');
     expect(byName(again.items, 'achild')).toBe(byName(first.items, 'achild'));
   });
 });

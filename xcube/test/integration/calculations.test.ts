@@ -285,10 +285,10 @@ describeWithDatabase('quick calculations: companions asked for by a query, compi
     }).expect(200);
     expect(Object.keys(viewed.body.data[0])).toContain('sales_view.revenue__xc_pct_of_total');
     const folder = await load({
-      measures: ['fsales__deals.count'], dimensions: ['fsales__deals.category'], calculations: [{ measure: 'fsales__deals.count', kind: 'rank' }],
+      measures: ['deals.count'], dimensions: ['deals.category'], calculations: [{ measure: 'deals.count', kind: 'rank' }],
     }).expect(200);
     // Two categories tie: competition ranking.
-    expect(folder.body.data.map((r: any) => r['fsales__deals.count__xc_rank']).sort()).toEqual(['1', '1', '3']);
+    expect(folder.body.data.map((r: any) => r['deals.count__xc_rank']).sort()).toEqual(['1', '1', '3']);
   });
 
   test('what can\'t be computed is refused 400, each with its reason', async () => {

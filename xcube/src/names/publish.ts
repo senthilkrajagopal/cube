@@ -6,10 +6,9 @@ import yaml from 'js-yaml';
 import type { SnapshotFile } from '../model/snapshot';
 import {
   FolderTree,
-  fullNameOf,
   itemKey,
+  nameKey,
   parseItem,
-  ROOT,
   type AuthoredItem,
   type ItemDefinition,
   type ItemError,
@@ -20,7 +19,7 @@ import { rewriteReferences, Scope } from './rewrite';
 /** The longest `<cubeAlias>_<preAggregation>` whose rollup table name, with Cube's version suffix, fits Postgres's 63. */
 export const MAX_TABLE_STEM = 25;
 
-/** The longest cube alias written as is; longer full names get a hash alias. */
+/** The longest cube alias a data source's salt is added to as is; longer ones get a hash alias. */
 export const MAX_PLAIN_ALIAS = 20;
 
 export const MAX_IDENTIFIER = 63;
@@ -45,13 +44,17 @@ export function titleOf(name: string): string {
     .replace(/\bId(s?)\b/g, (_m, plural) => `ID${plural}`);
 }
 
-/** The alias xcube gives a prefixed cube or view without one: short names stay, long ones become a stable hash. */
-export function aliasOf(fullName: string, dataSource?: string): string {
+/**
+ * The alias of a name on a data source other than Cube's default: the name
+ * with a short hash of the data source when that is short, else a stable
+ * hash of both. Without a data source, the name.
+ */
+export function aliasOf(name: string, dataSource?: string): string {
   if (dataSource === undefined) {
-    return fullName.length <= MAX_PLAIN_ALIAS ? fullName : `x${base32(fullName, 7)}`;
+    return name;
   }
-  const plain = `${fullName}_${base32(dataSource, 4)}`;
-  return plain.length <= MAX_PLAIN_ALIAS ? plain : `x${base32(`${fullName}@${dataSource}`, 7)}`;
+  const plain = `${name}_${base32(dataSource, 4)}`;
+  return plain.length <= MAX_PLAIN_ALIAS ? plain : `x${base32(`${name}@${dataSource}`, 7)}`;
 }
 
 export interface PublishInput {
@@ -65,22 +68,22 @@ export interface PublishInput {
   /** Deleting an item that isn't there is no error (checking whether a retry is already in). */
   lenientDeletes?: boolean;
   /**
-   * The upserts are an overlay's (a workspace's or a proposal's): their names
-   * resolve among themselves first, then along their folder's path, and no
-   * two may share a short name.
+   * The upserts are an overlay's (a workspace's or a proposal's): one with a
+   * published item's name is that item's edit, wherever either is (R71 2.6),
+   * and no two may share a name.
    */
   overlay?: boolean;
   /**
-   * The model's data sources (connections), by folder and short name: when
-   * given, a cube's `data_source` is bound to one nearest-first from its
-   * folder, and a cube naming none to the nearest `default`.
+   * The model's data sources (connections), with their folders: when given,
+   * the data source each cube uses, its own or its parent's through
+   * `extends`, must be one of them, in its folder or an ancestor (R71 4).
    */
   dataSources?: { folderId: string; name: string }[];
 }
 
 export interface PublishResult {
   items: PublishedItem[];
-  /** Items resolved in this publish. */
+  /** Items resolved in this publish, by `itemKey`. */
   changed: string[];
   errors: ItemError[];
 }
@@ -101,120 +104,46 @@ function preAggregationsOf(doc: Record<string, any>): any[] {
 type Entry = { def: ItemDefinition; doc: Record<string, any>; resolved: boolean };
 
 /**
- * The data source a cube's alias names: its own as bound (or written), else
- * the one it inherits through `extends`, unless that is Cube's default. Cube
- * keys cached results by their SQL and names rollup tables by the alias,
- * neither by data source: a cube on another data source must be another SQL
- * alias, or it would be answered from what the old one gave.
+ * The data source a cube uses, with the cube it is named on: its own, else
+ * the one it inherits through `extends`, however far up; `default` (Cube's,
+ * the root's) when no cube of the chain names one.
  */
-function aliasedDataSource(entry: Entry, byFullName: Map<string, Entry>): string | undefined {
+function usedDataSource(entry: Entry, byName: Map<string, Entry>): { name: string; from: Entry } {
   const seen = new Set<string>();
-  for (let at: Entry | undefined = entry; at && !seen.has(at.def.fullName);) {
-    seen.add(at.def.fullName);
+  for (let at: Entry | undefined = entry; at && !seen.has(at.def.name);) {
+    seen.add(at.def.name);
     const named = at.doc.data_source ?? at.doc.dataSource;
     if (typeof named === 'string') {
-      return named !== 'default' ? named : undefined;
+      return { name: named, from: at };
     }
-    at = typeof at.doc.extends === 'string' ? byFullName.get(at.doc.extends.trim()) : undefined;
+    at = typeof at.doc.extends === 'string' ? byName.get(at.doc.extends.trim()) : undefined;
   }
-  return undefined;
+  return { name: 'default', from: entry };
 }
 
 /**
- * A cube's alias naming `salt` (its data source, or, as served, its
- * connection's identity), or its full name alone without one. A rollup table
- * is named `<alias>_<pre-aggregation>`: when that would be too long, the
- * short hash alias.
+ * The data source a cube's alias names: the one it uses, unless that is
+ * Cube's default. Cube keys cached results by their SQL and names rollup
+ * tables by the alias, neither by data source: a cube on another data source
+ * must be another SQL alias, or it would be answered from what the old one gave.
  */
-export function saltedAlias(fullName: string, doc: Record<string, any>, salt: string | undefined): string {
-  const alias = aliasOf(fullName, salt);
-  const tooLong = preAggregationsOf(doc).some((pa) => `${alias}_${pa.sql_alias ?? pa.sqlAlias ?? pa.name}`.length > MAX_TABLE_STEM);
-  return tooLong ? `x${base32(salt === undefined ? fullName : `${fullName}@${salt}`, 7)}` : alias;
+function aliasedDataSource(entry: Entry, byName: Map<string, Entry>): string | undefined {
+  const { name } = usedDataSource(entry, byName);
+  return name !== 'default' ? name : undefined;
 }
 
-/**
- * The SQL alias xcube gives an item whose author wrote none:
- * - a prefixed view's is its full name, or a short hash when that is long;
- * - a prefixed cube's names it too, and the data source it is on unless that is
- *   Cube's default; so does a root cube's on a data source of its own,
- *   inherited ones included;
- * - a cube that extends another has one of its own, or Cube would give it its
- *   parent's (`CubeSymbols` sets the parent as its prototype);
- * - any other root item has none, and is its name.
- */
-function generatedAlias(entry: Entry, byFullName: Map<string, Entry>): string | undefined {
-  const { def, doc } = entry;
-  if (def.kind === 'view') {
-    return def.folderId === ROOT ? undefined : aliasOf(def.fullName);
-  }
-  const dataSource = aliasedDataSource(entry, byFullName);
-  if (def.folderId === ROOT && dataSource === undefined) {
-    return typeof doc.extends === 'string' ? def.fullName : undefined;
-  }
-  return saltedAlias(def.fullName, doc, dataSource);
-}
+/** A name as Cube's planners make it a SQL identifier (`BaseQuery.aliasName`). */
+const sqlName = (name: string) => inflection.underscore(name);
 
-/**
- * Each item's SQL alias, once every item of the publish is resolved. A kept
- * cube whose alias that changes (its parent published onto another data
- * source) is re-dumped with the new alias, and nothing else: its bindings
- * stay as published. Returns the keys of those.
- */
-function assignAliases(entries: Entry[]): Set<string> {
-  const byFullName = new Map(entries.map((entry) => [entry.def.fullName, entry]));
-  const realiased = new Set<string>();
-  entries
-    .filter(({ def }) => def.doc.sql_alias === undefined && def.doc.sqlAlias === undefined)
-    .forEach((entry) => {
-      const { def, doc } = entry;
-      const alias = generatedAlias(entry, byFullName);
-      if (alias !== (doc.sql_alias ?? doc.sqlAlias)) {
-        delete doc.sqlAlias;
-        if (alias === undefined) {
-          delete doc.sql_alias;
-        } else {
-          doc.sql_alias = alias;
-        }
-        if (!entry.resolved) {
-          realiased.add(itemKey(def.folderId, def.name));
-          entry.resolved = true;
-        }
-      }
-    });
-  return realiased;
-}
-
-/**
- * What xcube adds to a resolved item: its title when prefixed (its alias
- * comes once every item is resolved, `assignAliases`), aliases for the
- * cubes of a view that prefix or split by them, and where
- * it came from, in `meta.xcube`, for the client's pickers.
- */
-function finish(def: ItemDefinition, doc: Record<string, any>) {
-  const prefixed = def.folderId !== ROOT;
-  if (prefixed && doc.title === undefined) {
-    doc.title = titleOf(def.name);
+/** Its members' names, and for a view those its `cubes` entries give (CubeSymbols.ts:946). */
+function memberNamesOf(def: ItemDefinition, doc: Record<string, any>): string[] {
+  if (def.kind === 'cube') {
+    return [...def.members];
   }
-  if (def.kind === 'view' && Array.isArray(def.doc.cubes)) {
-    // A view prefixes or splits by each cube's name; keep it the short one (CubeSymbols.ts:946, 1018).
-    def.doc.cubes.forEach((authored: any, i: number) => {
-      const entry = doc.cubes?.[i];
-      const joinPath = authored?.join_path ?? authored?.joinPath;
-      if (entry && (entry.prefix || entry.split) && entry.alias === undefined && typeof joinPath === 'string') {
-        entry.alias = joinPath.split('.').pop()!.trim();
-      }
-    });
-  }
-  const meta = doc.meta && typeof doc.meta === 'object' && !Array.isArray(doc.meta) ? doc.meta : {};
-  doc.meta = { ...meta, xcube: { folderId: def.folderId, shortName: def.name } };
-}
-
-/** The names a view's members get from its `cubes` entries (CubeSymbols.ts:946). */
-function viewMemberNames(doc: Record<string, any>): string[] {
-  const names: string[] = [];
+  const names = [...def.members];
   for (const entry of Array.isArray(doc.cubes) ? doc.cubes : []) {
     const joinPath = entry?.join_path ?? entry?.joinPath;
-    const cube = typeof joinPath === 'string' ? joinPath.split('.').pop()! : '';
+    const cube = typeof joinPath === 'string' ? joinPath.split('.').pop()!.trim() : '';
     for (const include of Array.isArray(entry?.includes) ? entry.includes : []) {
       const member = typeof include === 'string' ? include : (include?.alias ?? include?.name);
       if (typeof member === 'string' && member !== '*') {
@@ -225,11 +154,80 @@ function viewMemberNames(doc: Record<string, any>): string[] {
   return names;
 }
 
+/** Whether a cube alias leaves some member's SQL alias, or rollup table stem, too long. */
+function tooLong(alias: string, def: ItemDefinition, doc: Record<string, any>): boolean {
+  const times = new Set<string>((Array.isArray(doc.dimensions) ? doc.dimensions : [])
+    .filter((d: any) => d?.type === 'time').map((d: any) => d.name));
+  return preAggregationsOf(doc).some((pa) => sqlName(`${alias}_${pa.sql_alias ?? pa.sqlAlias ?? pa.name}`).length > MAX_TABLE_STEM)
+    || memberNamesOf(def, doc).some((m) => sqlName(`${alias}__${m}`).length + (times.has(m) ? GRANULARITY_SUFFIX : 0) > MAX_IDENTIFIER);
+}
+
+/**
+ * The SQL alias xcube gives an item whose author wrote none, or none when its
+ * name serves:
+ * - a name with upper case has its lower-case form: Cube's planners snake-case
+ *   a name into its alias (`OrderItems` and `order_items` would both be
+ *   `order_items`, and `ORDERS` `o_r_d_e_r_s`);
+ * - a cube on a data source other than Cube's default names it too, inherited
+ *   ones included;
+ * - a cube that extends another has one of its own, or Cube would give it its
+ *   parent's (`CubeSymbols` sets the parent as its prototype);
+ * - one that would make a rollup table stem or a member's alias too long is a
+ *   short stable hash.
+ */
+function generatedAlias(entry: Entry, byName: Map<string, Entry>): string | undefined {
+  const { def, doc } = entry;
+  const lower = def.name.toLowerCase();
+  const dataSource = def.kind === 'cube' ? aliasedDataSource(entry, byName) : undefined;
+  let alias = aliasOf(lower, dataSource);
+  if (tooLong(alias, def, doc)) {
+    alias = `x${base32(dataSource === undefined ? def.name : `${def.name}@${dataSource}`, 7)}`;
+  }
+  const own = dataSource !== undefined || (def.kind === 'cube' && typeof doc.extends === 'string');
+  return alias !== def.name || own ? alias : undefined;
+}
+
+/**
+ * Each item's SQL alias, once every item of the publish is resolved. A kept
+ * cube whose alias that changes (its parent published onto another data
+ * source) is re-dumped with the new alias, and nothing else: its bindings
+ * stay as published. Returns the keys of those.
+ */
+function assignAliases(entries: Entry[]): Set<string> {
+  const byName = new Map(entries.map((entry) => [entry.def.name, entry]));
+  const realiased = new Set<string>();
+  entries
+    .filter(({ def }) => def.doc.sql_alias === undefined && def.doc.sqlAlias === undefined)
+    .forEach((entry) => {
+      const { def, doc } = entry;
+      const alias = generatedAlias(entry, byName);
+      if (alias !== (doc.sql_alias ?? doc.sqlAlias)) {
+        delete doc.sqlAlias;
+        if (alias === undefined) {
+          delete doc.sql_alias;
+        } else {
+          doc.sql_alias = alias;
+        }
+        if (!entry.resolved) {
+          realiased.add(itemKey(def.name));
+          entry.resolved = true;
+        }
+      }
+    });
+  return realiased;
+}
+
+/** What xcube adds to a resolved item: where it came from, in `meta.xcube`, for the folder gate and the client's pickers. */
+function finish(def: ItemDefinition, doc: Record<string, any>) {
+  const meta = doc.meta && typeof doc.meta === 'object' && !Array.isArray(doc.meta) ? doc.meta : {};
+  doc.meta = { ...meta, xcube: { folderId: def.folderId, shortName: def.name } };
+}
+
 /**
  * The aliases Cube will build SQL and rollup tables from, checked across the
  * whole model: two cubes can't share one, and none may make a Postgres
- * identifier too long. Pre-aggregations of prefixed cubes whose table stem
- * would be too long get a short stable alias.
+ * identifier too long. A resolved cube's pre-aggregation whose table stem
+ * would still be too long gets a short stable alias.
  */
 function checkAliases(entries: Entry[]): ItemError[] {
   const errors: ItemError[] = [];
@@ -238,25 +236,24 @@ function checkAliases(entries: Entry[]): ItemError[] {
 
   for (const { def, doc, resolved } of entries) {
     const at = { folderId: def.folderId, name: def.name };
-    const alias: string = doc.sql_alias ?? doc.sqlAlias ?? doc.name;
+    const alias = sqlName(doc.sql_alias ?? doc.sqlAlias ?? doc.name);
     const other = cubeAliases.get(alias);
     if (other) {
       errors.push({ ...at, kind: 'alias', message: `Its SQL alias "${alias}" is also ${other}'s` });
     }
-    cubeAliases.set(alias, def.fullName);
+    cubeAliases.set(alias, def.name);
 
-    const prefixed = def.folderId !== ROOT;
     for (const pa of preAggregationsOf(doc)) {
       let paAlias: string = pa.sql_alias ?? pa.sqlAlias ?? pa.name;
-      if (resolved && prefixed && `${alias}_${paAlias}`.length > MAX_TABLE_STEM) {
+      if (resolved && sqlName(`${alias}_${paAlias}`).length > MAX_TABLE_STEM) {
         // Cube names a pre-aggregation's indexes after its alias when it has one
         // (PreAggregations.ts:417, 450), so only one without indexes may get one.
         const hasIndexes = Array.isArray(pa.indexes) ? pa.indexes.length > 0 : Boolean(pa.indexes);
         if (pa.sql_alias === undefined && pa.sqlAlias === undefined && !hasIndexes) {
-          paAlias = `p${base32(`${def.fullName}.${pa.name}`, 6)}`;
+          paAlias = `p${base32(`${def.name}.${pa.name}`, 6)}`;
           pa.sql_alias = paAlias;
         }
-        if (`${alias}_${paAlias}`.length > MAX_TABLE_STEM) {
+        if (sqlName(`${alias}_${paAlias}`).length > MAX_TABLE_STEM) {
           const room = MAX_TABLE_STEM - alias.length - 1;
           errors.push({
             ...at,
@@ -265,21 +262,19 @@ function checkAliases(entries: Entry[]): ItemError[] {
           });
         }
       }
-      const table = `${alias}_${paAlias}`;
+      const table = sqlName(`${alias}_${paAlias}`);
       const owner = tables.get(table);
       if (owner) {
         errors.push({ ...at, kind: 'alias', message: `Pre-aggregation ${pa.name} would share its table ${table} with ${owner}` });
       }
-      tables.set(table, `${def.fullName}.${pa.name}`);
+      tables.set(table, `${def.name}.${pa.name}`);
     }
 
-    if (prefixed) {
-      const timeDimensions = new Set<string>((Array.isArray(doc.dimensions) ? doc.dimensions : [])
+    if (resolved) {
+      const times = new Set<string>((Array.isArray(doc.dimensions) ? doc.dimensions : [])
         .filter((d: any) => d?.type === 'time').map((d: any) => d.name));
-      const members = def.kind === 'view' ? [...def.members, ...viewMemberNames(doc)] : [...def.members];
-      for (const member of members) {
-        const length = `${alias}__${member}`.length + (timeDimensions.has(member) ? GRANULARITY_SUFFIX : 0);
-        if (length > MAX_IDENTIFIER) {
+      for (const member of memberNamesOf(def, doc)) {
+        if (sqlName(`${alias}__${member}`).length + (times.has(member) ? GRANULARITY_SUFFIX : 0) > MAX_IDENTIFIER) {
           errors.push({ ...at, kind: 'alias', message: `Member ${member}'s SQL alias would be longer than ${MAX_IDENTIFIER} characters; shorten the name` });
         }
       }
@@ -288,59 +283,142 @@ function checkAliases(entries: Entry[]): ItemError[] {
   return errors;
 }
 
+/** The views Cube makes of a view's `split` entries: `<view>_<alias or cube>` (CubeSymbols.ts:943, 1018). */
+function splitViewNames(def: ItemDefinition): string[] {
+  if (def.kind !== 'view' || !Array.isArray(def.doc.cubes)) {
+    return [];
+  }
+  return def.doc.cubes
+    .filter((entry: any) => entry?.split)
+    .map((entry: any) => {
+      const joinPath = entry.join_path ?? entry.joinPath;
+      return `${def.name}_${entry.alias ?? (typeof joinPath === 'string' ? joinPath.split('.').pop()!.trim() : '')}`;
+    });
+}
+
+/** The refusal of a name another item holds: it names the caller's item, never where the other is (R71 2.3). */
+function inUse(item: { folderId: string; name: string }, message = `The name "${item.name}" is already in use`): ItemError {
+  return { folderId: item.folderId, name: item.name, kind: 'name_in_use', message };
+}
+
 /**
- * Applies a changeset (or a whole snapshot) to the current items: resolves
- * the items it changes, nearest-first from each item's folder, keeps every
- * other item as it was published (no rebinding), and refuses to remove an
- * item another still refers to.
+ * Names are one per model, in any case (R71 2.1): no resolved item, nor a
+ * view Cube makes of one's `split`, may take a name a kept item, or another
+ * resolved one, holds.
  */
+function checkNames(defs: ItemDefinition[], resolved: Set<string>): ItemError[] {
+  const errors: ItemError[] = [];
+  const isResolved = (def: ItemDefinition) => resolved.has(itemKey(def.name));
+  // Every item's name, and the split views of kept ones: a resolved view's split may take none of them.
+  const taken = new Set(defs.map((def) => nameKey(def.name)));
+  const keptSplits = new Set(defs.filter((def) => !isResolved(def)).flatMap((def) => splitViewNames(def).map(nameKey)));
+  keptSplits.forEach((name) => taken.add(name));
+  for (const def of defs.filter(isResolved)) {
+    for (const name of splitViewNames(def)) {
+      if (taken.has(nameKey(name))) {
+        errors.push(inUse(def, `Its split view "${name}" would take a name already in use`));
+      }
+      taken.add(nameKey(name));
+    }
+    if (keptSplits.has(nameKey(def.name))) {
+      errors.push(inUse(def));
+    }
+  }
+  return errors;
+}
+
 /**
- * Binds a cube's `data_source` to the full name of the data source it
- * names, nearest-first from the cube's folder toward the root (never a
- * descendant's or a sibling's, AC-273); a cube naming none gets the
- * nearest `default` (AC-310), unless it extends another, whose it inherits.
+ * The cubes whose data source isn't in their folder or an ancestor of it
+ * (R71 4.1), inherited ones included (4.4). A data source the model doesn't
+ * hold is left to the binding's own refusal.
  */
-function bindDataSource(
-  def: ItemDefinition,
-  doc: Record<string, any>,
+function checkRanges(
+  entries: Entry[],
   tree: FolderTree,
   dataSources: { folderId: string; name: string }[],
-): ItemError | undefined {
-  const at = { folderId: def.folderId, name: def.name };
-  const byFolder = new Map<string, Set<string>>();
-  dataSources.forEach(({ folderId, name }) => byFolder.set(folderId, (byFolder.get(folderId) ?? new Set()).add(name)));
-  const nearest = (name: string) => {
-    const folder = tree.chain(def.folderId).find((f) => byFolder.get(f)?.has(name));
-    return folder === undefined ? undefined : fullNameOf(folder, name);
-  };
+  checked: (entry: Entry) => boolean = () => true,
+): ItemError[] {
+  const folderOf = new Map(dataSources.map((d) => [d.name, d.folderId]));
+  const byName = new Map(entries.map((entry) => [entry.def.name, entry]));
+  const errors: ItemError[] = [];
+  for (const entry of entries.filter((e) => e.def.kind === 'cube' && checked(e))) {
+    const { name, from } = usedDataSource(entry, byName);
+    const folder = folderOf.get(name);
+    if (name !== 'default' && folder !== undefined && !tree.chain(entry.def.folderId).includes(folder)) {
+      const through = from === entry ? '' : ` (through ${from.def.name}, which it extends)`;
+      errors.push({
+        folderId: entry.def.folderId,
+        name: entry.def.name,
+        kind: 'data_source_range',
+        message: `It uses the data source "${name}"${through}, which isn't in its folder or one of its ancestors`,
+      });
+    }
+  }
+  return errors;
+}
+
+/**
+ * The items referring to one outside their folder and its ancestors (R72):
+ * a join, `extends`, a view's join path, `{cube.member}` or `FILTER_PARAMS`,
+ * as their bindings record. A name only resolved up the path before names
+ * were one per model; now it is checked. The refusal names the referrer and
+ * what it refers to, never where that is.
+ */
+function checkReferences(
+  entries: Entry[],
+  tree: FolderTree,
+  bindingsOf: (entry: Entry) => Record<string, string>,
+  checked: (entry: Entry) => boolean = () => true,
+): ItemError[] {
+  const folderOf = new Map(entries.map((entry) => [entry.def.name, entry.def.folderId]));
+  const errors: ItemError[] = [];
+  for (const entry of entries.filter(checked)) {
+    const path = tree.chain(entry.def.folderId);
+    const outside = [...new Set(Object.values(bindingsOf(entry)))]
+      .filter((target) => target !== entry.def.name && folderOf.has(target) && !path.includes(folderOf.get(target)!))
+      .sort();
+    if (outside.length) {
+      errors.push({
+        folderId: entry.def.folderId,
+        name: entry.def.name,
+        kind: 'reference_range',
+        message: `It refers to ${outside.map((n) => `"${n}"`).join(', ')}, which ${outside.length === 1 ? 'isn\'t' : 'aren\'t'} in its folder or one of its ancestors`,
+      });
+    }
+  }
+  return errors;
+}
+
+/** Checks a cube's own `data_source`: a data source of the model, by its name (the root's `default` is always one). */
+function checkDataSource(def: ItemDefinition, doc: Record<string, any>, dataSources: { folderId: string; name: string }[]): ItemError | undefined {
   const key = ['data_source', 'dataSource'].find((k) => doc[k] !== undefined);
-  if (key) {
-    const named = doc[key];
-    if (typeof named !== 'string' || !named) {
-      return { ...at, kind: 'reference', message: 'data_source must name a data source' };
-    }
-    if (named.includes('__')) {
-      return { ...at, kind: 'reference', message: `"${named}" is a full name; name the data source by its short name` };
-    }
-    const bound = nearest(named);
-    if (!bound) {
-      return { ...at, kind: 'reference', message: `It uses the data source "${named}", which no folder on this item's path holds` };
-    }
-    doc[key] = bound;
-  } else if (!def.extendsName) {
-    const bound = nearest('default');
-    // The root's default is Cube's default: nothing to write.
-    if (bound && bound !== 'default') {
-      doc.data_source = bound;
-    }
+  if (!key) {
+    return undefined;
+  }
+  const at = { folderId: def.folderId, name: def.name };
+  const named = doc[key];
+  if (typeof named !== 'string' || !named) {
+    return { ...at, kind: 'reference', message: 'data_source must name a data source' };
+  }
+  if (named !== 'default' && !dataSources.some((d) => d.name === named)) {
+    return { ...at, kind: 'reference', message: `It uses the data source "${named}", which the model doesn't hold` };
   }
   return undefined;
 }
 
+/**
+ * Applies a changeset (or a whole snapshot) to the current items: an item is
+ * its name, wherever it is (R71). An upsert of a published item's name in
+ * its folder is its edit; in another folder, a clash, unless the changeset
+ * deletes the published one (a move, 2.7), or the upserts are an overlay's,
+ * whose items stand in for published ones of their names (2.6). Every other
+ * item is kept as published, and nothing kept may lose what it refers to.
+ */
 export function publish({
   tree, current, upserts, deletes, replaceAll, lenientDeletes, overlay, dataSources,
 }: PublishInput): PublishResult {
   const errors: ItemError[] = [];
+  const what = overlay ? 'overlay' : 'changeset';
 
   // What is written must be in the tree; what is deleted need not be, as a snapshot drops a
   // folder and its items together (a delete of an item that isn't there is refused below).
@@ -351,26 +429,14 @@ export function publish({
   }
   const upserted = new Map<string, AuthoredItem>();
   for (const item of upserts) {
-    const key = itemKey(item.folderId, item.name);
-    if (upserted.has(key)) {
-      errors.push({ folderId: item.folderId, name: item.name, kind: 'item', message: 'The item is in the changeset twice' });
+    const key = itemKey(String(item.name));
+    const other = upserted.get(key);
+    if (other && other.folderId === item.folderId && other.name === item.name) {
+      errors.push({ folderId: item.folderId, name: item.name, kind: 'item', message: `The item is in the ${what} twice` });
+    } else if (other) {
+      errors.push(inUse(item, `The ${what} holds two items named "${item.name}" (in ${other.folderId} and ${item.folderId}); names are one per model`));
     }
     upserted.set(key, item);
-  }
-  if (overlay) {
-    const byName = new Map<string, AuthoredItem>();
-    for (const item of upserts) {
-      const other = byName.get(item.name);
-      if (other && other.folderId !== item.folderId) {
-        errors.push({
-          folderId: item.folderId,
-          name: item.name,
-          kind: 'item',
-          message: `The overlay holds two items named "${item.name}" (in ${other.folderId} and ${item.folderId}); names in it resolve to its own items first, so they must differ`,
-        });
-      }
-      byName.set(item.name, item);
-    }
   }
   if (errors.length) {
     return { items: current, changed: [], errors };
@@ -378,13 +444,28 @@ export function publish({
 
   const kept = new Map<string, PublishedItem>();
   if (!replaceAll) {
-    current.forEach((item) => kept.set(itemKey(item.folderId, item.name), item));
+    current.forEach((item) => kept.set(itemKey(item.name), item));
     for (const { folderId, name } of deletes) {
-      if (!kept.delete(itemKey(folderId, name)) && !lenientDeletes) {
+      const known = kept.get(itemKey(name));
+      if (known && known.folderId === folderId && known.name === name) {
+        kept.delete(itemKey(name));
+      } else if (!lenientDeletes) {
         errors.push({ folderId, name, kind: 'item', message: 'There is no such item to delete' });
       }
     }
-    upserted.forEach((_item, key) => kept.delete(key));
+    for (const [key, item] of upserted) {
+      const known = kept.get(key);
+      if (known && !overlay && (known.folderId !== item.folderId || known.name !== item.name)) {
+        // Its name is another item's, or a landed name in another case: names never change (R71 5.1).
+        errors.push(known.folderId === item.folderId
+          ? inUse(item, `The name "${item.name}" is in use as "${known.name}": a landed name can't change, not even its case`)
+          : inUse(item));
+      }
+      kept.delete(key);
+    }
+  }
+  if (errors.length) {
+    return { items: current, changed: [], errors };
   }
 
   // Parse every item: the changed ones to resolve, the others for their members and names.
@@ -393,36 +474,33 @@ export function publish({
     const { def, errors: parseErrors } = parseItem(item);
     errors.push(...parseErrors);
     if (def) {
-      defs.set(itemKey(item.folderId, item.name), def);
+      defs.set(itemKey(item.name), def);
     }
   }
   if (errors.length) {
     return { items: current, changed: [], errors };
   }
+  errors.push(...checkNames([...defs.values()], new Set(upserted.keys())));
 
-  const keptBindings = new Map([...kept].map(([key, item]) => [key, item.bindings]));
-  const overlayNames = overlay
-    ? new Map([...upserted.keys()].map((key) => [defs.get(key)!.name, defs.get(key)!]))
-    : undefined;
-  const scope = new Scope(tree, [...defs.values()], (def) => keptBindings.get(itemKey(def.folderId, def.name)), overlayNames);
+  const scope = new Scope([...defs.values()]);
 
-  // Nothing kept may lose what it is bound to.
-  const fullNames = new Set([...defs.values()].map((d) => d.fullName));
+  // Nothing kept may lose what it refers to.
+  const names = new Set([...defs.values()].map((d) => d.name));
   const referrers = new Map<string, string[]>();
   for (const item of kept.values()) {
     for (const target of Object.values(item.bindings)) {
-      if (!fullNames.has(target)) {
-        referrers.set(target, [...(referrers.get(target) ?? []), `${item.folderId}/${item.name}`]);
+      if (!names.has(target)) {
+        referrers.set(target, [...(referrers.get(target) ?? []), item.name]);
       }
     }
   }
   for (const [target, by] of referrers) {
-    const gone = current.find((item) => item.fullName === target);
+    const gone = current.find((item) => item.name === target);
     errors.push({
       folderId: gone?.folderId ?? null,
       name: gone?.name ?? null,
       kind: 'reference',
-      message: `${gone ? `${gone.folderId}/${gone.name}` : target} can't be removed or renamed: ${by.sort().join(', ')} refer${by.length === 1 ? 's' : ''} to it`,
+      message: `${target} can't be removed: ${by.sort().join(', ')} refer${by.length === 1 ? 's' : ''} to it`,
     });
   }
 
@@ -433,7 +511,7 @@ export function publish({
     const { doc, bindings, errors: rewriteErrors } = rewriteReferences(def, scope);
     errors.push(...rewriteErrors);
     if (dataSources && def.kind === 'cube') {
-      const dataSourceError = bindDataSource(def, doc, tree, dataSources);
+      const dataSourceError = checkDataSource(def, doc, dataSources);
       if (dataSourceError) {
         errors.push(dataSourceError);
       }
@@ -448,6 +526,15 @@ export function publish({
     doc: resolvedDocs.get(key) ?? (yaml.load(kept.get(key)!.resolvedYaml) as any)[listKeyOf(def.kind)][0],
     resolved: resolvedDocs.has(key),
   }));
+  if (!errors.length) {
+    // An overlay's own items are checked; published ones it stands in for are when it lands (R71 2.6).
+    const checked = (entry: Entry) => !overlay || entry.resolved;
+    const bindingsOf = (entry: Entry) => newBindings.get(itemKey(entry.def.name)) ?? kept.get(itemKey(entry.def.name))?.bindings ?? {};
+    errors.push(...checkReferences(entries, tree, bindingsOf, checked));
+    if (dataSources) {
+      errors.push(...checkRanges(entries, tree, dataSources, checked));
+    }
+  }
   const realiased = assignAliases(entries);
   errors.push(...checkAliases(entries));
   if (errors.length) {
@@ -455,7 +542,7 @@ export function publish({
   }
 
   const items: PublishedItem[] = entries.map(({ def, doc, resolved }) => {
-    const key = itemKey(def.folderId, def.name);
+    const key = itemKey(def.name);
     if (!resolved) {
       return kept.get(key)!;
     }
@@ -465,18 +552,40 @@ export function publish({
     const authored = upserted.get(key)!;
     return {
       ...authored,
-      fullName: def.fullName,
+      fullName: def.name,
       bindings: newBindings.get(key)!,
       resolvedYaml: dump(def.kind, doc),
     };
-  }).sort((a, b) => (a.fullName < b.fullName ? -1 : 1));
+  }).sort((a, b) => (a.name < b.name ? -1 : 1));
 
   return { items, changed: [...upserted.keys(), ...realiased], errors: [] };
 }
 
-/** The files Cube compiles: one per item, named by its full name. */
+/**
+ * What of a published revision a folder push or a data source moved would
+ * carry out of range: the cubes whose data source would be outside their
+ * folder's (R71 4.1), and the items referring to one outside it (R72).
+ */
+export function outOfRange(
+  items: PublishedItem[],
+  tree: FolderTree,
+  dataSources: { folderId: string; name: string }[],
+): { cubes: string[]; items: string[] } {
+  const bindings = new Map(items.map((item) => [item.name, item.bindings]));
+  const entries: Entry[] = items.map((item) => ({
+    def: { folderId: item.folderId, name: item.name, kind: item.kind, fullName: item.name, doc: {}, members: new Set<string>() },
+    doc: (yaml.load(item.resolvedYaml) as any)[listKeyOf(item.kind)][0],
+    resolved: false,
+  }));
+  return {
+    cubes: checkRanges(entries, tree, dataSources).map((e) => e.name!).sort(),
+    items: checkReferences(entries, tree, (entry) => bindings.get(entry.def.name) ?? {}).map((e) => e.name!).sort(),
+  };
+}
+
+/** The files Cube compiles: one per item, named by its name. */
 export function filesOf(items: PublishedItem[]): SnapshotFile[] {
-  return items.map((item) => ({ path: `${item.fullName}.yml`, content: item.resolvedYaml }));
+  return items.map((item) => ({ path: `${item.name}.yml`, content: item.resolvedYaml }));
 }
 
 /**
@@ -485,8 +594,9 @@ export function filesOf(items: PublishedItem[]): SnapshotFile[] {
  * `[{"folderId","name","kind","yaml"}, …]`.
  */
 export function itemsHash(items: AuthoredItem[]): string {
+  const sortKey = (i: AuthoredItem) => `${i.folderId}/${i.name}`;
   const sorted = [...items]
-    .sort((a, b) => (itemKey(a.folderId, a.name) < itemKey(b.folderId, b.name) ? -1 : 1))
+    .sort((a, b) => (sortKey(a) < sortKey(b) ? -1 : 1))
     .map(({ folderId, name, kind, yaml: text }) => ({ folderId, name, kind, yaml: text }));
   return crypto.createHash('sha256').update(JSON.stringify(sorted), 'utf8').digest('hex');
 }

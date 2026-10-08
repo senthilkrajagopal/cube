@@ -191,8 +191,8 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
   const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
   test('the model, its data source, and a second one whose password is wrong', async () => {
-    await admin('put', '/connections/default', pgConnection()).expect(200);
-    await admin('put', '/connections/broken', pgConnection(PASSWORD_MARK)).expect(200);
+    await admin('put', '/connections/default', { ...pgConnection(), baseVersion: null }).expect(200);
+    await admin('put', '/connections/broken', { ...pgConnection(PASSWORD_MARK), baseVersion: null }).expect(200);
     const published = await admin('put', '/snapshot', {
       baseRevision: null,
       folders: [{ id: 'froot', parentId: null }, { id: 'fsales', parentId: 'froot' }],
@@ -337,11 +337,11 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
     await admin('put', '/overlays/ws-1', {
       connections: [{ ...pgConnection(undefined, fields), folderId: 'fsales', name: 'scratch' }],
     }).expect(201);
-    const res = await run('fsales__scratch', { sql: 'SELECT body FROM notes' }, '?overlay=ws-1').expect(200);
+    const res = await run('scratch', { sql: 'SELECT body FROM notes' }, '?overlay=ws-1').expect(200);
     expect(res.body.rows).toEqual([['from the workspace']]);
-    expect((await run('fsales__scratch', { sql: 'SELECT 1' }).expect(404)).body.code).toBe('unknown_connection');
+    expect((await run('scratch', { sql: 'SELECT 1' }).expect(404)).body.code).toBe('unknown_connection');
     expect((await run('default', { sql: 'SELECT 1' }, '?overlay=ws-1').expect(404)).body.code).toBe('unknown_connection');
-    expect((await run('fsales__scratch', { sql: 'SELECT 1' }, '?overlay=ws-2').expect(404)).body.code).toBe('unknown_overlay');
+    expect((await run('scratch', { sql: 'SELECT 1' }, '?overlay=ws-2').expect(404)).body.code).toBe('unknown_overlay');
   });
 
   test('introspection browses an overlay\'s own data source with ?overlay=, never a published one of its name', async () => {
@@ -357,13 +357,13 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
         : request(server).get(`/cubejs-api/v1/introspection/data-sources/${route}`);
       return req.set('Authorization', bearer);
     };
-    const schemas = await introspect('fsales__scratch/schemas?overlay=ws-1').expect(200);
+    const schemas = await introspect('scratch/schemas?overlay=ws-1').expect(200);
     expect(schemas.body.schemas).toContainEqual({ name: 'public' });
-    const tables = await introspect('fsales__scratch/tables?overlay=ws-1&schema=public').expect(200);
+    const tables = await introspect('scratch/tables?overlay=ws-1&schema=public').expect(200);
     expect(tables.body.tables.map((t: any) => t.name)).toEqual(['notes']);
-    const columns = await introspect('fsales__scratch/columns?overlay=ws-1', { tables: [{ schema: 'public', table: 'notes' }] }).expect(200);
+    const columns = await introspect('scratch/columns?overlay=ws-1', { tables: [{ schema: 'public', table: 'notes' }] }).expect(200);
     expect(columns.body.tables[0].columns.map((c: any) => [c.name, c.rawType])).toEqual([['id', 'integer'], ['body', 'text']]);
-    const scaffolded = await introspect('fsales__scratch/scaffold?overlay=ws-1', { tables: [{ schema: 'public', table: 'notes' }] }).expect(200);
+    const scaffolded = await introspect('scratch/scaffold?overlay=ws-1', { tables: [{ schema: 'public', table: 'notes' }] }).expect(200);
     expect(scaffolded.body.cubes).toHaveLength(1);
 
     // An overlay bringing a `default` of its own, on another database: its own, never the published one.
@@ -375,11 +375,11 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
     expect(published.body.tables.map((t: any) => t.name)).toContain('orders');
 
     // Refused as the SQL route refuses.
-    expect((await introspect('fsales__scratch/schemas').expect(404)).body.error).toMatch(/Unknown data source/);
+    expect((await introspect('scratch/schemas').expect(404)).body.error).toMatch(/Unknown data source/);
     expect((await introspect('default/schemas?overlay=ws-1').expect(404)).body).toMatchObject({ code: 'unknown_connection' });
-    expect((await introspect('fsales__scratch/schemas?overlay=ws-9').expect(404)).body).toMatchObject({ code: 'unknown_overlay' });
-    expect((await introspect('fsales__scratch/schemas?overlay=bad%20id').expect(400)).body).toMatchObject({ code: 'invalid_overlay_id' });
-    expect((await introspect('fsales__scratch/schemas?overlay=ws-1', undefined, token({}))).body).toMatchObject({ code: 'bad_request' });
+    expect((await introspect('scratch/schemas?overlay=ws-9').expect(404)).body).toMatchObject({ code: 'unknown_overlay' });
+    expect((await introspect('scratch/schemas?overlay=bad%20id').expect(400)).body).toMatchObject({ code: 'invalid_overlay_id' });
+    expect((await introspect('scratch/schemas?overlay=ws-1', undefined, token({}))).body).toMatchObject({ code: 'bad_request' });
   });
 
   test('the logs name the run and how it ended, never its SQL', () => {
@@ -396,7 +396,12 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
     const [host, port] = MYSQL!.split(':');
     const fields = { host, port: Number(port || 3306), database: 'test', ssl: false };
     await admin('put', '/connections/mysql', {
-      folderId: 'froot', driver: 'mysql', authMethod: 'password', fields: { ...fields, user: 'root' }, sealed: { password: seal('test', fields, 'mysql') },
+      baseVersion: null,
+      folderId: 'froot',
+      driver: 'mysql',
+      authMethod: 'password',
+      fields: { ...fields, user: 'root' },
+      sealed: { password: seal('test', fields, 'mysql') },
     }).expect(200);
     const res = await run('mysql', { sql: 'SELECT 1 AS a, \'it\\\'s\' AS b, "x" AS c UNION ALL SELECT 2, \'y\', "z"' }).expect(200);
     expect(res.body).toMatchObject({
@@ -451,7 +456,12 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
     });
     const fields = { host: at.hostname, port: Number(at.port || 9047), ssl: false };
     await admin('put', '/connections/dremio', {
-      folderId: 'froot', driver: 'dremio', authMethod: 'password', fields: { ...fields, user }, sealed: { password: seal(password, fields, 'dremio') },
+      baseVersion: null,
+      folderId: 'froot',
+      driver: 'dremio',
+      authMethod: 'password',
+      fields: { ...fields, user },
+      sealed: { password: seal(password, fields, 'dremio') },
     }).expect(200);
     const res = await run('dremio', { sql: 'SELECT * FROM (VALUES (1, \'a\'), (2, \'b\'), (3, \'c\')) AS t(id, name)', maxRows: 2 }).expect(200);
     expect(res.body).toMatchObject({
@@ -564,7 +574,12 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
     const [host, port] = MSSQL!.split(':');
     const fields = { host, port: Number(port || 1433), database: 'master', encrypt: false, trustServerCertificate: true };
     await admin('put', '/connections/mssql', {
-      folderId: 'froot', driver: 'mssql', authMethod: 'sql-login', fields: { ...fields, user: 'sa' }, sealed: { password: seal('Xcube-test-Pass1', fields, 'mssql') },
+      baseVersion: null,
+      folderId: 'froot',
+      driver: 'mssql',
+      authMethod: 'sql-login',
+      fields: { ...fields, user: 'sa' },
+      sealed: { password: seal('Xcube-test-Pass1', fields, 'mssql') },
     }).expect(200);
     const res = await run('mssql', { sql: 'SELECT TOP 2 CAST(1 AS int) AS a, N\'x\' AS b FROM sys.objects UNION ALL SELECT 2, N\'y\'' }).expect(200);
     // Cube's SQL Server driver gives every number as a string.
@@ -587,7 +602,12 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
     const [host, port] = ORACLE!.split(':');
     const fields = { host, port: Number(port || 1521), database: 'FREEPDB1' };
     await admin('put', '/connections/oracle', {
-      folderId: 'froot', driver: 'oracle', authMethod: 'password', fields: { ...fields, user: 'xcube' }, sealed: { password: seal('xcube_test_pass1', fields, 'oracle') },
+      baseVersion: null,
+      folderId: 'froot',
+      driver: 'oracle',
+      authMethod: 'password',
+      fields: { ...fields, user: 'xcube' },
+      sealed: { password: seal('xcube_test_pass1', fields, 'oracle') },
     }).expect(200);
     const res = await run('oracle', { sql: 'SELECT 1 AS a, \'x\' AS b FROM dual;' }).expect(200);
     expect(res.body).toMatchObject({ columns: [{ name: 'A', type: 'NUMBER' }, { name: 'B', type: 'CHAR' }], rows: [[1, 'x']] });

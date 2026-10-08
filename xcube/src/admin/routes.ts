@@ -12,6 +12,7 @@ import { CubejsHandlerError } from '@cubejs-backend/api-gateway';
 
 import { LaneBusyError } from '../runtime/lane';
 import {
+  OutOfRangeError,
   FolderTreeError,
   KeySetError,
   MAX_MODEL_KEYS,
@@ -28,6 +29,7 @@ import {
 import { ConnectionError } from '../connections/connections';
 import { CredentialError } from '../credentials/credentials';
 import { MODEL_ID, SnapshotError } from '../model/snapshot';
+import { checkDataSourceName } from '../names/items';
 import type { QueueEntry } from '../gateway';
 import { SqlRunError, type SqlFailure } from '../sql/runner';
 import { adminAuth } from './auth';
@@ -170,6 +172,9 @@ const connectionTestSchema = Joi.object({
 const connectionSchema = connectionTestSchema.keys({
   folderId: Joi.string().max(64).required(),
   revisions: Joi.object().pattern(Joi.string(), Joi.string().max(128)).default({}),
+  // null: create it, never over another; a version: edit or move that version of it (R71 2.5).
+  baseVersion: Joi.number().integer().min(1).allow(null)
+    .required(),
 });
 
 const rewrapSchema = Joi.object({
@@ -351,8 +356,8 @@ export function initAdminRoutes(
         status = 400;
         body = { error: e.message, code: e.code };
       } else if (e instanceof ConnectionError) {
-        status = e.code === 'invalid_connection' ? 400 : 409;
-        body = { error: e.message, code: e.code, problems: e.problems };
+        status = e.code === 'invalid_connection' || e.code === 'default_outside_root' ? 400 : 409;
+        body = { error: e.message, code: e.code, problems: e.problems, ...e.details };
       } else if (e instanceof CredentialError) {
         status = 422;
         body = { error: e.message, code: 'invalid_secret' };
@@ -368,6 +373,10 @@ export function initAdminRoutes(
       } else if (e instanceof FolderInUseError) {
         status = 409;
         body = { error: e.message, code: 'folder_in_use', folders: e.folders };
+      } else if (e instanceof OutOfRangeError) {
+        // The data source rule's code first, when both are broken; each list says what to fix.
+        status = 409;
+        body = { error: e.message, code: e.cubes.length ? 'data_source_range' : 'reference_range', cubes: e.cubes, items: e.items };
       } else if (e instanceof LaneBusyError) {
         status = 503;
         res.set('Retry-After', String(Math.ceil(e.retryAfterMs / 1000)));
@@ -644,8 +653,9 @@ export function initAdminRoutes(
   }));
 
   const connectionNameOf = (req: Request) => {
-    if (!/^[a-z0-9_]{1,128}$/.test(req.params.name)) {
-      throw new AdminError(400, 'invalid_connection_name', 'A data source is named by its short name in the root, and <folderId>__<name> elsewhere');
+    const problem = checkDataSourceName(req.params.name);
+    if (problem) {
+      throw new AdminError(400, 'invalid_connection_name', problem);
     }
     return req.params.name;
   };

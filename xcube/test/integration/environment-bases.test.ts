@@ -150,7 +150,9 @@ describeWithDatabase('a data source served from Cube\'s environment, then from a
   }).expect(201)).body.revision as number;
   // Stores the model's `default`, then waits for it to be served over it.
   const store = async (model: string, fields: object, served = true) => {
+    const known = (await admin(model, 'get', '/connections').expect(200)).body.connections.find((c: any) => c.name === 'default');
     await admin(model, 'put', '/connections/default', {
+      baseVersion: known?.version ?? null,
       folderId: 'froot',
       driver: 'postgres',
       authMethod: 'password',

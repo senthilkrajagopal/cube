@@ -147,9 +147,9 @@ token="$(node -e '
   console.log(`${body}.${crypto.createHmac("sha256", process.argv[1]).update(body).digest("base64url")}`);
 ' -- "$API_SECRET" "$revision")"
 answer="$(curl -s -H "Authorization: $token" -H 'Content-Type: application/json' \
-  --data '{"query": {"measures": ["fsub__doubled.total"]}}' "$CUBE_URL/cubejs-api/v1/load")"
+  --data '{"query": {"measures": ["doubled.total"]}}' "$CUBE_URL/cubejs-api/v1/load")"
 echo "$answer" | head -c 300; echo
-echo "$answer" | grep -q '"fsub__doubled.total":"84"'
+echo "$answer" | grep -q '"doubled.total":"84"'
 echo "Items check passed: a folder's cube, bound to a root cube, queried by its full name."
 
 # Slice 4: the model's keys and folder groups pushed with the service
@@ -167,10 +167,10 @@ status="$(signed PUT /folders '{"security": true, "folders": [{"id": "froot", "p
 
 query() {
   curl -s -o /tmp/xcube-query.json -w '%{http_code}' -H "Authorization: $1" -H 'Content-Type: application/json' \
-    --data '{"query": {"measures": ["fsub__doubled.total"]}}' "$CUBE_URL/cubejs-api/v1/load"
+    --data '{"query": {"measures": ["doubled.total"]}}' "$CUBE_URL/cubejs-api/v1/load"
 }
 status="$(query "$(node "$keys/tokens.js" user g_sub "$revision")")"
-[ "$status" = 200 ] && grep -q '"fsub__doubled.total":"84"' /tmp/xcube-query.json || { echo "a user of g_sub got $status"; cat /tmp/xcube-query.json; exit 1; }
+[ "$status" = 200 ] && grep -q '"doubled.total":"84"' /tmp/xcube-query.json || { echo "a user of g_sub got $status"; cat /tmp/xcube-query.json; exit 1; }
 status="$(query "$(node "$keys/tokens.js" user nobody "$revision")")"
 [ "$status" != 200 ] || { echo "a user of no allowed group was answered"; cat /tmp/xcube-query.json; exit 1; }
 meta="$(curl -s -H "Authorization: $(node "$keys/tokens.js" user nobody "$revision")" "$CUBE_URL/cubejs-api/v1/meta")"
@@ -178,7 +178,7 @@ meta="$(curl -s -H "Authorization: $(node "$keys/tokens.js" user nobody "$revisi
 status="$(query "$token")"
 [ "$status" = 403 ] || { echo "an HS256 token for a model with keys got $status"; exit 1; }
 status="$(signed GET /meta)"
-[ "$status" = 200 ] && grep -q '"name":"fsub__doubled"' /tmp/xcube-admin.json || { echo "the admin field list answered $status"; exit 1; }
+[ "$status" = 200 ] && grep -q '"name":"doubled"' /tmp/xcube-admin.json || { echo "the admin field list answered $status"; exit 1; }
 echo "Security check passed: keys and folder groups pushed with the service credential; the gate admits g_sub and refuses the rest."
 
 # Slice 5: a workspace's change pushed as an overlay, previewed by a token naming it.
@@ -186,9 +186,9 @@ tripled_item='{"folderId": "fsub", "name": "doubled", "kind": "cube", "yaml": "c
 status="$(signed PUT /overlays/ws-check "{\"upserts\": [$tripled_item]}")"
 [ "$status" = 201 ] || { echo "overlay answered $status"; cat /tmp/xcube-admin.json; exit 1; }
 status="$(query "$(node "$keys/tokens.js" user g_sub "$revision" ws-check)")"
-[ "$status" = 200 ] && grep -q '"fsub__doubled.total":"126"' /tmp/xcube-query.json || { echo "the overlay's preview got $status"; cat /tmp/xcube-query.json; exit 1; }
+[ "$status" = 200 ] && grep -q '"doubled.total":"126"' /tmp/xcube-query.json || { echo "the overlay's preview got $status"; cat /tmp/xcube-query.json; exit 1; }
 status="$(query "$(node "$keys/tokens.js" user g_sub "$revision")")"
-[ "$status" = 200 ] && grep -q '"fsub__doubled.total":"84"' /tmp/xcube-query.json || { echo "the published model got $status"; exit 1; }
+[ "$status" = 200 ] && grep -q '"doubled.total":"84"' /tmp/xcube-query.json || { echo "the published model got $status"; exit 1; }
 status="$(signed DELETE /overlays/ws-check)"
 [ "$status" = 204 ] || { echo "dropping the overlay answered $status"; exit 1; }
 status="$(query "$(node "$keys/tokens.js" user g_sub "$revision" ws-check)")"
@@ -209,7 +209,7 @@ conn() {
     -H "Authorization: Bearer $service" -H 'Content-Type: application/json' \
     ${3:+--data "$3"} "$CUBE_URL/cubejs-api/v1/semantic/models/conn$2"
 }
-connection="{\"folderId\": \"froot\", \"driver\": \"postgres\", \"authMethod\": \"password\", \"fields\": $(echo "$target" | sed 's/}$/, "user": "test"}/'), \"sealed\": {\"password\": $sealed}}"
+connection="{\"baseVersion\": null, \"folderId\": \"froot\", \"driver\": \"postgres\", \"authMethod\": \"password\", \"fields\": $(echo "$target" | sed 's/}$/, "user": "test"}/'), \"sealed\": {\"password\": $sealed}}"
 status="$(conn PUT /connections/default "$connection")"
 [ "$status" = 200 ] || { echo "the connection answered $status"; cat /tmp/xcube-admin.json; exit 1; }
 status="$(conn PUT /snapshot '{"baseRevision": null, "folders": [{"id": "froot", "parentId": null}], "items": [{"folderId": "froot", "name": "via_connection", "kind": "cube", "yaml": "cubes:\n  - name: via_connection\n    sql_table: public.serving_check\n    measures:\n      - name: total\n        sql: amount\n        type: sum\n"}]}')"

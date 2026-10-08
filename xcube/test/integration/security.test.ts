@@ -207,12 +207,12 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
   });
 
   test('with security off and no keys, a model reads as before: HS256 tokens, every cube', async () => {
-    expect(await countOf(legacyToken(), 'fa__sales.count')).toBe(3);
-    expect(await countOf(legacyToken(), 'fab__v_sales.count')).toBe(3);
+    expect(await countOf(legacyToken(), 'sales.count')).toBe(3);
+    expect(await countOf(legacyToken(), 'v_sales.count')).toBe(3);
     // Its own policies are Cube's, as ever: a context in none of their groups is refused.
-    expect((await load(legacyToken(), 'fa__secured.count')).status).not.toBe(200);
-    expect(await countOf(legacyToken({ groups: ['g_a'] }), 'fa__secured.count')).toBe(2);
-    expect(await metaNames(legacyToken())).toEqual(['fa__sales', 'fab__v_sales', 'orders']);
+    expect((await load(legacyToken(), 'secured.count')).status).not.toBe(200);
+    expect(await countOf(legacyToken({ groups: ['g_a'] }), 'secured.count')).toBe(2);
+    expect(await metaNames(legacyToken())).toEqual(['orders', 'sales', 'v_sales']);
     // Only xcube's verifier sets a role: one in an HS256 token grants nothing.
     await request(server).get('/cubejs-api/v1/introspection/data-sources')
       .set('Authorization', legacyToken({ xcubeRole: 'service' }))
@@ -247,26 +247,26 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
   });
 
   test('a model with keys takes only RS256 tokens signed by them, for itself', async () => {
-    const hs = await load(legacyToken(), 'fa__sales.count').expect(403);
+    const hs = await load(legacyToken(), 'sales.count').expect(403);
     expect(hs.body.error).toMatch(/model "dev" takes RS256 tokens only/);
     // A token naming no model would read the disk model: not once any model has keys.
     await load(jwt.sign({}, API_SECRET), 'x.count').expect(403);
-    expect(await countOf(userToken([]), 'fa__sales.count')).toBe(3);
-    const elsewhere = await load(userToken([], { wechartModel: 'demo' }), 'fa__sales.count').expect(403);
+    expect(await countOf(userToken([]), 'sales.count')).toBe(3);
+    const elsewhere = await load(userToken([], { wechartModel: 'demo' }), 'sales.count').expect(403);
     expect(elsewhere.body.error).toMatch(/not one of its model's/);
-    await load(userToken([], { iss: 'someone' }), 'fa__sales.count').expect(403);
-    await load(userToken([], { role: 'service' }), 'fa__sales.count').expect(403);
+    await load(userToken([], { iss: 'someone' }), 'sales.count').expect(403);
+    await load(userToken([], { role: 'service' }), 'sales.count').expect(403);
     // The playground secret is no way in, and its system routes aren't served.
-    await load(jwt.sign({ wechartModel: 'dev', groups: ['sa'] }, PLAYGROUND_SECRET), 'fa__sales.count').expect(403);
+    await load(jwt.sign({ wechartModel: 'dev', groups: ['sa'] }, PLAYGROUND_SECRET), 'sales.count').expect(403);
     await request(server).get('/cubejs-system/v1/context').expect(404);
   });
 
   test('security on: a group granted on /A/B reads the /A cube its view uses (AC-320)', async () => {
     const res = await admin('put', '/folders', { folders: FOLDERS, security: true }).expect(200);
     expect(res.body).toMatchObject({ model: 'dev', security: true });
-    expect(await countOf(userToken(['g_ab']), 'fa__sales.count')).toBe(3);
-    expect(await countOf(userToken(['x', 'g_ab']), 'fab__v_sales.count')).toBe(3);
-    expect(await metaNames(userToken(['g_ab']))).toEqual(['fa__sales', 'fab__v_sales', 'orders']);
+    expect(await countOf(userToken(['g_ab']), 'sales.count')).toBe(3);
+    expect(await countOf(userToken(['x', 'g_ab']), 'v_sales.count')).toBe(3);
+    expect(await metaNames(userToken(['g_ab']))).toEqual(['orders', 'sales', 'v_sales']);
   });
 
   test('a token no folder admits sees nothing: not in /v1/meta, refused by /v1/load, /v1/sql and /v1/dry-run', async () => {
@@ -274,24 +274,24 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
     expect(await metaNames(nobody)).toEqual([]);
     expect(await metaNames(userToken([]))).toEqual([]);
     // Refused plainly, naming the folder the groups don't reach (a Preview as groups says so).
-    const refused = await load(nobody, 'fa__sales.count');
+    const refused = await load(nobody, 'sales.count');
     expect({ status: refused.status, error: refused.body.error })
-      .toEqual({ status: 403, error: 'None of these groups reaches folder fa (fa__sales)' });
+      .toEqual({ status: 403, error: 'None of these groups reaches folder fa (sales)' });
     // The SQL view of a Preview as groups: refused the same way, by GET as by POST.
     for (const route of ['sql', 'dry-run']) {
       const got = await request(server).get(`/cubejs-api/v1/${route}`)
-        .query({ query: JSON.stringify({ measures: ['fa__sales.count'] }) })
+        .query({ query: JSON.stringify({ measures: ['sales.count'] }) })
         .set('Authorization', nobody);
       expect({ route, status: got.status, error: got.body.error })
-        .toEqual({ route, status: 403, error: 'None of these groups reaches folder fa (fa__sales)' });
+        .toEqual({ route, status: 403, error: 'None of these groups reaches folder fa (sales)' });
     }
     const posted = await request(server).post('/cubejs-api/v1/sql')
-      .send({ query: { measures: ['fa__sales.count'] } })
+      .send({ query: { measures: ['sales.count'] } })
       .set('Authorization', nobody);
     expect(posted.status).toBe(403);
     // A group it reaches still gets the SQL.
     const allowed = await request(server).get('/cubejs-api/v1/sql')
-      .query({ query: JSON.stringify({ measures: ['fa__sales.count'] }) })
+      .query({ query: JSON.stringify({ measures: ['sales.count'] }) })
       .set('Authorization', userToken(['g_ab']))
       .expect(200);
     expect(allowed.body.sql.sql[0]).not.toMatch(/1 = 0/);
@@ -299,16 +299,16 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
 
   test('a view in /A/B is closed to a group admitted to /A but not /A/B, though the /A cube is open to it', async () => {
     const ac = userToken(['g_ac']);
-    expect(await countOf(ac, 'fa__sales.count')).toBe(3);
-    expect(await metaNames(ac)).toEqual(['fa__sales', 'orders']);
-    expect((await load(ac, 'fab__v_sales.count')).status).not.toBe(200);
+    expect(await countOf(ac, 'sales.count')).toBe(3);
+    expect(await metaNames(ac)).toEqual(['orders', 'sales']);
+    expect((await load(ac, 'v_sales.count')).status).not.toBe(200);
   });
 
   test('an authored row-level policy still applies within an admitted folder', async () => {
-    expect(await countOf(userToken(['g_a']), 'fa__secured.count')).toBe(2);
-    expect(await countOf(userToken(['sa']), 'fa__secured.count')).toBe(3);
+    expect(await countOf(userToken(['g_a']), 'secured.count')).toBe(2);
+    expect(await countOf(userToken(['sa']), 'secured.count')).toBe(3);
     // Admitted to /A, but in no group the cube's own policies name.
-    expect((await load(userToken(['g_ab']), 'fa__secured.count')).status).not.toBe(200);
+    expect((await load(userToken(['g_ab']), 'secured.count')).status).not.toBe(200);
   });
 
   test('a permission change applies at once on every compiled module, with no compile', async () => {
@@ -317,14 +317,14 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
     const narrowed = FOLDERS.map((f) => ({ ...f, allowedGroups: f.allowedGroups.filter((g) => g !== 'g_ab') }));
     const res = await admin('put', '/folders', { folders: narrowed }).expect(200);
     expect(res.body.security).toBe(true);
-    expect((await load(userToken(['g_ab']), 'fa__sales.count')).status).not.toBe(200);
+    expect((await load(userToken(['g_ab']), 'sales.count')).status).not.toBe(200);
     expect(await metaNames(userToken(['g_ab']))).toEqual([]);
-    expect(await countOf(userToken(['g_a']), 'fa__sales.count')).toBe(3);
+    expect(await countOf(userToken(['g_a']), 'sales.count')).toBe(3);
     // A tree sent without groups keeps them.
     await admin('put', '/folders', { folders: FOLDERS.map(({ id, parentId }) => ({ id, parentId })) }).expect(200);
-    expect((await load(userToken(['g_ab']), 'fa__sales.count')).status).not.toBe(200);
+    expect((await load(userToken(['g_ab']), 'sales.count')).status).not.toBe(200);
     await admin('put', '/folders', { folders: FOLDERS }).expect(200);
-    expect(await countOf(userToken(['g_ab']), 'fa__sales.count')).toBe(3);
+    expect(await countOf(userToken(['g_ab']), 'sales.count')).toBe(3);
     expect([...(core as any).compilerCache.keys()].sort()).toEqual(compiled);
   });
 
@@ -338,7 +338,7 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
     const svc = await jobs(serviceToken());
     expect({ status: svc.status, error: svc.body.error })
       .toEqual({ status: 400, error: 'A user\'s selector doesn\'t match any of the pre-aggregations defined in the data model.' });
-    expect((await load(serviceToken({ wechartModel: 'dev' }), 'fa__sales.count')).body.error).toMatch(/scope is missing: data/);
+    expect((await load(serviceToken({ wechartModel: 'dev' }), 'sales.count')).body.error).toMatch(/scope is missing: data/);
     await request(server).get('/cubejs-api/v1/introspection/data-sources').set('Authorization', serviceToken()).expect(200);
     // A service token naming a model builds only that model's.
     const elsewhere = await jobs(serviceToken({ wechartModel: 'other' }));
@@ -350,10 +350,10 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
 
   test('wechart reads the field list for itself from the admin routes, unfiltered', async () => {
     const meta = await admin('get', '/meta').expect(200);
-    expect(meta.body.cubes.map((c: any) => c.name).sort()).toEqual(['fa__sales', 'fa__secured', 'fab__v_sales', 'orders']);
+    expect(meta.body.cubes.map((c: any) => c.name).sort()).toEqual(['orders', 'sales', 'secured', 'v_sales']);
     expect(meta.body.compilerId).toMatch(/^[0-9a-f-]{36}$/);
     const extended = await admin('get', '/meta?extended=true').expect(200);
-    const sales = extended.body.cubes.find((c: any) => c.name === 'fa__sales');
+    const sales = extended.body.cubes.find((c: any) => c.name === 'sales');
     expect(sales).toHaveProperty('preAggregations');
     expect(sales).toHaveProperty('joins');
     await admin('get', '/meta', undefined, userToken(['sa'])).expect(401);

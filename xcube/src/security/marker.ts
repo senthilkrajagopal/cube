@@ -42,6 +42,31 @@ export function folderOf(doc: any): string | undefined {
   return typeof folderId === 'string' ? folderId : undefined;
 }
 
+const folderMaps = new WeakMap<SnapshotFile[], Map<string, string>>();
+
+/** Each cube's and view's folder, by its name, as xcube published it (`meta.xcube`), for a revision's files. */
+export function foldersOfFiles(files: SnapshotFile[]): Map<string, string> {
+  let found = folderMaps.get(files);
+  if (!found) {
+    found = new Map();
+    for (const file of files.filter((f) => /\.ya?ml$/i.test(f.path) && f.content.includes('xcube'))) {
+      try {
+        const doc: any = yaml.load(file.content);
+        for (const item of [...(doc?.cubes ?? []), ...(doc?.views ?? [])]) {
+          const folderId = folderOf(item);
+          if (typeof item?.name === 'string' && folderId !== undefined) {
+            found.set(item.name, folderId);
+          }
+        }
+      } catch {
+        // Not xcube's: Cube's own rules.
+      }
+    }
+    folderMaps.set(files, found);
+  }
+  return found;
+}
+
 /**
  * A published item's file as Cube compiles it: each cube and view xcube
  * published (it carries `meta.xcube`) gets the reserved policy, appended to

@@ -44,13 +44,13 @@ const customers = {
   ].join('\n'),
 };
 
-const orders = (folderId: string, extra = '') => ({
+const orders = (folderId: string, extra = '', name = 'orders') => ({
   folderId,
-  name: 'orders',
+  name,
   kind: 'cube',
   yaml: [
     'cubes:',
-    '  - name: orders',
+    `  - name: ${name}`,
     '    sql_table: main.orders',
     '    joins:',
     '      - name: customers',
@@ -179,41 +179,42 @@ describeWithDatabase('xcube items and changesets', () => {
     expect(ordersMeta.meta).toEqual({ xcube: { folderId: 'froot', shortName: 'orders' } });
   });
 
-  test('a changeset adds a folder\'s own cube, published under its prefix and bound nearest-first', async () => {
-    const res = await admin.post('/changesets', {
-      baseRevision: 1, upserts: [orders('fsales', '      - name: big\n        sql: total_amount\n        type: max')], source: {},
-    }).expect(201);
-    expect(res.body).toMatchObject({ revision: 2, items: [{ folderId: 'fsales', name: 'orders', fullName: 'fsales__orders' }] });
+  const big = (folderId = 'fsales') => orders(folderId, '      - name: big\n        sql: total_amount\n        type: max', 'big_orders');
+
+  test('a changeset adds a folder\'s cube under its own name, referring up its path', async () => {
+    const res = await admin.post('/changesets', { baseRevision: 1, upserts: [big()], source: {} }).expect(201);
+    expect(res.body).toMatchObject({ revision: 2, items: [{ folderId: 'fsales', name: 'big_orders', fullName: 'big_orders' }] });
 
     const data = await load({ wechartModel: 'dev', wechartRevision: 2 }, {
-      measures: ['fsales__orders.total'], dimensions: ['customers.name'], order: { 'customers.name': 'asc' },
+      measures: ['big_orders.total'], dimensions: ['customers.name'], order: { 'customers.name': 'asc' },
     }).expect(200);
-    expect(data.body.data.map((r: any) => [r['customers.name'], Number(r['fsales__orders.total'])]))
+    expect(data.body.data.map((r: any) => [r['customers.name'], Number(r['big_orders.total'])]))
       .toEqual([['Ada', 20], ['Grace', 30]]);
 
     const meta = await request(server).get('/cubejs-api/v1/meta')
       .set('Authorization', token({ wechartModel: 'dev', wechartRevision: 2 })).expect(200);
-    const sales = meta.body.cubes.find((c: any) => c.name === 'fsales__orders');
-    expect(sales.title).toBe('Orders');
-    expect(sales.measures.map((m: any) => m.title)).toContain('Orders Big');
+    const sales = meta.body.cubes.find((c: any) => c.name === 'big_orders');
+    expect(sales.title).toBe('Big Orders');
+    expect(sales.meta).toEqual({ xcube: { folderId: 'fsales', shortName: 'big_orders' } });
+    expect(sales.measures.map((m: any) => m.title)).toContain('Big Orders Big');
   });
 
-  test('items and resolve answer with the full names each short name means', async () => {
+  test('items answer with bare names; resolve with the item holding each name, in any case, from any folder', async () => {
     const items = await admin.get('/items').expect(200);
     expect(items.body).toMatchObject({ revision: 2, mode: 'items' });
     expect(items.body.items).toContainEqual({
       folderId: 'fsales',
-      name: 'orders',
+      name: 'big_orders',
       kind: 'cube',
-      fullName: 'fsales__orders',
+      fullName: 'big_orders',
       bindings: { customers: 'customers' },
       dataSource: 'default',
     });
 
-    const fromSales = await admin.post('/resolve', { folderId: 'fsales', names: ['orders', 'customers', 'nope'] }).expect(200);
-    expect(fromSales.body.names).toEqual({ orders: 'fsales__orders', customers: 'customers', nope: null });
-    const fromOps = await admin.post('/resolve', { folderId: 'fops', names: ['orders'] }).expect(200);
-    expect(fromOps.body.names).toEqual({ orders: 'orders' });
+    const fromSales = await admin.post('/resolve', { folderId: 'fsales', names: ['big_orders', 'Customers', 'nope'] }).expect(200);
+    expect(fromSales.body.names).toEqual({ big_orders: 'big_orders', Customers: 'customers', nope: null });
+    const fromOps = await admin.post('/resolve', { folderId: 'fops', names: ['BIG_ORDERS'] }).expect(200);
+    expect(fromOps.body.names).toEqual({ BIG_ORDERS: 'big_orders' });
   });
 
   test('a dry run checks a changeset and places Cube\'s errors on the item', async () => {
@@ -227,17 +228,16 @@ describeWithDatabase('xcube items and changesets', () => {
     expect(check.body.valid).toBe(false);
     expect(check.body.errors[0]).toMatchObject({ folderId: 'fops', name: 'returns', kind: 'compile' });
     expect(check.body.items).toEqual([{
-      folderId: 'fops', name: 'returns', fullName: 'fops__returns', bindings: {}, dataSource: 'default',
+      folderId: 'fops', name: 'returns', fullName: 'returns', bindings: {}, dataSource: 'default',
     }]);
 
     const good = await admin.post('/changesets?dryRun=true', {
-      upserts: [orders('fops')],
-      probes: [{ id: 'p', query: { measures: ['fops__orders.count'], dimensions: ['customers.name'] } }],
+      upserts: [orders('fops', '', 'ops_orders')],
+      probes: [{ id: 'p', query: { measures: ['ops_orders.count'], dimensions: ['customers.name'] } }],
     }).expect(200);
     expect(good.body).toMatchObject({ valid: true, probes: [{ id: 'p', candidate: { status: 200 } }], currentRevision: 2 });
-    // Each item with its bindings as the changeset would land it: `customers` nearest-first, from the root.
     expect(good.body.items).toEqual([expect.objectContaining({
-      folderId: 'fops', name: 'orders', fullName: 'fops__orders', bindings: expect.objectContaining({ customers: 'customers' }),
+      folderId: 'fops', name: 'ops_orders', fullName: 'ops_orders', bindings: expect.objectContaining({ customers: 'customers' }),
     })]);
 
     const status = await admin.get('/revision').expect(200);
@@ -245,12 +245,12 @@ describeWithDatabase('xcube items and changesets', () => {
   });
 
   test('refusals: a stale base, a referenced delete, an unknown folder, a file set, a folder still in use', async () => {
-    await admin.post('/changesets', { baseRevision: 1, upserts: [orders('fops')] }).expect(409);
+    await admin.post('/changesets', { baseRevision: 1, upserts: [orders('fops', '', 'ops_orders')] }).expect(409);
 
     const referenced = await admin.post('/changesets', { baseRevision: 2, deletes: [{ folderId: 'froot', name: 'customers' }] }).expect(422);
-    expect(referenced.body.errors[0].message).toMatch(/can't be removed or renamed: .*froot\/orders.*fsales\/orders/);
+    expect(referenced.body.errors[0].message).toBe('customers can\'t be removed: big_orders, orders refer to it');
 
-    const nowhere = await admin.post('/changesets', { baseRevision: 2, upserts: [orders('fnowhere')] }).expect(422);
+    const nowhere = await admin.post('/changesets', { baseRevision: 2, upserts: [orders('fnowhere', '', 'nowhere')] }).expect(422);
     expect(nowhere.body.errors[0]).toMatchObject({ kind: 'folder' });
 
     const files = await admin.put('/snapshot', { baseRevision: 2, files: [] }).expect(409);
@@ -263,16 +263,40 @@ describeWithDatabase('xcube items and changesets', () => {
     expect(cycle.body.code).toBe('invalid_folders');
   });
 
+  test('a name in use, in any case, is refused, naming the caller\'s item and never where the other is (R71 2.3)', async () => {
+    const clash = await admin.post('/changesets', { baseRevision: 2, upserts: [orders('fops', '', 'Big_Orders')] }).expect(422);
+    expect(clash.body).toMatchObject({
+      code: 'invalid_items',
+      errors: [{ folderId: 'fops', name: 'Big_Orders', kind: 'name_in_use', message: 'The name "Big_Orders" is already in use' }],
+    });
+    expect(JSON.stringify(clash.body)).not.toMatch(/fsales/);
+    // A dry run says the same.
+    const dry = await admin.post('/changesets?dryRun=true', { upserts: [orders('fops', '', 'BIG_ORDERS')] }).expect(200);
+    expect(dry.body).toMatchObject({ valid: false, errors: [{ kind: 'name_in_use' }] });
+  });
+
+  test('a reference off the referrer\'s folder path is refused, naming the referrer only (R72)', async () => {
+    const offPath = {
+      folderId: 'fops',
+      name: 'ops_stats',
+      kind: 'cube',
+      yaml: 'cubes:\n  - name: ops_stats\n    sql_table: main.orders\n    measures:\n      - name: biggest\n        sql: "{big_orders.big}"\n        type: number\n',
+    };
+    const refused = await admin.post('/changesets', { baseRevision: 2, upserts: [offPath] }).expect(422);
+    expect(refused.body.errors).toEqual([{
+      folderId: 'fops', name: 'ops_stats', kind: 'reference_range', message: 'It refers to "big_orders", which isn\'t in its folder or one of its ancestors',
+    }]);
+    expect(JSON.stringify(refused.body)).not.toMatch(/fsales/);
+  });
+
   test('the same changeset again is a no-op, and a delete no one refers to goes', async () => {
-    const again = await admin.post('/changesets', {
-      baseRevision: 1, upserts: [orders('fsales', '      - name: big\n        sql: total_amount\n        type: max')],
-    }).expect(200);
+    const again = await admin.post('/changesets', { baseRevision: 1, upserts: [big()] }).expect(200);
     expect(again.body).toMatchObject({ created: false, revision: 2 });
 
-    const removed = await admin.post('/changesets', { baseRevision: 2, deletes: [{ folderId: 'fsales', name: 'orders' }] }).expect(201);
+    const removed = await admin.post('/changesets', { baseRevision: 2, deletes: [{ folderId: 'fsales', name: 'big_orders' }] }).expect(201);
     expect(removed.body.revision).toBe(3);
     // Its retry, after it went in, changes nothing.
-    const retried = await admin.post('/changesets', { baseRevision: 2, deletes: [{ folderId: 'fsales', name: 'orders' }] }).expect(200);
+    const retried = await admin.post('/changesets', { baseRevision: 2, deletes: [{ folderId: 'fsales', name: 'big_orders' }] }).expect(200);
     expect(retried.body).toMatchObject({ created: false, revision: 3 });
     // A stale base is a conflict, even when the changeset is invalid too: the client rebases first.
     const invalid = { folderId: 'fops', name: 'broken', kind: 'cube', yaml: 'cubes:\n  - name: broken\n   bad: [\n' };
@@ -285,39 +309,62 @@ describeWithDatabase('xcube items and changesets', () => {
     await admin.put('/folders', { folders: [{ id: 'froot', parentId: null }, { id: 'fops', parentId: 'froot' }] }).expect(200);
   });
 
-  test('republishing an item as it was rebinds it to a nearer namesake', async () => {
-    const tree = { folders: [{ id: 'froot', parentId: null }, { id: 'fops', parentId: 'froot' }] };
-    await admin.put('/folders', tree).expect(200);
-    const added = await admin.post('/changesets', { baseRevision: 3, upserts: [orders('fops')] }).expect(201);
-    let items = await admin.get('/items').expect(200);
-    expect(items.body.items.find((i: any) => i.fullName === 'fops__orders').bindings).toEqual({ customers: 'customers' });
-
-    const ownCustomers = { ...customers, folderId: 'fops' };
-    const next = await admin.post('/changesets', { baseRevision: added.body.revision, upserts: [ownCustomers] }).expect(201);
-    items = await admin.get('/items').expect(200);
-    expect(items.body.items.find((i: any) => i.fullName === 'fops__orders').bindings).toEqual({ customers: 'customers' });
-
-    const republished = await admin.post('/changesets', { baseRevision: next.body.revision, upserts: [orders('fops')] }).expect(201);
-    expect(republished.body.revision).toBe(next.body.revision + 1);
-    items = await admin.get('/items').expect(200);
-    expect(items.body.items.find((i: any) => i.fullName === 'fops__orders').bindings).toEqual({ customers: 'fops__customers' });
+  test('a move in one changeset is the same item: what refers to it keeps it (R71 2.7)', async () => {
+    const summary = { folderId: 'fops', name: 'summary', kind: 'view', yaml: 'views:\n  - name: summary\n    cubes:\n      - join_path: orders\n        includes: [count]\n' };
+    const withView = await admin.post('/changesets', { baseRevision: 3, upserts: [summary] }).expect(201);
+    const moved = await admin.post('/changesets', {
+      baseRevision: withView.body.revision, deletes: [{ folderId: 'froot', name: 'orders' }], upserts: [orders('fops')],
+    }).expect(201);
+    const { items } = (await admin.get('/items').expect(200)).body;
+    expect(items.find((i: any) => i.name === 'orders')).toMatchObject({ folderId: 'fops', fullName: 'orders' });
+    expect(items.find((i: any) => i.name === 'summary').bindings).toEqual({ orders: 'orders' });
+    const data = await load({ wechartModel: 'dev', wechartRevision: moved.body.revision }, { measures: ['summary.count'] }).expect(200);
+    expect(Number(data.body.data[0]['summary.count'])).toBe(3);
   });
 
-  test('a whole-model snapshot keeps each unchanged item as bound; one bound to an item it drops binds afresh', async () => {
-    const tree = { folders: [{ id: 'froot', parentId: null }, { id: 'fops', parentId: 'froot' }] };
-    const bindingOf = async (fullName: string) => (await admin.get('/items').expect(200)).body.items.find((i: any) => i.fullName === fullName).bindings;
+  test('two publishes racing for one new name: the first to land wins, the other is refused on its retry (R71 2.4)', async () => {
+    const head = (await admin.get('/revision').expect(200)).body.current.revision;
+    const returns = (folderId: string) => ({ folderId, name: 'returns', kind: 'cube', yaml: 'cubes:\n  - name: returns\n    sql_table: main.orders\n    measures:\n      - name: count\n        type: count\n' });
+    const raced = await Promise.all([
+      admin.post('/changesets', { baseRevision: head, upserts: [returns('froot')] }),
+      admin.post('/changesets', { baseRevision: head, upserts: [returns('fops')] }),
+    ]);
+    expect(raced.map((r) => r.status).sort()).toEqual([201, 409]);
+    const loser = raced.find((r) => r.status === 409)!;
+    const lost = raced.indexOf(loser) === 0 ? 'froot' : 'fops';
+    const retry = await admin.post('/changesets', { baseRevision: loser.body.currentRevision, upserts: [returns(lost)] }).expect(422);
+    expect(retry.body.errors).toEqual([{ folderId: lost, name: 'returns', kind: 'name_in_use', message: 'The name "returns" is already in use' }]);
+    const items = (await admin.get('/items').expect(200)).body.items.filter((i: any) => i.name === 'returns');
+    expect(items).toHaveLength(1);
+  });
+
+  test('a folder push that would strand a reference is refused, naming the referrer (R72)', async () => {
+    const tree = [{ id: 'froot', parentId: null }, { id: 'fops', parentId: 'froot' }, { id: 'fsub', parentId: 'fops' }, { id: 'fside', parentId: 'froot' }];
+    await admin.put('/folders', { folders: tree }).expect(200);
+    const head = (await admin.get('/revision').expect(200)).body.current.revision;
+    const sub = { folderId: 'fsub', name: 'sub_stats', kind: 'cube', yaml: 'cubes:\n  - name: sub_stats\n    sql_table: main.orders\n    measures:\n      - name: n\n        sql: "{orders.count}"\n        type: number\n' };
+    await admin.post('/changesets', { baseRevision: head, upserts: [sub] }).expect(201);
+    // fsub under fside: sub_stats would lose orders, in fops.
+    const stranded = await admin.put('/folders', { folders: tree.map((f) => (f.id === 'fsub' ? { ...f, parentId: 'fside' } : f)) }).expect(409);
+    expect(stranded.body).toEqual({
+      error: 'The folder tree would leave items using what isn\'t in their folder or one of its ancestors', code: 'reference_range', cubes: [], items: ['sub_stats'],
+    });
+    // Under the root, fops is no ancestor of it either.
+    await admin.put('/folders', { folders: tree.map((f) => (f.id === 'fsub' ? { ...f, parentId: 'froot' } : f)) }).expect(409);
+    // Nothing moved.
+    expect((await admin.put('/folders', { folders: tree }).expect(200)).body).toMatchObject({ model: 'dev' });
+  });
+
+  test('a whole-model snapshot sent as it is changes nothing; one that moves an item lands it where it is sent', async () => {
+    const tree = { folders: [{ id: 'froot', parentId: null }, { id: 'fops', parentId: 'froot' }, { id: 'fsub', parentId: 'fops' }, { id: 'fside', parentId: 'froot' }] };
     let head = (await admin.get('/revision').expect(200)).body.current.revision;
     const all = await runtime.authored('dev');
-
-    // Sent as it is: nothing is resolved again, nothing changes.
     const same = await admin.put('/snapshot', { baseRevision: head, ...tree, items: all }).expect(200);
     expect(same.body.created).toBe(false);
-    expect(await bindingOf('fops__orders')).toEqual({ customers: 'fops__customers' });
-
-    // Sent without fops's own customers: fops's orders, bound to it, binds to the root's now.
-    const without = all.filter((i) => !(i.folderId === 'fops' && i.name === 'customers'));
-    head = (await admin.put('/snapshot', { baseRevision: head, ...tree, items: without }).expect(201)).body.revision;
-    expect(await bindingOf('fops__orders')).toEqual({ customers: 'customers' });
+    // orders back to the root: still up every referrer's path.
+    const moved = all.map((i) => (i.name === 'orders' ? { ...i, folderId: 'froot' } : i));
+    head = (await admin.put('/snapshot', { baseRevision: head, ...tree, items: moved }).expect(201)).body.revision;
+    expect((await admin.get('/items').expect(200)).body.items.find((i: any) => i.name === 'orders').folderId).toBe('froot');
   });
 
   test('a whole snapshot whose tree drops folders deletes the items it holds there, and the folders go', async () => {
@@ -332,7 +379,7 @@ describeWithDatabase('xcube items and changesets', () => {
     await admin.put('/folders', { folders: [{ id: 'froot', parentId: null }, { id: 'fnew', parentId: 'froot' }] }).expect(200);
     // An item sent in a folder its tree lacks is still refused.
     const lacking = await admin.put('/snapshot', {
-      baseRevision: res.body.revision, folders: [{ id: 'froot', parentId: null }], items: [...root, orders('fgone')],
+      baseRevision: res.body.revision, folders: [{ id: 'froot', parentId: null }], items: [...root, orders('fgone', '', 'gone_orders')],
     }).expect(422);
     expect(lacking.body.errors[0]).toMatchObject({ folderId: 'fgone', kind: 'folder' });
   });

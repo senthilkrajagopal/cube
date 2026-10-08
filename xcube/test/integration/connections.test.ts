@@ -23,7 +23,7 @@ import {
 import type { SnapshotFile } from '../../src/model/snapshot';
 import type { Probe } from '../../src/model/validate';
 import type { Priority } from '../../src/runtime/lane';
-import type { ModelHead, StoredModule } from '../../src/store/revisions';
+import { connectionsStamp, folderTreeHash, type ModelHead, type StoredModule } from '../../src/store/revisions';
 
 const DATABASE_URL = process.env.XCUBE_TEST_DATABASE_URL;
 const describeWithDatabase = DATABASE_URL ? describe : describe.skip;
@@ -188,6 +188,13 @@ describeWithDatabase('connections: data sources served from sealed credentials',
     sealed: { password: seal(password) },
     revisions: { password: `rev-${user}` },
   });
+  // A data source put over what is stored of it, or as new: its precondition read first (R71 2.5).
+  const putConnection = (name: string, body: object) => ({
+    expect: async (status: number) => {
+      const known = (await admin('get', '/connections').expect(200)).body.connections.find((c: any) => c.name === name);
+      return admin('put', `/connections/${name}`, { baseVersion: known?.version ?? null, ...body }).expect(status);
+    },
+  });
   // An instance reports a connection's state in the background: wait for the report `until` accepts.
   const reported = async (name: string, until: (instance: any) => boolean) => {
     for (let i = 0; i < 100; i++) {
@@ -210,25 +217,25 @@ describeWithDatabase('connections: data sources served from sealed credentials',
   });
 
   test('a connection is taken once its fields are right and its secret opens for its target', async () => {
-    const res = await admin('put', '/connections/default', connection(url.username, decodeURIComponent(url.password))).expect(200);
+    const res = await putConnection('default', connection(url.username, decodeURIComponent(url.password))).expect(200);
     expect(res.body).toMatchObject({ model: 'dev', name: 'default', driver: 'postgres', secrets: ['password'], revisions: { password: `rev-${url.username}` } });
     // What was sealed comes back only as the fields' names: no envelope, no password.
     expect(res.body.fields).not.toHaveProperty('password');
     expect(res.body).not.toHaveProperty('sealed');
     expect(JSON.stringify(res.body)).not.toContain('"enc"');
 
-    const moved = await admin('put', '/connections/other', {
+    const moved = await putConnection('other', {
       ...connection(url.username, 'x'), sealed: { password: seal('x', { ...target, host: 'elsewhere.example.com' }) },
     }).expect(422);
     expect(moved.body).toMatchObject({ code: 'invalid_secret' });
     // Verification turned off, the stored secret kept: it no longer opens (TLS settings are bound).
-    const unverified = await admin('put', '/connections/other', {
+    const unverified = await putConnection('other', {
       ...connection(url.username, 'x'), fields: { ...target, user: url.username, ssl: true, sslRejectUnauthorized: false },
     }).expect(422);
     expect(unverified.body).toMatchObject({ code: 'invalid_secret' });
-    const wrong = await admin('put', '/connections/other', { ...connection(url.username, 'x'), fields: { ...target, password: 'plain' } }).expect(400);
+    const wrong = await putConnection('other', { ...connection(url.username, 'x'), fields: { ...target, password: 'plain' } }).expect(400);
     expect(wrong.body.problems).toContain('password is a secret: send it sealed, never in the fields');
-    await admin('put', '/connections/fnope__other', { ...connection(url.username, 'x'), folderId: 'fnope' }).expect(400);
+    await putConnection('other', { ...connection(url.username, 'x'), folderId: 'fnope' }).expect(400);
     const listed = await admin('get', '/connections').expect(200);
     expect(listed.body.connections.map((c: any) => c.name)).toEqual(['default']);
     expect(JSON.stringify(listed.body)).not.toContain('"enc"');
@@ -254,7 +261,7 @@ describeWithDatabase('connections: data sources served from sealed credentials',
 
   test('a changed connection is swapped in while Cube runs, with no restart', async () => {
     const before = (await admin('get', '/connections/default/health').expect(200)).body.version;
-    const res = await admin('put', '/connections/default', connection(role, 'second-password')).expect(200);
+    const res = await putConnection('default', connection(role, 'second-password')).expect(200);
     expect(res.body.version).toBeGreaterThan(before);
     const health = await reported('default', (i) => i.version === res.body.version);
     expect(health.instances[0]).toMatchObject({ version: res.body.version, state: 'live', current: true });
@@ -300,14 +307,14 @@ describeWithDatabase('connections: data sources served from sealed credentials',
   });
 
   test('a connection\'s driver can\'t change, nor can one published cubes use be dropped', async () => {
-    const changed = await admin('put', '/connections/default', {
+    const changed = await putConnection('default', {
       folderId: 'froot', driver: 'mysql', authMethod: 'password', fields: { ...target, user: 'x' }, sealed: { password: seal('x', target, 'password', 'mysql') },
     }).expect(409);
     expect(changed.body.code).toBe('driver_change');
 
     // orders names no data source: it uses the root's default.
     const used = await admin('delete', '/connections/default').expect(409);
-    expect(used.body).toMatchObject({ code: 'in_use', problems: ['froot/orders uses it'] });
+    expect(used.body).toMatchObject({ code: 'in_use', problems: ['orders uses it'] });
     const res = await admin('post', '/changesets', { baseRevision: revision, deletes: [{ folderId: 'froot', name: 'orders' }] }).expect(201);
     revision = res.body.revision;
     await admin('delete', '/connections/default').expect(204);
@@ -325,7 +332,7 @@ describeWithDatabase('connections: data sources served from sealed credentials',
   });
 
   test('a dropped connection pushed again serves again, with no restart', async () => {
-    await admin('put', '/connections/default', connection(role, 'second-password')).expect(200);
+    await putConnection('default', connection(role, 'second-password')).expect(200);
     const res = await admin('post', '/changesets', {
       baseRevision: revision,
       upserts: [{
@@ -341,41 +348,110 @@ describeWithDatabase('connections: data sources served from sealed credentials',
     expect(answer.body.data[0]['orders.total']).toBe('42');
   });
 
-  test('a cube in a folder names its data source by its short name, bound at publish to the nearest one (AC-273)', async () => {
+  const salesYaml = (dataSource = 'warehouse', name = 'sales') => `cubes:\n  - name: ${name}\n    data_source: ${dataSource}\n    sql_table: ${warehouse}.orders\n    measures:\n      - name: total\n        sql: amount\n        type: sum\n`;
+
+  test('a cube in a folder uses a data source in its folder or an ancestor, by its name (R71 4.1)', async () => {
     await admin('put', '/folders', { folders: [{ id: 'froot', parentId: null }, { id: 'fa', parentId: 'froot' }] }).expect(200);
-    await admin('put', '/connections/fa__warehouse', { ...connection(role, 'second-password'), folderId: 'fa' }).expect(200);
+    await putConnection('warehouse', { ...connection(role, 'second-password'), folderId: 'fa' }).expect(200);
     const res = await admin('post', '/changesets', {
-      baseRevision: revision,
-      upserts: [{
-        folderId: 'fa',
-        name: 'sales',
-        kind: 'cube',
-        yaml: `cubes:\n  - name: sales\n    data_source: warehouse\n    sql_table: ${warehouse}.orders\n    measures:\n      - name: total\n        sql: amount\n        type: sum\n`,
-      }],
+      baseRevision: revision, upserts: [{ folderId: 'fa', name: 'sales', kind: 'cube', yaml: salesYaml() }],
     }).expect(201);
     revision = res.body.revision;
     const answer = await request(server).get('/cubejs-api/v1/load')
-      .query({ query: JSON.stringify({ measures: ['fa__sales.total'] }) })
+      .query({ query: JSON.stringify({ measures: ['sales.total'] }) })
       .set('Authorization', jwt.sign({ wechartModel: 'dev', wechartRevision: revision }, API_SECRET));
     expect({ status: answer.status, error: answer.body.error }).toEqual({ status: 200, error: undefined });
-    expect(answer.body.data[0]['fa__sales.total']).toBe('42');
-    const health = await reported('fa__warehouse', (i) => i.state === 'live');
+    expect(answer.body.data[0]['sales.total']).toBe('42');
+    const health = await reported('warehouse', (i) => i.state === 'live');
     expect(health.instances[0]).toMatchObject({ state: 'live', current: true });
+    expect((await admin('get', '/items').expect(200)).body.items.find((i: any) => i.name === 'sales')).toMatchObject({ dataSource: 'warehouse' });
 
     const unknown = await admin('post', '/changesets', {
       baseRevision: revision,
       upserts: [{ folderId: 'fa', name: 'lost', kind: 'cube', yaml: 'cubes:\n  - name: lost\n    data_source: nowhere\n    sql_table: t\n' }],
     }).expect(422);
-    expect(unknown.body.errors[0].message).toMatch(/uses the data source "nowhere", which no folder on this item's path holds/);
+    expect(unknown.body.errors[0].message).toBe('It uses the data source "nowhere", which the model doesn\'t hold');
 
-    // Browsable in introspection, and in use: fa's sales won't let it go.
+    // Browsable in introspection, and in use: sales won't let it go.
     const listed = await request(server).get('/cubejs-api/v1/introspection/data-sources')
       .set('Authorization', jwt.sign({ wechartModel: 'dev' }, API_SECRET))
       .expect(200);
     expect(listed.body.dataSources).toEqual(expect.arrayContaining([
-      { dataSource: 'default', dbType: 'postgres' }, { dataSource: 'fa__warehouse', dbType: 'postgres' },
+      { dataSource: 'default', dbType: 'postgres' }, { dataSource: 'warehouse', dbType: 'postgres' },
     ]));
-    expect((await admin('delete', '/connections/fa__warehouse').expect(409)).body.problems).toEqual(['fa/sales uses it']);
+    expect((await admin('delete', '/connections/warehouse').expect(409)).body.problems).toEqual(['sales uses it']);
+  });
+
+  test('a data source\'s name is one per model, in any case; a create never lands over another; an edit is of the version it names (R71 2.3, 2.5)', async () => {
+    const body = { ...connection(role, 'second-password'), folderId: 'froot' };
+    const taken = await admin('put', '/connections/Warehouse', { ...body, baseVersion: null }).expect(409);
+    expect(taken.body).toMatchObject({ code: 'name_in_use', error: 'The name "Warehouse" is already in use' });
+    expect(JSON.stringify(taken.body)).not.toMatch(/"fa"|\bfa\b/);
+    await admin('put', '/connections/warehouse', { ...body, folderId: 'fa', baseVersion: null }).expect(409);
+
+    const stored = (await admin('get', '/connections').expect(200)).body.connections.find((c: any) => c.name === 'warehouse');
+    const stale = await admin('put', '/connections/warehouse', { ...body, folderId: 'fa', baseVersion: stored.version - 1 }).expect(409);
+    expect(stale.body).toMatchObject({ code: 'conflict', currentVersion: stored.version });
+    const recased = await admin('put', '/connections/WAREHOUSE', { ...body, folderId: 'fa', baseVersion: stored.version }).expect(409);
+    expect(recased.body).toMatchObject({ code: 'name_in_use', error: expect.stringMatching(/in use as "warehouse": a data source's name can't change, not even its case/) });
+    const missing = await admin('put', '/connections/nothing_here', { ...body, baseVersion: 7 }).expect(409);
+    expect(missing.body).toMatchObject({ code: 'conflict', currentVersion: null });
+    // baseVersion is required: null to create, or the version edited.
+    expect((await admin('put', '/connections/fresh', body).expect(400)).body.code).toBe('bad_request');
+
+    // Two creates racing for one new name: one lands.
+    const raced = await Promise.all([
+      admin('put', '/connections/racer', { ...body, baseVersion: null }),
+      admin('put', '/connections/Racer', { ...body, baseVersion: null }),
+    ]);
+    expect(raced.map((r) => r.status).sort()).toEqual([200, 409]);
+    expect(raced.find((r) => r.status === 409)!.body.code).toBe('name_in_use');
+    const racers = (await admin('get', '/connections').expect(200)).body.connections.filter((c: any) => c.name.toLowerCase() === 'racer');
+    expect(racers).toHaveLength(1);
+    await admin('delete', `/connections/${racers[0].name}`).expect(204);
+  });
+
+  test('only the root holds `default` (R71 4.2)', async () => {
+    const body = { ...connection(role, 'second-password'), baseVersion: null };
+    const inFolder = await putConnection('default', { ...body, folderId: 'fa' }).expect(400);
+    expect(inFolder.body).toMatchObject({ code: 'default_outside_root' });
+    expect((await admin('put', '/connections/Default', { ...body, folderId: 'froot' }).expect(400)).body.code).toBe('default_outside_root');
+    const { revisions: _revisions, ...brought } = connection(role, 'second-password');
+    const overlay = await admin('put', '/overlays/ws-default', { connections: [{ ...brought, folderId: 'fa', name: 'default' }] }).expect(400);
+    expect(overlay.body.code).toBe('default_outside_root');
+  });
+
+  test('a cube is refused a data source off its path: at publish, overlay push, connection move and folder push (R71 4.3)', async () => {
+    const tree = [{ id: 'froot', parentId: null }, { id: 'fa', parentId: 'froot' }, { id: 'faa', parentId: 'fa' }, { id: 'fb', parentId: 'froot' }];
+    await admin('put', '/folders', { folders: tree }).expect(200);
+    // At publish: fb is beside fa, which holds warehouse.
+    const side = await admin('post', '/changesets', {
+      baseRevision: revision, upserts: [{ folderId: 'fb', name: 'side', kind: 'cube', yaml: salesYaml('warehouse', 'side') }],
+    }).expect(422);
+    expect(side.body.errors).toEqual([{
+      folderId: 'fb', name: 'side', kind: 'data_source_range', message: 'It uses the data source "warehouse", which isn\'t in its folder or one of its ancestors',
+    }]);
+    // At an overlay push, for its own items.
+    const pushed = await admin('put', '/overlays/ws-side', { upserts: [{ folderId: 'fb', name: 'side', kind: 'cube', yaml: salesYaml('warehouse', 'side') }] }).expect(422);
+    expect(pushed.body.errors).toEqual([expect.objectContaining({ name: 'side', kind: 'data_source_range' })]);
+
+    // deep, in faa, uses fa's warehouse.
+    revision = (await admin('post', '/changesets', {
+      baseRevision: revision, upserts: [{ folderId: 'faa', name: 'deep', kind: 'cube', yaml: salesYaml('warehouse', 'deep') }],
+    }).expect(201)).body.revision;
+    // A folder push carrying faa under fb strands deep.
+    const stranded = await admin('put', '/folders', { folders: tree.map((f) => (f.id === 'faa' ? { ...f, parentId: 'fb' } : f)) }).expect(409);
+    expect(stranded.body).toMatchObject({ code: 'data_source_range', cubes: ['deep'], items: [] });
+    // A move of warehouse into fb strands sales and deep; into faa, sales.
+    const stored = (await admin('get', '/connections').expect(200)).body.connections.find((c: any) => c.name === 'warehouse');
+    const move = (folderId: string) => admin('put', '/connections/warehouse', { ...connection(role, 'second-password'), folderId, baseVersion: stored.version });
+    expect((await move('fb').expect(409)).body).toMatchObject({ code: 'data_source_range', cubes: ['deep', 'sales'] });
+    expect((await move('faa').expect(409)).body).toMatchObject({ code: 'data_source_range', cubes: ['sales'] });
+    // Up to the root, it stays on every path.
+    const moved = await move('froot').expect(200);
+    await admin('put', '/connections/warehouse', { ...connection(role, 'second-password'), folderId: 'fa', baseVersion: moved.body.version }).expect(200);
+    revision = (await admin('post', '/changesets', { baseRevision: revision, deletes: [{ folderId: 'faa', name: 'deep' }] }).expect(201)).body.revision;
+    await admin('put', '/folders', { folders: [{ id: 'froot', parentId: null }, { id: 'fa', parentId: 'froot' }] }).expect(200);
   });
 
   test('a publish checked while another folder\'s data source goes is told its base moved, never refused over it', async () => {
@@ -383,7 +459,7 @@ describeWithDatabase('connections: data sources served from sealed credentials',
     let moved = 0;
     const other = async () => {
       const gone = await admin('post', '/changesets', { baseRevision: revision, deletes: [{ folderId: 'fa', name: 'sales' }] }).expect(201);
-      await admin('delete', '/connections/fa__warehouse').expect(204);
+      await admin('delete', '/connections/warehouse').expect(204);
       moved = gone.body.revision;
     };
     // It joins fa's sales, so its check compiles sales, bound to that data source.
@@ -402,10 +478,10 @@ describeWithDatabase('connections: data sources served from sealed credentials',
     revision = moved;
 
     // Once more for a publish: sales and its data source back, then gone again during the check.
-    await admin('put', '/connections/fa__warehouse', { ...connection(role, 'second-password'), folderId: 'fa' }).expect(200);
+    await putConnection('warehouse', { ...connection(role, 'second-password'), folderId: 'fa' }).expect(200);
     const back = await admin('post', '/changesets', {
       baseRevision: revision,
-      upserts: [{ folderId: 'fa', name: 'sales', kind: 'cube', yaml: `cubes:\n  - name: sales\n    data_source: warehouse\n    sql_table: ${warehouse}.orders\n    measures:\n      - name: total\n        sql: amount\n        type: sum\n` }],
+      upserts: [{ folderId: 'fa', name: 'sales', kind: 'cube', yaml: salesYaml() }],
     }).expect(201);
     revision = back.body.revision;
     runtime.beforeValidate = other;
@@ -414,12 +490,15 @@ describeWithDatabase('connections: data sources served from sealed credentials',
     revision = moved;
   });
 
-  test('a publish binding to a data source removed after its check is not stored; a removal waits out a publish', async () => {
+  test('a publish checked against data sources or a tree since changed is not stored; a removal waits out a publish', async () => {
     const { store, head, items } = await runtime.storeAt('dev');
-    const stored = await store.importItems({
-      model: 'dev', baseRevision: head!.revision, items, itemsHash: 'f'.repeat(64), source: {}, dataSources: ['fa__gone'],
-    });
-    expect(stored).toMatchObject({ outcome: 'conflict' });
+    const connections = await store.connections('dev');
+    const stamp = connectionsStamp(connections);
+    const tree = folderTreeHash(await store.folders('dev'));
+    for (const basis of [{ connections: connectionsStamp([...connections, { name: 'gone', folderId: 'fa' }]), tree }, { connections: stamp, tree: 'f'.repeat(64) }]) {
+      const stored = await store.importItems({ model: 'dev', baseRevision: head!.revision, items, itemsHash: 'f'.repeat(64), source: {}, basis });
+      expect(stored).toMatchObject({ outcome: 'conflict' });
+    }
     expect((await store.head('dev'))!.revision).toBe(head!.revision);
     // A removal checked at a revision since replaced is checked again.
     expect(await store.deleteConnection('dev', 'default', head!.revision - 1)).toBe('moved');
@@ -540,21 +619,21 @@ describeWithDatabase('connections: data sources served from sealed credentials',
       expect((await load().expect(200)).body.data[0]['orders.total']).toBe('42');
     });
 
-    test('a cube published again onto a nearer data source answers from it at once, never from the old one\'s cache (AC-273)', async () => {
+    test('a cube published again onto another data source answers from it at once, never from the old one\'s cache', async () => {
       await admin('put', '/folders', {
         folders: [{ id: 'froot', parentId: null }, { id: 'fa', parentId: 'froot' }, { id: 'fab', parentId: 'fa' }],
       }).expect(200);
-      await admin('put', '/connections/fa__warehouse', { ...connection(role, 'second-password'), folderId: 'fa' }).expect(200);
-      const where = {
+      await putConnection('warehouse', { ...connection(role, 'second-password'), folderId: 'fa' }).expect(200);
+      const where = (dataSource: string) => ({
         folderId: 'fab',
         name: 'where',
         kind: 'cube',
-        yaml: 'cubes:\n  - name: where\n    data_source: warehouse\n    sql: SELECT current_database() AS db\n    dimensions:\n      - name: db\n        sql: db\n        type: string\n        primary_key: true\n        public: true\n',
-      };
+        yaml: `cubes:\n  - name: where\n    data_source: ${dataSource}\n    sql: SELECT current_database() AS db\n    dimensions:\n      - name: db\n        sql: db\n        type: string\n        primary_key: true\n        public: true\n`,
+      });
       // A cube extending it, published once and then left alone.
       const twin = { folderId: 'fab', name: 'twin', kind: 'cube', yaml: 'cubes:\n  - name: twin\n    extends: where\n' };
       // As a client does that takes what is cached and has it renewed behind (or Cube with background renewal on).
-      const ask = (cube = 'fab__where') => request(server).get('/cubejs-api/v1/load')
+      const ask = (cube = 'where') => request(server).get('/cubejs-api/v1/load')
         .query({ query: JSON.stringify({ dimensions: [`${cube}.db`], cacheMode: 'stale-while-revalidate' }) })
         .set('Authorization', jwt.sign({ wechartModel: 'dev', wechartRevision: revision }, API_SECRET));
       // The SQL Cube keys its cached results by.
@@ -562,53 +641,28 @@ describeWithDatabase('connections: data sources served from sealed credentials',
         .query({ query: JSON.stringify({ dimensions: [`${cube}.db`] }) })
         .set('Authorization', jwt.sign({ wechartModel: 'dev', wechartRevision: revision }, API_SECRET))
         .expect(200)).body.sql.sql[0];
-      revision = (await admin('post', '/changesets', { baseRevision: revision, upserts: [where, twin] }).expect(201)).body.revision;
-      expect((await ask().expect(200)).body.data[0]['fab__where.db']).toBe(target.database);
-      expect((await ask('fab__twin').expect(200)).body.data[0]['fab__twin.db']).toBe(target.database);
-      const [whereBefore, twinBefore] = [await sqlOf('fab__where'), await sqlOf('fab__twin')];
+      revision = (await admin('post', '/changesets', { baseRevision: revision, upserts: [where('warehouse'), twin] }).expect(201)).body.revision;
+      expect((await ask().expect(200)).body.data[0]['where.db']).toBe(target.database);
+      expect((await ask('twin').expect(200)).body.data[0]['twin.db']).toBe(target.database);
+      const [whereBefore, twinBefore] = [await sqlOf('where'), await sqlOf('twin')];
       let { items } = (await admin('get', '/items').expect(200)).body;
-      expect(items.find((i: any) => i.fullName === 'fab__where')).toMatchObject({ kind: 'cube', dataSource: 'fa__warehouse' });
-      expect(items.find((i: any) => i.fullName === 'orders')).toMatchObject({ dataSource: 'default' });
+      expect(items.find((i: any) => i.name === 'where')).toMatchObject({ kind: 'cube', dataSource: 'warehouse' });
+      expect(items.find((i: any) => i.name === 'orders')).toMatchObject({ dataSource: 'default' });
 
-      // fab gets its own warehouse, on the other database; the cube, published again, binds to it.
+      // fab gets a warehouse of its own, on the other database; the cube, published again onto it, uses it.
       const { name: _name, ...onOther } = copy();
-      await admin('put', '/connections/fab__warehouse', { ...onOther, folderId: 'fab' }).expect(200);
-      revision = (await admin('post', '/changesets', { baseRevision: revision, upserts: [where] }).expect(201)).body.revision;
+      await putConnection('warehouse2', { ...onOther, folderId: 'fab' }).expect(200);
+      revision = (await admin('post', '/changesets', { baseRevision: revision, upserts: [where('warehouse2')] }).expect(201)).body.revision;
       // Straight after, well within Postgres's 10-second refresh key: the same query, from the new database.
-      expect((await ask().expect(200)).body.data[0]['fab__where.db']).toBe(workspaceDb);
+      expect((await ask().expect(200)).body.data[0]['where.db']).toBe(workspaceDb);
       // The twin, never published again, follows its parent onto it too: another SQL, so no cached answer of the old one's.
-      expect(await sqlOf('fab__where')).not.toBe(whereBefore);
-      expect(await sqlOf('fab__twin')).not.toBe(twinBefore);
-      expect((await ask('fab__twin').expect(200)).body.data[0]['fab__twin.db']).toBe(workspaceDb);
+      expect(await sqlOf('where')).not.toBe(whereBefore);
+      expect(await sqlOf('twin')).not.toBe(twinBefore);
+      expect((await ask('twin').expect(200)).body.data[0]['twin.db']).toBe(workspaceDb);
       ({ items } = (await admin('get', '/items').expect(200)).body);
-      expect(items.find((i: any) => i.fullName === 'fab__where').dataSource).toBe('fab__warehouse');
+      expect(items.find((i: any) => i.name === 'where').dataSource).toBe('warehouse2');
       // What the twin queries, and where it gets it.
-      expect(items.find((i: any) => i.fullName === 'fab__twin')).toMatchObject({ dataSource: 'fab__warehouse', extends: 'fab__where' });
-    });
-
-    test('a whole-model snapshot keeps what is published as it was bound; only what it changes binds afresh (AC-273)', async () => {
-      const folders = [
-        { id: 'froot', parentId: null }, { id: 'fa', parentId: 'froot' }, { id: 'fab', parentId: 'fa' }, { id: 'fabc', parentId: 'fab' },
-      ];
-      await admin('put', '/folders', { folders }).expect(200);
-      const early = { folderId: 'fabc', name: 'early', kind: 'cube', yaml: `cubes:\n  - name: early\n    data_source: warehouse\n    sql_table: ${warehouse}.orders\n    measures:\n      - name: total\n        sql: amount\n        type: sum\n` };
-      revision = (await admin('post', '/changesets', { baseRevision: revision, upserts: [early] }).expect(201)).body.revision;
-      const boundOf = async (fullName: string) => (await admin('get', '/items').expect(200)).body.items.find((i: any) => i.fullName === fullName).dataSource;
-      expect(await boundOf('fabc__early')).toBe('fab__warehouse');
-
-      // A nearer warehouse comes, then the whole model is sent again as it is: nothing published moves.
-      const { name: _name, ...onOther } = copy();
-      await admin('put', '/connections/fabc__warehouse', { ...onOther, folderId: 'fabc' }).expect(200);
-      const whole = async () => (await runtime.storeAt('dev')).items.map(({ folderId, name, kind, yaml }) => ({ folderId, name, kind, yaml }));
-      const again = await admin('put', '/snapshot', { baseRevision: revision, folders, items: await whole() });
-      expect([200, 201]).toContain(again.status);
-      revision = again.body.revision;
-      expect(await boundOf('fabc__early')).toBe('fab__warehouse');
-
-      // Sent changed, it is resolved afresh, and binds to the nearest now.
-      const changed = (await whole()).map((i) => (i.name === 'early' ? { ...i, yaml: i.yaml.replace('type: sum', 'type: max') } : i));
-      revision = (await admin('put', '/snapshot', { baseRevision: revision, folders, items: changed }).expect(201)).body.revision;
-      expect(await boundOf('fabc__early')).toBe('fabc__warehouse');
+      expect(items.find((i: any) => i.name === 'twin')).toMatchObject({ dataSource: 'warehouse2', extends: 'where' });
     });
 
     test('a data source changed in place is served from its new target at once, never its old one\'s cache or rollups (AC-161)', async () => {
@@ -622,15 +676,15 @@ describeWithDatabase('connections: data sources served from sealed credentials',
       // Served from cache while it renews: what would answer from the old target, if anything could.
       // (`at`, which the rollup doesn't hold: its query reads the source.)
       const ask = () => request(server).get('/cubejs-api/v1/load')
-        .query({ query: JSON.stringify({ dimensions: ['fa__sold.at'], cacheMode: 'stale-while-revalidate' }) })
+        .query({ query: JSON.stringify({ dimensions: ['sold.at'], cacheMode: 'stale-while-revalidate' }) })
         .set('Authorization', token());
       const sqlOf = async (query: object) => (await request(server).get('/cubejs-api/v1/sql')
         .query({ query: JSON.stringify(query) })
         .set('Authorization', token())
         .expect(200)).body.sql;
-      const rollupOf = async () => (await sqlOf({ measures: ['fa__sold.count'], dimensions: ['fa__sold.db'] })).preAggregations[0]?.tableName;
-      const push = async (fields: object, state = 'live', name = 'fa__warehouse', folderId = 'fa') => {
-        const res = await admin('put', `/connections/${name}`, {
+      const rollupOf = async () => (await sqlOf({ measures: ['sold.count'], dimensions: ['sold.db'] })).preAggregations[0]?.tableName;
+      const push = async (fields: object, state = 'live', name = 'warehouse', folderId = 'fa') => {
+        const res = await putConnection(name, {
           ...connection(role, 'second-password'), folderId, fields: { ...target, user: role, ...fields },
         }).expect(200);
         const health = await reported(name, (i) => i.version === res.body.version && i.state === state);
@@ -638,44 +692,44 @@ describeWithDatabase('connections: data sources served from sealed credentials',
       };
 
       revision = (await admin('post', '/changesets', { baseRevision: revision, upserts: [sold] }).expect(201)).body.revision;
-      expect((await ask().expect(200)).body.data[0]['fa__sold.at']).toBe(target.database);
-      const [sqlBefore, rollupBefore] = [(await sqlOf({ dimensions: ['fa__sold.at'] })).sql[0], await rollupOf()];
+      expect((await ask().expect(200)).body.data[0]['sold.at']).toBe(target.database);
+      const [sqlBefore, rollupBefore] = [(await sqlOf({ dimensions: ['sold.at'] })).sql[0], await rollupOf()];
       expect(rollupBefore).toBeTruthy();
       // On the target it was first served with (its base): served as published, under its own names.
       const asPublished = () => {
-        const { served, published } = runtime.servedFile('dev', 'fa__sold.yml');
+        const { served, published } = runtime.servedFile('dev', 'sold.yml');
         return Boolean(published) && served === published;
       };
       expect(asPublished()).toBe(true);
 
       // A new password, sealed again, to the same target: served as it was, nothing to rebuild.
       await push({});
-      expect((await sqlOf({ dimensions: ['fa__sold.at'] })).sql[0]).toBe(sqlBefore);
+      expect((await sqlOf({ dimensions: ['sold.at'] })).sql[0]).toBe(sqlBefore);
       expect(await rollupOf()).toBe(rollupBefore);
 
       // The same data source, now on the other database: from its new target at once, however asked.
       await push({ database: workspaceDb });
-      expect((await ask().expect(200)).body.data[0]['fa__sold.at']).toBe(workspaceDb);
-      expect((await sqlOf({ dimensions: ['fa__sold.at'] })).sql[0]).not.toBe(sqlBefore);
+      expect((await ask().expect(200)).body.data[0]['sold.at']).toBe(workspaceDb);
+      expect((await sqlOf({ dimensions: ['sold.at'] })).sql[0]).not.toBe(sqlBefore);
       // Its rollup is another table, to be built from the new target; the old one is never read for it.
       expect(await rollupOf()).not.toBe(rollupBefore);
       expect(asPublished()).toBe(false);
 
       // Back again: the first target's, at once, under its own names again, and its own tables.
       await push({});
-      expect((await ask().expect(200)).body.data[0]['fa__sold.at']).toBe(target.database);
-      expect((await sqlOf({ dimensions: ['fa__sold.at'] })).sql[0]).toBe(sqlBefore);
+      expect((await ask().expect(200)).body.data[0]['sold.at']).toBe(target.database);
+      expect((await sqlOf({ dimensions: ['sold.at'] })).sql[0]).toBe(sqlBefore);
       expect(await rollupOf()).toBe(rollupBefore);
       expect(asPublished()).toBe(true);
 
       // Two changed together: each switches.
-      await Promise.all([push({ database: workspaceDb }), push({ database: target.database }, 'live', 'fab__warehouse', 'fab')]);
-      expect((await ask().expect(200)).body.data[0]['fa__sold.at']).toBe(workspaceDb);
+      await Promise.all([push({ database: workspaceDb }), push({ database: target.database }, 'live', 'warehouse2', 'fab')]);
+      expect((await ask().expect(200)).body.data[0]['sold.at']).toBe(workspaceDb);
       const whereNow = await request(server).get('/cubejs-api/v1/load')
-        .query({ query: JSON.stringify({ dimensions: ['fab__where.db'], cacheMode: 'stale-while-revalidate' }) })
+        .query({ query: JSON.stringify({ dimensions: ['where.db'], cacheMode: 'stale-while-revalidate' }) })
         .set('Authorization', token())
         .expect(200);
-      expect(whereNow.body.data[0]['fab__where.db']).toBe(target.database);
+      expect(whereNow.body.data[0]['where.db']).toBe(target.database);
 
       // New settings that don't connect: queries fail, and never answer from the old target.
       await push({ database: `${workspaceDb}_missing` }, 'failed');
@@ -693,7 +747,7 @@ describeWithDatabase('connections: data sources served from sealed credentials',
         .set('Authorization', token())
         .expect(200)).body.sql.preAggregations[0]?.tableName as string;
       const push = async (body: object) => {
-        const res = await admin('put', '/connections/default', body).expect(200);
+        const res = await putConnection('default', body).expect(200);
         await reported('default', (i) => i.version === res.body.version && i.state === 'live');
       };
       const asPublished = () => {

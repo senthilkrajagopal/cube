@@ -57,11 +57,25 @@ export interface ItemsImportRequest {
   folders?: Folder[];
   modules?: StoredModule[];
   /**
-   * The connections the changed items are bound to: stored only while every
-   * one of them still exists, checked under the model's lock that a
-   * connection's removal takes too.
+   * What the items were checked against (R71's data-source rule): stored only
+   * while the model's data sources, and for a changeset its folder tree, are
+   * still as they were, checked under the model's lock that a data source's
+   * change and a folder push take too.
    */
-  dataSources?: string[];
+  basis?: PublishBasis;
+}
+
+/** The data sources, by name and folder, and the folder tree a publish was checked against. */
+export interface PublishBasis {
+  connections: string;
+  /** For a changeset; a snapshot brings its own tree. */
+  tree?: string;
+}
+
+/** The stamp of a model's data sources: each one's name and folder. */
+export function connectionsStamp(connections: { name: string; folderId: string }[]): string {
+  const sorted = connections.map((c) => `${c.name}@${c.folderId}`).sort();
+  return crypto.createHash('sha256').update(JSON.stringify(sorted), 'utf8').digest('hex');
 }
 
 export interface ImportRequest {
@@ -212,9 +226,10 @@ export interface RevisionStore {
   folders(model: string): Promise<Folder[]>;
   /**
    * Replaces the folder tree, setting the allowed groups of the folders
-   * that carry them, and security when given.
+   * that carry them, and security when given, under the model's lock:
+   * `guard` may refuse it, by throwing, before anything changes.
    */
-  putFolders(model: string, folders: Folder[], security?: boolean): Promise<{
+  putFolders(model: string, folders: Folder[], security?: boolean, guard?: () => Promise<void>): Promise<{
     hash: string;
     permissionsVersion: number;
     security: boolean;
@@ -234,7 +249,15 @@ export interface RevisionStore {
   /** How many live overlays a model holds. */
   overlayCount(model: string): Promise<number>;
   connections(model: string): Promise<StoredConnection[]>;
-  putConnection(connection: Omit<StoredConnection, 'version' | 'updatedAt'>): Promise<StoredConnection>;
+  /**
+   * Stores a data source under the model's lock, which publishes and folder
+   * pushes take too: `guard`, given the model's data sources as they are,
+   * may refuse it by throwing.
+   */
+  putConnection(
+    connection: Omit<StoredConnection, 'version' | 'updatedAt'>,
+    guard?: (connections: StoredConnection[]) => Promise<void>,
+  ): Promise<StoredConnection>;
   /**
    * Removes a connection once nothing published uses it, as checked at
    * `atRevision`: `moved` if the model has another revision by then, to be
@@ -389,7 +412,7 @@ export class PgRevisionStore implements RevisionStore {
     return rows.map((row) => ({ id: row.id, parentId: row.parent_id }));
   }
 
-  public async putFolders(model: string, folders: Folder[], security?: boolean) {
+  public async putFolders(model: string, folders: Folder[], security?: boolean, guard?: () => Promise<void>) {
     const { s } = this;
     return inTransaction(this.pool, async (client) => {
       await client.query("SET LOCAL lock_timeout = '10s'");
@@ -401,6 +424,7 @@ export class PgRevisionStore implements RevisionStore {
       if (security === true && locked.mode === 'files' && locked.current_rev !== null) {
         throw new SecurityModeError(model);
       }
+      await guard?.();
       if (security === true && !locked.security) {
         const older = await this.olderInstances(client, 4);
         if (older.length) {
@@ -667,10 +691,19 @@ export class PgRevisionStore implements RevisionStore {
     return rows.map((row) => this.connectionOf(row));
   }
 
-  public async putConnection(c: Omit<StoredConnection, 'version' | 'updatedAt'>): Promise<StoredConnection> {
+  public async putConnection(
+    c: Omit<StoredConnection, 'version' | 'updatedAt'>,
+    guard?: (connections: StoredConnection[]) => Promise<void>,
+  ): Promise<StoredConnection> {
     const { s } = this;
     return inTransaction(this.pool, async (client) => {
+      await client.query("SET LOCAL lock_timeout = '10s'");
       await client.query(`INSERT INTO ${s}.models (id) VALUES ($1) ON CONFLICT (id) DO NOTHING`, [c.model]);
+      await client.query(`SELECT 1 FROM ${s}.models WHERE id = $1 FOR UPDATE`, [c.model]);
+      if (guard) {
+        const { rows } = await client.query(`SELECT * FROM ${s}.connections WHERE model = $1 ORDER BY name COLLATE "C"`, [c.model]);
+        await guard(rows.map((row) => this.connectionOf(row)));
+      }
       const { rows: [row] } = await client.query(
         `INSERT INTO ${s}.connections (model, name, folder_id, driver, auth_method, fields, sealed, revisions, version)
          VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::jsonb, nextval('${s}.connection_versions'))
@@ -901,7 +934,7 @@ export class PgRevisionStore implements RevisionStore {
       itemsHash: request.itemsHash,
       folders: request.folders,
       modules: request.modules,
-      dataSources: request.dataSources,
+      basis: request.basis,
     });
   }
 
@@ -915,9 +948,9 @@ export class PgRevisionStore implements RevisionStore {
     itemsHash?: string;
     folders?: Folder[];
     modules?: StoredModule[];
-    dataSources?: string[];
+    basis?: PublishBasis;
   }): Promise<ImportResult> {
-    const { model, baseRevision, files, source, mode, items, itemsHash, folders, modules, dataSources } = request;
+    const { model, baseRevision, files, source, mode, items, itemsHash, folders, modules, basis } = request;
     const hash = contentHash(files);
     const { s } = this;
 
@@ -951,14 +984,17 @@ export class PgRevisionStore implements RevisionStore {
       if (!same && (current?.revision ?? null) !== baseRevision) {
         return { outcome: 'conflict', current };
       }
-      if (!same && dataSources?.length) {
-        // A connection they were bound to was removed meanwhile: checked again, they bind otherwise, or not at all.
-        const { rows } = await client.query(
-          `SELECT name FROM ${s}.connections WHERE model = $1 AND name = ANY($2::text[])`,
-          [model, dataSources]
-        );
-        if (rows.length !== new Set(dataSources).size) {
+      if (!same && basis) {
+        // A data source or folder changed meanwhile: checked again, the items may be refused.
+        const { rows } = await client.query(`SELECT name, folder_id FROM ${s}.connections WHERE model = $1`, [model]);
+        if (connectionsStamp(rows.map((row) => ({ name: row.name, folderId: row.folder_id }))) !== basis.connections) {
           return { outcome: 'conflict', current };
+        }
+        if (basis.tree !== undefined) {
+          const { rows: tree } = await client.query(`SELECT id, parent_id FROM ${s}.folders WHERE model = $1`, [model]);
+          if (folderTreeHash(tree.map((row) => ({ id: row.id, parentId: row.parent_id }))) !== basis.tree) {
+            return { outcome: 'conflict', current };
+          }
         }
       }
       if (folders) {

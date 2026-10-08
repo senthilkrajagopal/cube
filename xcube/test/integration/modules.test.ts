@@ -191,21 +191,21 @@ describeWithDatabase('xcube modules', () => {
 
   test('queries are answered from the module holding their cubes', async () => {
     const sales = await load(revision, {
-      measures: ['fsales__orders.total'], dimensions: ['customers.name'], order: { 'customers.name': 'asc' },
+      measures: ['orders.total'], dimensions: ['customers.name'], order: { 'customers.name': 'asc' },
     }).expect(200);
-    expect(sales.body.data.map((r: any) => [r['customers.name'], Number(r['fsales__orders.total'])]))
+    expect(sales.body.data.map((r: any) => [r['customers.name'], Number(r['orders.total'])]))
       .toEqual([['Ada', 20], ['Grace', 30]]);
-    const marketing = await load(revision, { measures: ['fmkt__leads.count'] }).expect(200);
-    expect(Number(marketing.body.data[0]['fmkt__leads.count'])).toBe(3);
+    const marketing = await load(revision, { measures: ['leads.count'] }).expect(200);
+    expect(Number(marketing.body.data[0]['leads.count'])).toBe(3);
     const shared = await load(revision, { measures: ['customers.count'] }).expect(200);
     expect(Number(shared.body.data[0]['customers.count'])).toBe(2);
   });
 
   test('meta is every module\'s, merged: each cube once', async () => {
     const meta = await request(server).get('/cubejs-api/v1/meta').set('Authorization', token(revision)).expect(200);
-    expect(meta.body.cubes.map((c: any) => c.name).sort()).toEqual(['customers', 'fmkt__leads', 'fsales__orders']);
+    expect(meta.body.cubes.map((c: any) => c.name).sort()).toEqual(['customers', 'leads', 'orders']);
     const extended = await request(server).get('/cubejs-api/v1/meta?extended=true').set('Authorization', token(revision)).expect(200);
-    expect(extended.body.cubes.map((c: any) => c.name).sort()).toEqual(['customers', 'fmkt__leads', 'fsales__orders']);
+    expect(extended.body.cubes.map((c: any) => c.name).sort()).toEqual(['customers', 'leads', 'orders']);
     // Joined through the shared customers: one component, as one model would say.
     const components = new Set(meta.body.cubes.map((c: any) => c.connectedComponent));
     expect(components).toEqual(new Set([1]));
@@ -216,8 +216,8 @@ describeWithDatabase('xcube modules', () => {
     const check = await admin('post', '/changesets?dryRun=true', {
       upserts: [],
       probes: [
-        { id: 'span', query: { measures: ['fsales__orders.total', 'fmkt__leads.count'] } },
-        { id: 'one', query: { measures: ['fmkt__leads.count'] } },
+        { id: 'span', query: { measures: ['orders.total', 'leads.count'] } },
+        { id: 'one', query: { measures: ['leads.count'] } },
       ],
     }).expect(200);
     expect(check.body.probes.map((p: any) => [p.id, p.candidate.status])).toEqual([['span', 200], ['one', 200]]);
@@ -226,15 +226,15 @@ describeWithDatabase('xcube modules', () => {
   test('adding a cube compiles only its module', async () => {
     const res = await admin('post', '/changesets', { baseRevision: revision, upserts: [campaigns] }).expect(201);
     revision = res.body.revision;
-    const data = await load(revision, { measures: ['fmkt__campaigns.count', 'fmkt__leads.count'] }).expect(200);
-    expect(Number(data.body.data[0]['fmkt__campaigns.count'])).toBe(3);
+    const data = await load(revision, { measures: ['campaigns.count', 'leads.count'] }).expect(200);
+    expect(Number(data.body.data[0]['campaigns.count'])).toBe(3);
     expect(served(revision)[0].params).toMatchObject({ modules: 3, compiledModules: 1 });
   });
 
   test('a query spanning modules is answered from a union of just those modules', async () => {
-    const res = await load(revision, { measures: ['fsales__orders.total', 'fmkt__leads.count'] }).expect(200);
-    expect(Number(res.body.data[0]['fsales__orders.total'])).toBe(50);
-    expect(Number(res.body.data[0]['fmkt__leads.count'])).toBe(3);
+    const res = await load(revision, { measures: ['orders.total', 'leads.count'] }).expect(200);
+    expect(Number(res.body.data[0]['orders.total'])).toBe(50);
+    expect(Number(res.body.data[0]['leads.count'])).toBe(3);
     expect(logs.filter((l) => l.message.startsWith('xcube: compiling a union')).map((l) => l.params.modules.length)).toEqual([2]);
     expect(logs.some((l) => l.message.startsWith('xcube: a request names no module'))).toBe(false);
   });

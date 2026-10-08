@@ -358,6 +358,29 @@ export const MIGRATIONS: Migration[] = [
       ALTER TABLE ${s}.sql_runs ADD COLUMN ends_by timestamptz;
     `,
   },
+  {
+    version: 14,
+    name: 'one name per item',
+    // Contract: names are bare and one per model (R71). Older code reads a
+    // folder's items and data sources by `<folderId>__<name>`, which no longer
+    // are; it may not run on this schema.
+    minReader: 14,
+    sql: (s) => `
+      -- No migration: a schema holding folder-prefixed names is dropped and
+      -- seeded again, never served with bare ones beside them.
+      DO $$
+      BEGIN
+        IF EXISTS (SELECT 1 FROM ${s}.revision_items WHERE full_name <> name)
+          OR EXISTS (SELECT 1 FROM ${s}.connections WHERE position('__' in name) > 0)
+          OR EXISTS (SELECT 1 FROM ${s}.connection_bases WHERE position('__' in name) > 0) THEN
+          RAISE EXCEPTION 'xcube: this schema holds folder-prefixed names, from before names were one per model; this xcube serves bare names only: drop the schema and seed it again';
+        END IF;
+      END $$;
+      -- Names compare in any case: one item, and one data source, per name.
+      CREATE UNIQUE INDEX revision_items_name_ci ON ${s}.revision_items (model, rev, lower(name));
+      CREATE UNIQUE INDEX connections_name_ci ON ${s}.connections (model, lower(name));
+    `,
+  },
 ];
 
 /** The newest schema version this code knows. */

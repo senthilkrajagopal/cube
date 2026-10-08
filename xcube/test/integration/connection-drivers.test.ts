@@ -128,7 +128,7 @@ function suite(title: string, available: boolean, make: () => DriverCase) {
     });
 
     test('a model\'s cube queries the source through the connection', async () => {
-      await admin('put', '/connections/default', { folderId: 'froot', ...connection(c.password) }).expect(200);
+      await admin('put', '/connections/default', { baseVersion: null, folderId: 'froot', ...connection(c.password) }).expect(200);
       const res = await admin('put', '/snapshot', {
         baseRevision: null,
         folders: [{ id: 'froot', parentId: null }],

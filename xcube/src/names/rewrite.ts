@@ -5,7 +5,7 @@ import {
 } from '@cubejs-backend/schema-compiler/dist/src/compiler/transpilers/CubePropContextTranspiler';
 
 import { applyReplacements, chainsIn, chainsInFString, type Chain, type Replacement } from './expr';
-import { FolderTree, itemKey, type ItemDefinition, type ItemError } from './items';
+import type { ItemDefinition, ItemError } from './items';
 
 /** Names every model can use that are never cubes: Cube's own symbols and the security context. */
 const SYMBOLS = new Set([
@@ -13,92 +13,38 @@ const SYMBOLS = new Set([
   'securityContext', 'COMPILE_CONTEXT',
 ]);
 
-/** What a short name means from a folder: the nearest item of that name, from the folder up to the root. */
+/**
+ * What a name means: the one item of that name in the model (R71). Names are
+ * matched exactly, as Cube matches them (`CubeSymbols.resolveSymbol`): they
+ * compare in any case only for uniqueness, so `{amount}` stays a member when
+ * the model has a cube `Amount`.
+ */
 export class Scope {
-  protected readonly byKey = new Map<string, ItemDefinition>();
+  protected readonly byName = new Map<string, ItemDefinition>();
 
-  protected readonly byFullName = new Map<string, ItemDefinition>();
-
-  public constructor(
-    protected readonly tree: FolderTree,
-    defs: ItemDefinition[],
-    /** Bindings items were published with; an item keeps its own until it is published again. */
-    protected readonly bindingsOf: (def: ItemDefinition) => Record<string, string> | undefined = () => undefined,
-    /**
-     * An overlay's items by short name, which its own items' names resolve
-     * to first, before their folder path (a workspace, AC-281).
-     */
-    protected readonly overlay?: Map<string, ItemDefinition>,
-  ) {
+  public constructor(defs: ItemDefinition[]) {
     for (const def of defs) {
-      this.byKey.set(itemKey(def.folderId, def.name), def);
-      this.byFullName.set(def.fullName, def);
+      this.byName.set(def.name, def);
     }
   }
 
-  /** The overlay item a name means to `from`, when `from` is in the overlay. */
-  protected inOverlay(from: ItemDefinition | undefined, name: string): ItemDefinition | undefined {
-    return from && this.overlay?.get(from.name) === from ? this.overlay.get(name) : undefined;
+  public resolve(name: string): ItemDefinition | undefined {
+    return this.byName.get(name);
   }
 
-  public resolve(folderId: string, name: string, from?: ItemDefinition): ItemDefinition | undefined {
-    const first = this.inOverlay(from, name);
-    if (first) {
-      return first;
-    }
-    for (const folder of this.tree.chain(folderId)) {
-      const def = this.byKey.get(itemKey(folder, name));
-      if (def) {
-        return def;
-      }
-    }
-    return undefined;
-  }
-
-  public byFull(fullName: string): ItemDefinition | undefined {
-    return this.byFullName.get(fullName);
-  }
-
-  /** The item of that name in exactly that folder. */
-  public at(folderId: string, name: string): ItemDefinition | undefined {
-    return this.byKey.get(itemKey(folderId, name));
-  }
-
-  public chainOf(folderId: string): string[] {
-    return this.tree.chain(folderId);
-  }
-
-  /** The item a definition extends: through its own binding when it has one, else resolved now. */
+  /** The item a definition extends, if there is one (never itself). */
   public parentOf(def: ItemDefinition): ItemDefinition | undefined {
-    if (!def.extendsName) {
-      return undefined;
-    }
-    const bound = this.bindingsOf(def)?.[def.extendsName];
-    if (bound && this.byFullName.get(bound)) {
-      return this.byFullName.get(bound);
-    }
-    const first = def.extendsName === def.name ? undefined : this.inOverlay(def, def.extendsName);
-    if (first) {
-      return first;
-    }
-    // An item never extends itself: its own name means an ancestor's namesake.
-    const chain = this.tree.chain(def.folderId);
-    for (const folder of def.extendsName === def.name ? chain.slice(1) : chain) {
-      const found = this.byKey.get(itemKey(folder, def.extendsName));
-      if (found) {
-        return found;
-      }
-    }
-    return undefined;
+    const parent = def.extendsName ? this.resolve(def.extendsName) : undefined;
+    return parent === def ? undefined : parent;
   }
 
   /** Its members and every inherited one. */
   public membersOf(def: ItemDefinition): Set<string> {
     const members = new Set<string>();
     const seen = new Set<string>();
-    for (let current: ItemDefinition | undefined = def; current && !seen.has(current.fullName);
+    for (let current: ItemDefinition | undefined = def; current && !seen.has(current.name);
       current = this.parentOf(current)) {
-      seen.add(current.fullName);
+      seen.add(current.name);
       current.members.forEach((m) => members.add(m));
     }
     return members;
@@ -129,11 +75,10 @@ const NAMED_LISTS = new Set(['measures', 'dimensions', 'segments', 'preAggregati
 const camel = (key: string) => inflection.camelize(key, true);
 
 /**
- * An item with every reference to another cube or view rewritten to the
- * full name it resolves to, nearest-first from the item's own folder, with
- * each binding recorded. Names that resolve to nothing are left for Cube's
- * compile to report, except where only a cube can stand (joins, `extends`,
- * join paths), which are errors here.
+ * An item with each reference to another cube or view checked and recorded
+ * as a binding (a name means the one item of that name). Names that resolve
+ * to nothing are left for Cube's compile to report, except where only a cube
+ * can stand (joins, `extends`, join paths), which are errors here.
  */
 export function rewriteReferences(def: ItemDefinition, scope: Scope): {
   doc: Record<string, any>;
@@ -145,56 +90,28 @@ export function rewriteReferences(def: ItemDefinition, scope: Scope): {
   const at = { folderId: def.folderId, name: def.name };
 
   const bind = (name: string): ItemDefinition | undefined => {
-    const target = scope.resolve(def.folderId, name, def);
+    const target = scope.resolve(name);
     if (target) {
-      bindings[name] = target.fullName;
+      bindings[name] = target.name;
     }
     return target;
-  };
-
-  /**
-   * Where only another item can stand (`extends`, a join, a view's join
-   * path), the item's own name means the nearest *other* item of that name:
-   * an override extending, or a view over, its ancestor's namesake.
-   */
-  const bindOther = (name: string): ItemDefinition | undefined => {
-    if (name !== def.name) {
-      return bind(name);
-    }
-    const [, ...ancestors] = scope.chainOf(def.folderId);
-    for (const folder of ancestors) {
-      const target = scope.at(folder, name);
-      if (target) {
-        bindings[name] = target.fullName;
-        return target;
-      }
-    }
-    return undefined;
-  };
-
-  /** A full name written by hand escapes resolution and the reference checks. */
-  const refuseFullName = (name: string) => {
-    if (name.includes('__') && scope.byFull(name) && name !== def.fullName) {
-      errors.push({ ...at, kind: 'reference', message: `"${name}" is a full name; refer to it by its short name` });
-    }
   };
 
   const rewriteChain = (chain: Chain, mode: Mode): Replacement[] => {
     const out: Replacement[] = [];
     const replace = (i: number, target: ItemDefinition) => {
-      if (chain[i].text !== target.fullName) {
-        out.push({ start: chain[i].start, stop: chain[i].stop, text: target.fullName });
+      if (chain[i].text !== target.name) {
+        out.push({ start: chain[i].start, stop: chain[i].stop, text: target.name });
       }
     };
 
     if (mode === 'joinPath') {
       chain.forEach((segment, i) => {
-        refuseFullName(segment.text);
-        const target = i === 0 ? bindOther(segment.text) : bind(segment.text);
+        const target = bind(segment.text);
         if (target) {
           replace(i, target);
         } else {
-          errors.push({ ...at, kind: 'reference', message: `The join path names "${segment.text}", which no folder on this item's path holds` });
+          errors.push({ ...at, kind: 'reference', message: `The join path names "${segment.text}", which is no cube of the model` });
         }
       });
       return out;
@@ -230,7 +147,6 @@ export function rewriteReferences(def: ItemDefinition, scope: Scope): {
       current = bind(first);
       if (!current) {
         // A member of this item, a context name, or something Cube will report.
-        refuseFullName(first);
         return out;
       }
       replace(0, current);
@@ -290,13 +206,12 @@ export function rewriteReferences(def: ItemDefinition, scope: Scope): {
       return value;
     }
     if (mode === 'joinName') {
-      refuseFullName(value);
-      const target = bindOther(value);
+      const target = bind(value);
       if (!target) {
-        errors.push({ ...at, kind: 'reference', message: `The join to "${value}" names no cube in a folder on this item's path` });
+        errors.push({ ...at, kind: 'reference', message: `The join to "${value}" names no cube of the model` });
         return value;
       }
-      return target.fullName;
+      return target.name;
     }
     if (mode === 'fstring') {
       return rewriteString(value, 'expr', true);
@@ -338,14 +253,14 @@ export function rewriteReferences(def: ItemDefinition, scope: Scope): {
   const doc = walk(def.doc, []);
 
   if (def.extendsName) {
-    refuseFullName(def.extendsName);
-    const parent = bindOther(def.extendsName);
-    if (parent) {
-      doc.extends = parent.fullName;
+    const parent = bind(def.extendsName);
+    if (parent === def) {
+      errors.push({ ...at, kind: 'reference', message: 'It extends itself' });
+    } else if (parent) {
+      doc.extends = parent.name;
     } else {
-      errors.push({ ...at, kind: 'reference', message: `It extends "${def.extendsName}", which no folder on this item's path holds` });
+      errors.push({ ...at, kind: 'reference', message: `It extends "${def.extendsName}", which is no cube or view of the model` });
     }
   }
-  doc.name = def.fullName;
   return { doc, bindings, errors };
 }

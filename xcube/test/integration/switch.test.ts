@@ -165,12 +165,12 @@ describeWithDatabase('switching a file-set model to items', () => {
     expect(after.sql).toEqual(before.sql);
   });
 
-  test('a folder item\'s rollup builds through the jobs API, named by its full name', async () => {
+  test('a folder item\'s rollup builds through the jobs API, named by its name', async () => {
     const res = await admin('post', '/changesets', {
-      baseRevision: revision, upserts: [{ folderId: 'fsales', name: 'orders', kind: 'cube', yaml: ordersYaml('orders') }],
+      baseRevision: revision, upserts: [{ folderId: 'fsales', name: 'sales_orders', kind: 'cube', yaml: ordersYaml('sales_orders') }],
     }).expect(201);
     revision = res.body.revision;
-    expect((await sqlOf(revision, 'fsales__orders')).preAggregations[0].tableName).toMatch(/fsales__orders_main$/);
+    expect((await sqlOf(revision, 'sales_orders')).preAggregations[0].tableName).toMatch(/\.sales_orders_main$/);
 
     const jobs = (body: object) => request(server).post('/cubejs-api/v1/pre-aggregations/jobs')
       .set('Authorization', token(revision))
@@ -181,7 +181,7 @@ describeWithDatabase('switching a file-set model to items', () => {
       selector: {
         contexts: [{ securityContext: { wechartModel: 'dev' } }],
         timezones: ['UTC'],
-        preAggregations: ['fsales__orders.main'],
+        preAggregations: ['sales_orders.main'],
       },
     });
     expect(posted.body.length).toBeGreaterThan(0);
@@ -196,8 +196,8 @@ describeWithDatabase('switching a file-set model to items', () => {
     }
     const done = Object.values(statuses) as any[];
     expect(done.map((s) => s.status)).toEqual(done.map(() => 'done'));
-    expect(done[0].table).toMatch(/fsales__orders_main/);
-    expect(done[0].selector.preAggregations).toEqual(['fsales__orders.main']);
+    expect(done[0].table).toMatch(/\.sales_orders_main/);
+    expect(done[0].selector.preAggregations).toEqual(['sales_orders.main']);
     // The jobs API sent the context to the module owning the cube.
     expect(done[0].selector.contexts[0].securityContext.xcubeModule).toMatch(/^m[0-9a-f]{10}$/);
   });
@@ -208,14 +208,14 @@ describeWithDatabase('switching a file-set model to items', () => {
       .send({ query })
       .expect(200);
     const one = (await partitions({
-      timezones: ['UTC'], preAggregations: [{ id: 'fsales__orders.main' }], expand: ['partitions.meta', 'partitions.versions'],
+      timezones: ['UTC'], preAggregations: [{ id: 'sales_orders.main' }], expand: ['partitions.meta', 'partitions.versions'],
     })).body.preAggregationPartitions;
     expect(one).toHaveLength(1);
-    expect(one[0].preAggregation.id).toBe('fsales__orders.main');
+    expect(one[0].preAggregation.id).toBe('sales_orders.main');
     expect(one[0].partitions.length).toBeGreaterThan(0);
     expect(one[0].partitions.some((p: any) => p.versionEntries.length > 0)).toBe(true);
     // Unnamed: every module's, each once.
     const all = (await partitions({ timezones: ['UTC'] })).body.preAggregationPartitions.map((p: any) => p.preAggregation.id).sort();
-    expect(all).toEqual(['fsales__orders.main', 'orders.main']);
+    expect(all).toEqual(['orders.main', 'sales_orders.main']);
   });
 });

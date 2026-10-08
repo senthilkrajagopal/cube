@@ -10,19 +10,34 @@ export const FOLDER_ID = /^f[a-z0-9]{1,40}$/;
 export const ROOT = 'froot';
 
 /**
- * A short name: lower-case words joined by single underscores. It never
- * holds `__`, so a short name can't be taken for a prefixed full name, and
- * never starts with `_`, which Cube keeps for its own names.
+ * An item's or a data source's name, one per model (R71): a letter, then
+ * letters, digits and single underscores. Cube names a member's SQL column
+ * `<cube>__<member>` (`BaseQuery.aliasName`), and allows `__` and a leading
+ * `_` in member names; a name holding `__`, or ending in `_`, could make two
+ * members' columns one.
  */
-export const SHORT_NAME = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/;
+export const NAME = /^[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)*$/;
 
-export const MAX_SHORT_NAME = 40;
+export const MAX_NAME = 40;
 
-const PYTHON_KEYWORDS = new Set([
+/**
+ * Names a cube or view may not take, compared in any case: Python's keywords,
+ * as Cube's YAML compiler reads `{…}` as Python (`Python3Lexer.g4`), and the
+ * names Cube resolves before any cube's (`CubeSymbols.ts` `CONTEXT_SYMBOLS`,
+ * `CURRENT_CUBE_CONSTANTS`, `USER_CONTEXT`; `COMPILE_CONTEXT`).
+ */
+const RESERVED = new Set([
   'and', 'as', 'assert', 'async', 'await', 'break', 'class', 'continue', 'def', 'del', 'elif', 'else',
   'except', 'finally', 'for', 'from', 'global', 'if', 'import', 'in', 'is', 'lambda', 'nonlocal', 'not',
-  'or', 'pass', 'raise', 'return', 'try', 'while', 'with', 'yield',
+  'or', 'pass', 'raise', 'return', 'try', 'while', 'with', 'yield', 'none', 'true', 'false',
+  'cube', 'table', 'security_context', 'securitycontext', 'filter_params', 'filter_group', 'sql_utils',
+  'user_context', 'compile_context',
 ]);
+
+/** A name as names compare: in any case (R71). */
+export function nameKey(name: string): string {
+  return name.toLowerCase();
+}
 
 export interface Folder {
   id: string;
@@ -41,10 +56,11 @@ export interface AuthoredItem {
   yaml: string;
 }
 
-/** An item as published: its full name, what it was bound to, and the YAML Cube compiles. */
+/** An item as published: what it refers to, and the YAML Cube compiles. */
 export interface PublishedItem extends AuthoredItem {
+  /** Its name as Cube serves it: the name itself, since names are one per model (R71). */
   fullName: string;
-  /** Each short name the item refers to, and the full name it was bound to at publish. */
+  /** Each name the item refers to, as written, and the item it means, by its own name. */
   bindings: Record<string, string>;
   resolvedYaml: string;
 }
@@ -55,27 +71,37 @@ export interface ItemError {
   name: string | null;
   line?: number;
   column?: number;
-  kind: 'yaml' | 'item' | 'reference' | 'alias' | 'compile' | 'folder';
+  kind: 'yaml' | 'item' | 'reference' | 'alias' | 'compile' | 'folder' | 'name_in_use' | 'data_source_range' | 'reference_range';
   message: string;
 }
 
-export function itemKey(folderId: string, name: string): string {
-  return `${folderId}/${name}`;
+/** An item's identity: its name, in any case. Its folder is where it is, not what it is. */
+export function itemKey(name: string): string {
+  return nameKey(name);
 }
 
-export function fullNameOf(folderId: string, name: string): string {
-  return folderId === ROOT ? name : `${folderId}__${name}`;
-}
-
-export function checkShortName(name: string): string | null {
-  if (typeof name !== 'string' || name.length > MAX_SHORT_NAME || !SHORT_NAME.test(name)) {
-    return `"${String(name).slice(0, 64)}" is not a valid name: lower-case letters, digits and single underscores, `
-      + `starting with a letter, at most ${MAX_SHORT_NAME} characters`;
+function checkGrammar(name: unknown, what: string): string | null {
+  if (typeof name !== 'string' || name.length > MAX_NAME || !NAME.test(name)) {
+    return `"${String(name).slice(0, 64)}" is not a valid ${what}: a letter, then letters, digits and single underscores, `
+      + `not ending in one, at most ${MAX_NAME} characters`;
   }
-  if (PYTHON_KEYWORDS.has(name)) {
+  return null;
+}
+
+export function checkName(name: string): string | null {
+  const problem = checkGrammar(name, 'name');
+  if (problem) {
+    return problem;
+  }
+  if (RESERVED.has(nameKey(name))) {
     return `"${name}" is a reserved word and can't be a name`;
   }
   return null;
+}
+
+/** A data source's name: the same grammar; no reserved words, as no `{…}` names one. */
+export function checkDataSourceName(name: string): string | null {
+  return checkGrammar(name, 'data source name');
 }
 
 /** The folder tree, and each folder's chain from itself to the root. */
@@ -161,7 +187,7 @@ export interface ItemDefinition {
   doc: Record<string, any>;
   /** Names of its measures, dimensions, segments, pre-aggregations and hierarchies (not inherited ones). */
   members: Set<string>;
-  /** The short name it extends, if any. */
+  /** The name it extends, as written, if any. */
   extendsName?: string;
 }
 
@@ -179,7 +205,7 @@ export function parseItem(item: AuthoredItem): { def?: ItemDefinition; errors: I
     { errors: [{ ...at, kind, message, ...extra }] }
   );
 
-  const nameProblem = checkShortName(item.name);
+  const nameProblem = checkName(item.name);
   if (nameProblem) {
     return fail(nameProblem);
   }
@@ -241,7 +267,7 @@ export function parseItem(item: AuthoredItem): { def?: ItemDefinition; errors: I
       folderId: item.folderId,
       name: item.name,
       kind: item.kind,
-      fullName: fullNameOf(item.folderId, item.name),
+      fullName: item.name,
       doc,
       members,
       extendsName,

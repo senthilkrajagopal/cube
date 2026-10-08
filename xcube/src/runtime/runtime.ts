@@ -17,16 +17,17 @@ import {
 } from '../model/validate';
 import { compileErrors } from '../model/errors';
 import {
+  checkDataSourceName,
   FolderTree,
-  fullNameOf,
+  itemKey,
+  nameKey,
   ROOT,
-  SHORT_NAME,
   type AuthoredItem,
   type Folder,
   type ItemError,
   type PublishedItem,
 } from '../names/items';
-import { filesOf, itemsHash, publish } from '../names/publish';
+import { filesOf, itemsHash, outOfRange, publish } from '../names/publish';
 import { parentOf, rollupsToStrip, withoutRollups } from '../overlays/rollups';
 import {
   boundDataSource, effectiveDataSource, MAX_OVERLAY_ORCHESTRATORS, overlayOfAppId, withDataSourceMark,
@@ -44,6 +45,8 @@ import { PgOpsStore, type RefreshTick } from '../store/ops';
 import { migrate } from '../store/migrate';
 import {
   channelOf,
+  connectionsStamp,
+  FolderInUseError,
   folderTreeHash,
   PgRevisionStore,
   type ConnectionBase,
@@ -57,7 +60,7 @@ import {
 } from '../store/revisions';
 import { COMMONS, groupModules } from '../modules/graph';
 import { admits, type Permissions } from '../security/gate';
-import { withGate } from '../security/marker';
+import { foldersOfFiles, withGate } from '../security/marker';
 import { KeyError, keySetOf, TokenError, tokenParts } from '../security/tokens';
 import { ROLE_KEY, TokenVerifier } from '../security/verifier';
 import { CompileLane, LaneBusyError, Priority } from './lane';
@@ -326,6 +329,17 @@ export interface ItemsCheck {
   items: ItemRef[];
 }
 
+/**
+ * What a folder push would carry out of range, by name: cubes using a data
+ * source outside their folder's (R71 4.3), and items referring to one
+ * outside it (R72).
+ */
+export class OutOfRangeError extends Error {
+  public constructor(message: string, public readonly cubes: string[], public readonly items: string[]) {
+    super(message);
+  }
+}
+
 /** A folder tree that can't be taken as it is. */
 export class FolderTreeError extends Error {
   public constructor(public readonly problems: string[]) {
@@ -466,7 +480,7 @@ function canonical(value: unknown): unknown {
 /** An overlay's data sources as its content: each with every field and envelope, in one order. */
 function connectionsHash(connections: OverlayConnection[]): string {
   return JSON.stringify([...connections]
-    .sort((a, b) => (fullNameOf(a.folderId, a.name) < fullNameOf(b.folderId, b.name) ? -1 : 1))
+    .sort((a, b) => (a.name < b.name ? -1 : 1))
     .map((c) => canonical([c.folderId, c.name, c.driver, c.authMethod, c.fields, c.sealed])));
 }
 
@@ -1446,7 +1460,7 @@ export class XcubeRuntime {
       if (record.connections.length) {
         this.overlayConnectionSets.set(
           `${base.model}/${record.id}/${record.version}`,
-          new Map(record.connections.map((c) => [fullNameOf(c.folderId, c.name), c])),
+          new Map(record.connections.map((c) => [c.name, c])),
         );
       }
     }
@@ -1523,7 +1537,7 @@ export class XcubeRuntime {
     if (published.errors.length) {
       return { errors: published.errors };
     }
-    const byKey = new Map(published.items.map((item) => [`${item.folderId}/${item.name}`, item.fullName]));
+    const byKey = new Map(published.items.map((item) => [itemKey(item.name), item.name]));
     const changed = published.changed.map((key) => byKey.get(key)!);
     const onOwn = new Map<string, string>();
     for (const item of published.items) {
@@ -1555,9 +1569,11 @@ export class XcubeRuntime {
     dataSources?: { folderId: string; name: string }[],
   ) {
     const brought = overlay.connections ?? [];
-    const own = new Map(brought.map((c) => [fullNameOf(c.folderId, c.name), DRIVERS[c.driver as keyof typeof DRIVERS].cubeType]));
+    const own = new Map(brought.map((c) => [c.name, DRIVERS[c.driver as keyof typeof DRIVERS].cubeType]));
+    // One the overlay brings stands in for the published one of its name (R71 2.6).
+    const shadowed = new Set(brought.map((c) => nameKey(c.name)));
     const sources = [
-      ...(dataSources ?? []).filter((d) => !own.has(fullNameOf(d.folderId, d.name))),
+      ...(dataSources ?? []).filter((d) => !shadowed.has(nameKey(d.name))),
       ...brought.map(({ folderId, name }) => ({ folderId, name })),
     ];
     const published = publish({
@@ -1674,7 +1690,7 @@ export class XcubeRuntime {
       );
       if (!published.errors.length) {
         const byFullName = new Map(published.items.map((item) => [item.fullName, item]));
-        bound = new Map(published.items.map((item) => [`${item.folderId}/${item.name}`, XcubeRuntime.refOf(item, byFullName)]));
+        bound = new Map(published.items.map((item) => [itemKey(item.name), XcubeRuntime.refOf(item, byFullName)]));
       }
     }
     const active = this.models.get(model)?.active;
@@ -1693,7 +1709,7 @@ export class XcubeRuntime {
       expiresAt: record.expiresAt.toISOString(),
       validatedRevision: record.validatedRevision,
       upserts: record.upserts.map(({ folderId, name, kind }) => {
-        const ref = bound?.get(`${folderId}/${name}`);
+        const ref = bound?.get(itemKey(name));
         return { folderId, name, kind, ...(ref ? { ...ref, folderId, name } : {}) };
       }),
       // The published revision the upserts' bindings are over; null when it doesn't apply to it.
@@ -1702,7 +1718,7 @@ export class XcubeRuntime {
       connections: record.connections.map((c) => ({
         folderId: c.folderId,
         name: c.name,
-        fullName: fullNameOf(c.folderId, c.name),
+        fullName: c.name,
         driver: c.driver,
         authMethod: c.authMethod,
         fields: c.fields,
@@ -1724,17 +1740,18 @@ export class XcubeRuntime {
     const seen = new Set<string>();
     return list.map((c) => {
       const where = `${c.folderId}/${c.name}`;
-      if (!SHORT_NAME.test(c.name)) {
-        throw new ConnectionError(`Data source ${where} has no valid short name`, ['a short name has letters, digits and single underscores']);
+      const problem = checkDataSourceName(c.name);
+      if (problem) {
+        throw new ConnectionError(`Data source ${where}: ${problem}`);
       }
       if (c.folderId !== ROOT && !folders.some((f) => f.id === c.folderId)) {
         throw new ConnectionError(`Data source ${where} is in folder ${c.folderId}, which is not in the folder tree`);
       }
-      const fullName = fullNameOf(c.folderId, c.name);
-      if (seen.has(fullName)) {
-        throw new ConnectionError(`Data source ${where} is brought twice`);
+      XcubeRuntime.checkDefault(c.name, c.folderId);
+      if (seen.has(nameKey(c.name))) {
+        throw new ConnectionError(`The overlay brings two data sources named "${c.name}"; names are one per model`, [], 'name_in_use');
       }
-      seen.add(fullName);
+      seen.add(nameKey(c.name));
       try {
         const { driver, fields } = this.connections.check(c);
         return {
@@ -1782,11 +1799,12 @@ export class XcubeRuntime {
       return undefined;
     }
     const reach = new Set(groups);
+    const served = this.revisionOfContext(context);
+    const folders = served ? foldersOfFiles(served.source.files) : new Map<string, string>();
     for (const cube of cubesOfQuery(query)) {
-      // A full name's folder is what precedes its `__`; a root item's name has none.
-      const separator = cube.indexOf('__');
-      const folderId = separator === -1 ? ROOT : cube.slice(0, separator);
-      if (!admits(permissions, folderId, reach)) {
+      // One the revision doesn't hold is Cube's to refuse.
+      const folderId = folders.get(cube);
+      if (folderId !== undefined && !admits(permissions, folderId, reach)) {
         return { cube, folderId };
       }
     }
@@ -1858,35 +1876,41 @@ export class XcubeRuntime {
     }
   }
 
+  /** `default` is the root's alone, and named so (R71 4.2): a cube that names no data source uses it. */
+  protected static checkDefault(name: string, folderId: string) {
+    if (nameKey(name) !== 'default') {
+      return;
+    }
+    if (name !== 'default') {
+      throw new ConnectionError(`The data source "default" is named in lower case, not "${name}"`, [], 'default_outside_root');
+    }
+    if (folderId !== ROOT) {
+      throw new ConnectionError(`Only the root folder (${ROOT}) holds the data source "default"`, [
+        'a cube that names no data source uses the root\'s "default"; name any other data source explicitly',
+      ], 'default_outside_root');
+    }
+  }
+
   /**
    * Stores a model's data source, once its fields are right and every
-   * secret opens for its target. `name` is what models call it: its short
-   * name in the root, `<folderId>__<name>` elsewhere. Nothing connects here:
-   * the test route does that.
+   * secret opens for its target. Its name is one per model, in any case
+   * (R71): `baseVersion` null creates it, and is refused while any data
+   * source holds the name; a version edits that version of it, or moves it
+   * to another folder, as long as every cube using it keeps it in its
+   * folder's range. Each check is made under the model's lock, which
+   * publishes take too. Nothing connects here: the test route does that.
    */
   public async putConnection(
     model: string,
     name: string,
-    body: ConnectionInput & { folderId: string; revisions?: Record<string, string> },
+    body: ConnectionInput & { folderId: string; revisions?: Record<string, string>; baseVersion: number | null },
   ) {
     const store = this.requireStore();
-    const separator = name.indexOf('__');
-    const shortName = separator === -1 ? name : name.slice(separator + 2);
-    if (!SHORT_NAME.test(shortName) || fullNameOf(body.folderId, shortName) !== name) {
-      throw new ConnectionError(`"${name}" isn't the name of a data source in folder ${body.folderId}`, [
-        `a data source is named by its short name in the root (${ROOT}), and <folderId>__<name> elsewhere`,
-      ]);
+    const problem = checkDataSourceName(name);
+    if (problem) {
+      throw new ConnectionError(problem);
     }
-    const folders = await store.folders(model);
-    if (body.folderId !== ROOT && !folders.some((f) => f.id === body.folderId)) {
-      throw new ConnectionError(`Folder ${body.folderId} is not in the folder tree`);
-    }
-    const known = (await store.connections(model)).find((c) => c.name === name);
-    if (known && known.driver !== body.driver) {
-      throw new ConnectionError(`Connection "${name}" is a ${known.driver} data source; its driver can't change`, [
-        'Cube fixes a data source\'s SQL dialect when it compiles: create one under another name',
-      ], 'driver_change');
-    }
+    XcubeRuntime.checkDefault(name, body.folderId);
     const { driver, fields } = this.connections.check(body);
     const stored = await store.putConnection({
       model,
@@ -1897,6 +1921,44 @@ export class XcubeRuntime {
       fields: fields as Record<string, string | number | boolean | null>,
       sealed: body.sealed ?? {},
       revisions: body.revisions ?? {},
+    }, async (connections) => {
+      const folders = await store.folders(model);
+      if (body.folderId !== ROOT && !folders.some((f) => f.id === body.folderId)) {
+        throw new ConnectionError(`Folder ${body.folderId} is not in the folder tree`);
+      }
+      const known = connections.find((c) => nameKey(c.name) === nameKey(name));
+      if (body.baseVersion === null) {
+        if (known) {
+          throw new ConnectionError(`The name "${name}" is already in use`, [], 'name_in_use');
+        }
+        return;
+      }
+      if (known && known.name !== name) {
+        throw new ConnectionError(`The name "${name}" is in use as "${known.name}": a data source's name can't change, not even its case`, [], 'name_in_use');
+      }
+      if (!known || known.version !== body.baseVersion) {
+        throw new ConnectionError(`Data source "${name}" isn't at version ${body.baseVersion}`, [
+          known ? 'it changed since: read it again' : 'there is none: create it with baseVersion null',
+        ], 'conflict', { currentVersion: known?.version ?? null });
+      }
+      if (known.driver !== driver) {
+        throw new ConnectionError(`Connection "${name}" is a ${known.driver} data source; its driver can't change`, [
+          'Cube fixes a data source\'s SQL dialect when it compiles: create one under another name',
+        ], 'driver_change');
+      }
+      if (known.folderId !== body.folderId) {
+        const head = await store.head(model);
+        const items = head ? await this.itemsAt(head) : [];
+        const tree = new FolderTree(folders);
+        const before = new Set(outOfRange(items, tree, connections).cubes);
+        const after = outOfRange(items, tree, connections.map((c) => (c === known ? { ...c, folderId: body.folderId } : c))).cubes
+          .filter((cube) => !before.has(cube));
+        if (after.length) {
+          throw new ConnectionError(`Moving data source "${name}" would leave cubes using it outside their folder's range`, [
+            'a cube may use a data source in its own folder or an ancestor of it',
+          ], 'data_source_range', { cubes: after });
+        }
+      }
     });
     this.persistently('a connection', model, () => this.connections.changed(model, name));
     return XcubeRuntime.connectionView(stored);
@@ -1923,9 +1985,7 @@ export class XcubeRuntime {
   /** A model's connections as publishes bind to them (none: `data_source` is left as written). */
   protected async dataSourcesOf(model: string): Promise<{ folderId: string; name: string }[] | undefined> {
     const connections = await this.requireStore().connections(model);
-    return connections.length
-      ? connections.map((c) => ({ folderId: c.folderId, name: c.name.includes('__') ? c.name.slice(c.name.indexOf('__') + 2) : c.name }))
-      : undefined;
+    return connections.length ? connections.map((c) => ({ folderId: c.folderId, name: c.name })) : undefined;
   }
 
   /** The published cubes using a data source at `head`: bound to it, or, for the root's `default`, naming none. */
@@ -1936,7 +1996,7 @@ export class XcubeRuntime {
     const users: string[] = [];
     for (const item of await this.itemsAt(head)) {
       if (item.kind === 'cube' && boundDataSource(item) === name) {
-        users.push(`${item.folderId}/${item.name}`);
+        users.push(item.name);
       }
     }
     return users.sort();
@@ -2010,7 +2070,7 @@ export class XcubeRuntime {
     if (!record) {
       throw new OverlaySourceError(404, 'unknown_overlay', `No overlay "${overlayId}": it expired, was dropped, or never was`);
     }
-    if (!record.connections.some((c) => fullNameOf(c.folderId, c.name) === dataSource)) {
+    if (!record.connections.some((c) => c.name === dataSource)) {
       throw new OverlaySourceError(404, 'unknown_connection', `No connection "${dataSource}" in overlay "${overlayId}"`);
     }
     const securityContext = { ...context.securityContext, [this.servingOptions.overlayClaim ?? 'xcubeOverlay']: overlayId };
@@ -2053,9 +2113,7 @@ export class XcubeRuntime {
       if (!overlay) {
         throw new SqlRunError('unknown_overlay', `No overlay "${on.overlay}": it expired, was dropped, or never was`);
       }
-      connection = overlay.connections
-        .map((c) => ({ ...c, name: fullNameOf(c.folderId, c.name) }))
-        .find((c) => c.name === on.connection);
+      connection = overlay.connections.find((c) => c.name === on.connection);
     } else {
       connection = (await store.connections(model)).find((c) => c.name === on.connection);
     }
@@ -3526,20 +3584,8 @@ export class XcubeRuntime {
   protected static refs(items: PublishedItem[], keys?: Set<string>): ItemRef[] {
     const byFullName = new Map(items.map((item) => [item.fullName, item]));
     return items
-      .filter((item) => !keys || keys.has(`${item.folderId}/${item.name}`))
+      .filter((item) => !keys || keys.has(itemKey(item.name)))
       .map((item) => XcubeRuntime.refOf(item, byFullName));
-  }
-
-  /** The connections changed cubes are bound to (the root's `default` may be Cube's own, so it isn't one). */
-  protected static boundConnections(items: PublishedItem[], changed: Set<string>): string[] {
-    const names = new Set<string>();
-    for (const item of items) {
-      const bound = item.kind === 'cube' && changed.has(`${item.folderId}/${item.name}`) ? boundDataSource(item) : null;
-      if (bound !== null && bound !== 'default') {
-        names.add(bound);
-      }
-    }
-    return [...names].sort();
   }
 
   /** An item as answers name it; `byFullName` (the revision's items) resolves what a cube inherits. */
@@ -3574,7 +3620,29 @@ export class XcubeRuntime {
     if (problems.length) {
       throw new FolderTreeError(problems);
     }
-    const result = await this.requireStore().putFolders(model, folders, security);
+    const store = this.requireStore();
+    const result = await store.putFolders(model, folders, security, async () => {
+      // Under the model's lock: no publish or data source lands meanwhile.
+      const connections = await store.connections(model);
+      const head = await store.head(model);
+      const items = head?.mode === 'items' ? await this.itemsAt(head) : [];
+      const tree = new FolderTree(folders);
+      const dropped = [...new Set([...items, ...connections].map((x) => x.folderId).filter((id) => !tree.has(id)))].sort();
+      if (dropped.length) {
+        throw new FolderInUseError(dropped);
+      }
+      const before = outOfRange(items, new FolderTree(await store.folders(model)), connections);
+      const after = outOfRange(items, tree, connections);
+      const cubes = after.cubes.filter((cube) => !before.cubes.includes(cube));
+      const referrers = after.items.filter((item) => !before.items.includes(item));
+      if (cubes.length || referrers.length) {
+        throw new OutOfRangeError(
+          'The folder tree would leave items using what isn\'t in their folder or one of its ancestors',
+          cubes,
+          referrers,
+        );
+      }
+    });
     // This instance answers with them in force; the others follow the notification.
     await this.loadPermissions(model);
     return result;
@@ -3739,10 +3807,15 @@ export class XcubeRuntime {
     }
 
     const files = checkedSnapshot(filesOf(published.items), this.settings.limits);
+    // Checked against these data sources and this tree: stored only while they still are.
+    const basis = {
+      connections: connectionsStamp(input.dataSources ?? []),
+      ...(folders ? {} : { tree: folderTreeHash(input.tree.folders) }),
+    };
     if (!check && sameAsHead()) {
       // The same items with a new folder tree: stored without compiling again.
       const same = await this.requireStore().importItems({
-        model, baseRevision: request.baseRevision, items: published.items, itemsHash: hash!, source: request.source, folders,
+        model, baseRevision: request.baseRevision, items: published.items, itemsHash: hash!, source: request.source, folders, basis,
       });
       return 'current' in same
         ? { status: same.outcome, current: same.current }
@@ -3781,8 +3854,7 @@ export class XcubeRuntime {
       source: request.source,
       folders,
       modules,
-      // Bound at publish to connections: stored only while they still exist.
-      dataSources: input.dataSources ? XcubeRuntime.boundConnections(published.items, changed) : undefined,
+      basis,
     });
     if ('current' in result) {
       return { status: result.outcome, current: result.current };
@@ -3907,8 +3979,10 @@ export class XcubeRuntime {
   }
 
   /**
-   * What short names mean from a folder, nearest-first, in the current
-   * revision; with an overlay, in the overlay first (a workspace, AC-281).
+   * The item holding each name, in any case, by its own name, or null, in the
+   * current revision; with an overlay, its items first, as previews of it
+   * serve them (R71 3.1). Names are one per model, so the folder asked from
+   * changes nothing: it is only checked to be in the tree.
    */
   public async resolveNames(model: string, folderId: string, names: string[], overlayId?: string) {
     const store = this.requireStore();
@@ -3918,24 +3992,23 @@ export class XcubeRuntime {
     if (!tree.has(folderId)) {
       throw new FolderTreeError([`Folder ${folderId} is not in the folder tree`]);
     }
-    const byKey = new Map(items.map((item) => [`${item.folderId}/${item.name}`, item.fullName]));
-    const first = new Map<string, string>();
+    const byKey = new Map(items.map((item) => [itemKey(item.name), item]));
     if (overlayId !== undefined) {
       const overlay = await store.overlay(model, overlayId);
       if (!overlay) {
         throw gone(model, overlayId);
       }
-      overlay.deletes.forEach(({ folderId: f, name }) => byKey.delete(`${f}/${name}`));
-      for (const item of overlay.upserts) {
-        byKey.set(`${item.folderId}/${item.name}`, fullNameOf(item.folderId, item.name));
-        first.set(item.name, fullNameOf(item.folderId, item.name));
-      }
+      overlay.deletes.forEach(({ folderId: f, name }) => {
+        const known = byKey.get(itemKey(name));
+        if (known && known.folderId === f && known.name === name) {
+          byKey.delete(itemKey(name));
+        }
+      });
+      overlay.upserts.forEach((item) => byKey.set(itemKey(item.name), { ...item, fullName: item.name, bindings: {}, resolvedYaml: '' }));
     }
-    const chain = tree.chain(folderId);
     const resolved: Record<string, string | null> = {};
     for (const name of names) {
-      const folder = chain.find((f) => byKey.has(`${f}/${name}`));
-      resolved[name] = first.get(name) ?? (folder ? byKey.get(`${folder}/${name}`)! : null);
+      resolved[name] = byKey.get(itemKey(name))?.name ?? null;
     }
     return {
       model, revision: head?.revision ?? null, folderId, ...(overlayId !== undefined ? { overlay: overlayId } : {}), names: resolved,

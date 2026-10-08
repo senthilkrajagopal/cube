@@ -81,6 +81,11 @@ In both modes:
   own role. xcube creates and migrates its tables itself, on start, under an
   advisory lock. Each distinct file content is stored once per model, and the
   newest `XCUBE_KEEP_REVISIONS` revisions are kept.
+  - **Schema version 14** (one name per item, R71) has no migration of
+    folder-prefixed names. On a schema holding any (an item in a folder, or a
+    data source named `<folderId>__<name>`), xcube refuses to start with
+    *drop the schema and seed it again*, and applies nothing. An xcube before
+    14 refuses to start on a schema at 14.
 - **Following.** Every process (API instances and the refresh worker)
   listens for `NOTIFY xcube_revision`, re-reads on each reconnect, and polls
   as a backstop. It compiles a new revision before switching to it; until
@@ -181,29 +186,66 @@ In both modes:
 
 ### Folders and names
 
-- **One flat namespace.** Every item's cube or view is named by its short
-  name in the root folder (`orders`), and `<folderId>__<shortName>` in any
-  other folder (`f7k2__orders`). Short names are lower-case words joined by
-  single underscores, so they never hold `__`, and the two kinds can't
-  collide. A folder id is `f` and 1 to 40 lower-case letters and digits; the
-  root is `froot`.
-- **Resolution at publish.** A short name an item uses (a join, `{orders.id}`,
-  `extends`, a view's `join_path`, `FILTER_PARAMS.orders…`, a
-  pre-aggregation's `rollups`…) means the nearest item of that name, from the
-  item's own folder up to the root. xcube rewrites it to the full name and
-  records the binding, which stays until the item is published again: a
-  nearer item of the same name doesn't rebind items published before it.
-- **Removal.** An item another item is bound to can't be deleted or renamed;
-  the refusal names the items that refer to it.
-- **What people see.** An item in a folder gets `title` from its short name
-  (`Orders`, as Cube would title `orders`) and a `sql_alias` (its full name,
-  or a stable hash when that is longer than 20 characters), so SQL, member
-  and rollup table names stay short. A cube's alias also names its data
-  source (see Connections). xcube adds `meta.xcube = { folderId,
-  shortName }` to every item, for pickers. Root items keep their names,
-  titles and SQL as they were.
+- **One name per item, model-wide (R71).** A cube or view is served under
+  its own name in every folder (`orders`): there is no folder prefix.
+  - Cubes and views share one namespace. Cube keeps both in one map, and a
+    second of a name would silently replace the first. Data sources have
+    their own namespace.
+  - Names compare in any case: `Orders` and `orders` are one name. A name
+    another item holds is refused (`name_in_use`), naming the caller's item,
+    never where the other is.
+  - A view's `split` makes Cube add views named `<view>_<alias>`; those
+    names count too.
+  - A folder id is `f` and 1 to 40 lower-case letters and digits; the root
+    is `froot`.
+- **The grammar.** A letter, then letters, digits and single underscores,
+  not ending in one, at most 40 characters. In any case, it may not be:
+  - a Python keyword, `None`, `True` and `False` included: Cube's YAML
+    compiler reads `{…}` as Python;
+  - a name Cube resolves before any cube's: `CUBE`, `TABLE`,
+    `SECURITY_CONTEXT`, `securityContext`, `FILTER_PARAMS`, `FILTER_GROUP`,
+    `SQL_UTILS`, `USER_CONTEXT`, `COMPILE_CONTEXT`.
+
+  Why `__` and a trailing `_` are out: Cube names a member's SQL column
+  `<cube>__<member>`, and member names may hold `__` or start with `_`.
+- **An item is its name.** A changeset's upsert of a landed name:
+  - **in the item's own folder** is its edit;
+  - **in another folder** is a clash, unless the same changeset deletes the
+    landed one (a move);
+  - **in another case** is a clash: a landed name never changes, not even its
+    case.
+
+  A deleted item's name may be used again.
+- **References** (a join, `{orders.id}`, `extends`, a view's `join_path`,
+  `FILTER_PARAMS.orders…`, a pre-aggregation's `rollups`…):
+  - are matched exactly, as Cube matches them, and recorded as the item's
+    `bindings`;
+  - must be to an item in the referrer's own folder or an ancestor of it
+    (R72). Otherwise the referrer is refused (`reference_range`), naming
+    what it refers to, never where that is.
+
+  The rule is checked:
+  - at each publish, for every item (a move can strand a referrer);
+  - at each folder push;
+  - at an overlay push, for the overlay's own items.
+- **Removal.** An item another refers to can't be deleted; the refusal
+  names the items that refer to it.
+- **What people see.**
+  - An item's title is Cube's own, from its name.
+  - xcube adds `meta.xcube = { folderId, shortName }` to every item, for
+    the folder gate and pickers. `shortName` is the name.
+  - xcube writes a `sql_alias` only where Cube's would go wrong:
+    - for a name with upper case, its lower-case form. Cube snake-cases
+      names into SQL aliases and rollup table names (`OrderItems` and
+      `order_items` would both be `order_items`, and `ORDERS` would be
+      `o_r_d_e_r_s`);
+    - for a cube on a data source other than Cube's default, or one that
+      extends another (see Connections);
+    - for a name that would make a rollup table's stem (25 characters) or a
+      member's alias (63) too long, a stable hash.
 - **Expressions** are read with Cube's own lexer, so names in string
-  literals, lambda parameters and keyword arguments are never rewritten.
+  literals, lambda parameters and keyword arguments are never taken for
+  references.
 
 ### Modules
 
@@ -337,9 +379,15 @@ query previews when its token names it.
   queried, so a preview is today's model plus the overlay's changes. If a
   publish leaves it not applying (it deletes a cube the overlay uses), its
   queries answer `409`, naming the item, until a fixed overlay is pushed.
-- **Names** in an overlay's items resolve among the overlay's items first,
-  then along each item's folder path (its origin or target). An overlay item
-  in a folder replaces the published item of that name there.
+- **Names.** An overlay item with a published item's name stands in for it,
+  wherever either is (R71 2.6): a draft's edit, or a use-only copy in a
+  workspace's folder. No two of its items may share a name, in any case.
+  - Its own items' references and data sources are held to their folder's
+    path at the push.
+  - Published items it stands in under are checked when it lands, as a
+    changeset.
+  - A new name that has landed elsewhere meanwhile isn't refused at the
+    push, only when it lands.
 - **Only what changes compiles.** The overlay's items are grouped into
   modules as a publish would group them. A module whose files are unchanged is
   the published one, already compiled; the rest compile on the overlay's
@@ -354,10 +402,11 @@ query previews when its token names it.
   - **Checked as connections are.** A copy keeps the published envelopes, which
     open only while its target is the original's (AC-312). They are opened when
     pushed and again when previews connect, never stored opened.
-  - **Bound.** They bind like published data sources, nearest-first. Every cube
-    bound to one, published or not, is previewed on it, without rollups, in its
-    driver's dialect. The preview binds as the model would once they land, so
-    only `default` may then fall back to Cube's environment.
+  - **Bound.** One with a published data source's name stands in for it. Every
+    cube using one, published or not, is previewed on it, without rollups, in
+    its driver's dialect. The preview binds as the model would once they land,
+    so only `default` may then fall back to Cube's environment.
+  - `default` is the root's alone, here too (`400 default_outside_root`).
   - **Their own orchestrator.** Previews of an overlay version that brings data
     sources get an orchestrator of their own: drivers, queues and result cache.
     Cube keys cached results by their SQL alone, and a copy shares its
@@ -597,8 +646,9 @@ Pool sizes and timeouts still come from the environment.
   compiled model keeps its schema. Upgrading to this makes each model's
   rollups build once more.
 - **Names and the environment.**
-  - A data source is named as items are: its short name in the root,
-    `<folderId>__<name>` elsewhere.
+  - A data source's name is one per model, in any case, and never changes
+    (R71). Its grammar is an item's, without the reserved words. `default`
+    is the root's alone (`400 default_outside_root`).
   - Keep `CUBEJS_DATASOURCES` unset: Cube refuses names it doesn't declare.
   - Of a model with connections, only `default` may be Cube's from its
     environment when it has no connection: any other name is refused.
@@ -607,20 +657,22 @@ Pool sizes and timeouts still come from the environment.
 - **A connection's driver can't change** (`409 driver_change`): Cube fixes a
   data source's SQL dialect when it compiles.
 
-**Binding at publish.** In a model with connections, a cube's `data_source`
-names a data source by its short name, and publishing binds it to the
-nearest one, from the cube's folder toward the root, never a sibling's or a
-descendant's.
-- The resolved file holds the full name (`data_source: fsales__warehouse`).
-- A name no folder on the path holds is refused, as is a full name written
-  by hand.
-- A cube naming none gets the nearest `default`, or, when that is the
-  root's, none: Cube's default is the root's. A cube that `extends` another
-  inherits its parent's.
-- As with names, a published cube keeps its binding until it is published
-  again.
+**Data sources at publish.** In a model with connections, a cube's
+`data_source` names a data source by its name, as it is written in the
+resolved file.
+- **It must be a data source of the model** (`reference`, otherwise).
+- **It must be in the cube's folder or an ancestor of it** (R71 4.1,
+  `data_source_range`, naming the cube, never where the data source is).
+  This holds for the data source a cube runs on, inherited through `extends`
+  included (4.4). It is checked:
+  - at every publish, for every cube;
+  - at a folder push;
+  - when a data source is moved;
+  - at an overlay push, for its own items.
+- **A cube naming none uses the root's `default`**, which is Cube's default.
+  A cube that `extends` another inherits its parent's.
 - A connection a published cube uses can't be dropped (`409 in_use`, naming
-  the cubes). For the root's `default`, that is every cube naming none.
+  the cubes, by name). For the root's `default`, that is every cube naming none.
 - **Another binding is another alias.** Cube keys cached results by their SQL
   and names rollup tables by the cube's alias, neither by data source. So a
   cube bound to a data source other than Cube's default gets an SQL alias that
@@ -640,10 +692,15 @@ descendant's.
     Its rollups rebuild once then.
   - A connection changed in place, the same name aimed elsewhere, is served
     as a new epoch (see Serving, "Changed in place").
-- **Dropping and publishing don't interleave.** A drop checks its users at the
-  current revision, and is taken only while that revision is still current. A
-  publish is stored only while every connection its changed cubes bind to
-  still exists; otherwise it answers `409 conflict`, to be sent again.
+- **Data sources, folders and publishing don't interleave.** They all take the
+  model's lock.
+  - A drop checks its users at the current revision, and is taken only while
+    that revision is still current.
+  - A publish is stored only while the model's data sources (by name and
+    folder) and, for a changeset, its folder tree are as it was checked
+    against. Otherwise it answers `409 conflict`, to be sent again.
+  - A data source's create, edit or move is checked under the lock against
+    what is published.
 - In a model without connections, `data_source` is left as written.
 - **Introspection** lists a model's connections, so a data source can be
   browsed before any cube uses it.
@@ -887,8 +944,9 @@ Replaces the folder tree, with each folder's allowed groups, and sets security:
 }
 ```
 
-- **The tree** changes nothing Cube serves, only how later publishes resolve
-  names.
+- **The tree** changes nothing Cube serves. It is refused when it would carry
+  an item away from what it refers to, or a cube away from its data source
+  (R71 4.3, R72), checked under the model's lock against what is published.
 - **`allowedGroups`** is at most 10,000 group names per folder.
   - A folder sent without it keeps what it has.
   - A new folder has none, and neither has a folder that moved to another parent.
@@ -905,7 +963,8 @@ goes up only when security or a folder's groups changed.
 | --- | --- |
 | `400` | `invalid_folders`: a bad id, a missing root, an unknown parent or a cycle |
 | `400` | `invalid_permissions`: with security on, a folder allows groups its parent doesn't (`problems`) |
-| `409` | `folder_in_use`: a folder that still holds items would go |
+| `409` | `folder_in_use`: a folder that still holds items or data sources would go (`folders`) |
+| `409` | `data_source_range`: a cube would use a data source outside its folder's range; `reference_range`: an item would refer outside its own. Both answer `{ cubes, items }`, by name, and `data_source_range` is the code when both are broken |
 | `409` | `mode`: security on for a model holding a file set |
 | `409` | `older_instances`: security turned on while an xcube before schema version 4 is connected (`instances`) |
 
@@ -954,12 +1013,13 @@ Stores a workspace's or a proposal's items as an overlay:
 
 - **The id** is 1 to 64 of `A-Z`, `a-z`, `0-9`, `_` and `-`.
 - **Items** are as in a changeset, at most 2,000 of each; each sits in the folder it
-  comes from or targets. No two may share a short name.
+  comes from or targets. No two may share a name, in any case (`name_in_use`).
 - **It is taken only if it applies to what is published now and every module it
   changes compiles.** Otherwise `422 invalid_items`, with `errors`, and the
   overlay stays as it was.
 - **Connections** (optional, at most 20) are the workspace's data sources,
-  each by its short name in the folder it would land in, with the fields and
+  each by its name and the folder it would land in (one with a published data
+  source's name stands in for it; no two share a name), with the fields and
   envelopes of `PUT …/connections/{name}` (see Overlays). A bad one answers
   as a connection's would: `400 invalid_connection` (naming it), or
   `422 invalid_secret` when an envelope doesn't open for its target.
@@ -992,7 +1052,7 @@ It answers `201` (created) or `200` with
 - `connections` lists `{ folderId, name, fullName, driver, authMethod, fields, secrets }`,
   `secrets` naming the sealed fields; never an envelope.
 - **Bindings as previews have them.** Each upsert also has `fullName`, `bindings` and a cube's `dataSource`, as its previews bind it over the published revision `boundRevision`.
-  - Names resolve among the overlay's items first, so they may differ from what the same items would bind to once landed. Compare them with a `POST …/changesets?dryRun=true` of the same items.
+  - An overlay item stands in for the published item of its name, wherever it is; landed, the same items may be refused (a name in use elsewhere, a published item's reference stranded). Compare with a `POST …/changesets?dryRun=true` of the same items.
   - `boundRevision` is `null`, and the bindings are left out, when the overlay no longer applies.
 - `instance` is what the answering instance makes of the overlay over its
   current revision: `serving`, `idle` (not compiled now), or `broken` with its
@@ -1106,11 +1166,24 @@ Each refresh worker's last run of each module of the model, as it recorded it
 Stores a model's data source:
 
 ```json
-{ "folderId": "froot", "driver": "postgres", "authMethod": "password",
+{ "baseVersion": null, "folderId": "froot", "driver": "postgres", "authMethod": "password",
   "fields": { "host": "db", "port": 5432, "database": "sales", "user": "cube" },
   "sealed": { "password": { "v": 1, "kid": "…", "enc": "…", "ct": "…" } },
   "revisions": { "password": "<the client's revision id>" } }
 ```
+
+- **`{name}`** is the data source's name, one per model in any case, which
+  never changes (R71). Its grammar is an item's (a letter, then letters,
+  digits and single underscores, at most 40), without the reserved words.
+  `default` is the root's alone.
+- **`baseVersion`** (required) says what the request is (R71 2.5):
+  - `null` creates it. It is refused while any data source holds the name, in
+    any case, so a create never lands over another.
+  - A version edits that version of it, in place or moved to another folder
+    (`folderId`). It is refused unless that is the stored version, and a move
+    is refused when it would leave a cube using it outside its folder's range.
+
+  Each check is made under the model's lock, which publishes take too.
 
 - **`fields`** are the form's values, secrets excepted, exactly as the
   browser sealed with them.
@@ -1119,7 +1192,11 @@ Stores a model's data source:
   target. Nothing connects: that is the test route's job.
 - **Answers.**
   - `200` with the connection, its secret fields named but never returned;
-  - `400 invalid_connection` (`problems`);
+  - `400 invalid_connection` (`problems`); `400 invalid_connection_name`;
+  - `400 default_outside_root`: `default` in another folder, or not in lower case;
+  - `409 name_in_use`: a create of a name another holds, or an edit naming it in another case;
+  - `409 conflict` with `currentVersion` (`null`: there is none): `baseVersion` isn't the stored version;
+  - `409 data_source_range` with `cubes` (by name): a move that would leave them out of range;
   - `422 invalid_secret`;
   - `409 driver_change`.
 - **After storing,** every instance swaps it in as soon as it hears, or, for
@@ -1127,9 +1204,10 @@ Stores a model's data source:
 
 #### `GET …/connections`, `DELETE …/connections/{name}`
 
-The model's connections (no secrets). Dropping one answers `204`, and Cube
-refuses its queries at once; a connection published cubes use can't be
-dropped (`409 in_use`).
+The model's connections (no secrets), each with its `version`. Dropping one
+answers `204`, and Cube refuses its queries at once; a connection published
+cubes use can't be dropped (`409 in_use`, naming them). Its name may be used
+again.
 
 #### `GET …/connections/{name}/health`
 
@@ -1161,8 +1239,7 @@ Every error has the connection's secrets taken out.
 #### `POST …/connections/{name}/sql`
 
 Runs read-only SQL on a stored connection (see SQL runner). With
-`?overlay={id}`, on that overlay's own data source instead, named as its
-previews name it: `<folderId>__<name>`, a root one by its short name.
+`?overlay={id}`, on that overlay's own data source of that name instead.
 
 ```json
 { "sql": "SELECT …", "runId": "<uuid>", "maxRows": 10000, "timeoutMs": 30000, "maxBytes": 10485760 }
@@ -1264,13 +1341,22 @@ retry), `409 conflict` on a stale base, `409 mode` for a model still in
 files mode, `422 invalid_items` with `errors` of the form
 `{ folderId, name, line?, column?, kind, message }`. Each changed item comes
 back in `items` as `{ folderId, name, fullName, bindings, dataSource? }`:
-- `bindings` is what each short name it uses is bound to, `{ shortName: fullName }`, as `GET …/items` gives them;
+- `fullName` is the name: names are one per model (R71);
+- `bindings` is each item it refers to, `{ name: name }`, as `GET …/items` gives them;
 - a cube's `dataSource` is the data source it queries, as in `GET …/items`, with `extends` naming the cube it extends.
+
+R71's and R72's refusals are `errors` of their own kinds:
+
+| `kind` | When | Names |
+| --- | --- | --- |
+| `name_in_use` | A name another item holds, in any case; a landed name sent in another case; two of one name in the changeset; a split view's name in use | The caller's item, never where the other is |
+| `data_source_range` | A cube's data source, its own or inherited, isn't in its folder or an ancestor | The cube (published ones too, when a change strands them), never where the data source is |
+| `reference_range` | An item refers to one outside its folder and its ancestors | The referrer and what it refers to, never where that is |
 
 The overlay push and the snapshot import answer the same way.
 
 With `?dryRun=true` it only checks, and takes slice 2's `securityContext`
-and `probes` (queries use full names); it answers `200` with `{ valid,
+and `probes`; it answers `200` with `{ valid,
 errors, probes, items, itemsHash, currentRevision }`.
 
 **Another writer in between.** A check is made against the revision the
@@ -1286,12 +1372,11 @@ data source only a superseded revision used.
 item set: the first import, and a recovery. A model in items mode refuses a
 file set (`409 mode`).
 
-**It changes nothing published that it sends unchanged (AC-273).** An item
-whose kind and authored YAML are what is published keeps what it was resolved
-to: its bindings, its data source and its alias. Only these are resolved
-afresh:
-- items it adds or changes;
-- items bound to an item it drops.
+**It changes nothing published that it sends unchanged.** An item whose kind,
+folder and authored YAML are what is published keeps what it was resolved to.
+Only these are resolved afresh:
+- items it adds, changes or moves to another folder;
+- items that refer to an item it drops, which are refused then.
 
 What it doesn't send goes, including items in folders its tree drops, which go
 with them. An item it sends in a folder its tree lacks is refused (`422`,
@@ -1315,22 +1400,24 @@ column.
 #### `GET …/items`
 
 Every item of the current revision:
-`{ folderId, name, kind, fullName, bindings: { shortName: fullName }, dataSource?, extends? }`.
-A cube's `dataSource` is the one it queries, and what a data source's "cubes
-that use it" lists (AC-157):
-- the one it is bound to, with `default` when it names none;
+`{ folderId, name, kind, fullName, bindings: { name: name }, dataSource?, extends? }`,
+`fullName` being the name. A cube's `dataSource` is the one it queries, and
+what a data source's "cubes that use it" lists (AC-157):
+- the one it names, with `default` when it names none;
 - for a cube that `extends` another, the one it inherits, however far up, with
-  `extends` naming its parent by full name.
+  `extends` naming its parent.
 
 It is `null` only when that can't be found.
 
 #### `POST …/resolve`
 
-`{ "folderId": "f7k2", "names": ["orders", "customers"] }` →
-`{ "names": { "orders": "f7k2__orders", "customers": "customers" } }`, or
-`null` for a name nothing on the folder's path holds. With
-`"overlay": "<id>"`, names resolve in the overlay's items first (a workspace's
-pickers, AC-281).
+`{ "folderId": "f7k2", "names": ["Orders", "nope"] }` →
+`{ "names": { "Orders": "orders", "nope": null } }`: the item holding each
+name, in any case, by its own name, or `null` when none does. Names are one
+per model, so the folder changes nothing; it is only checked to be in the
+tree. With `"overlay": "<id>"`, the overlay's items stand in for the
+published ones of their names (a workspace's pickers, and its check that a
+draft's name is free).
 
 #### `GET …/revision`
 
@@ -1384,8 +1471,7 @@ source answers `404`.
 
 **An overlay's own data source.** With `?overlay={id}`, the `schemas`,
 `tables`, `columns` and `scaffold` routes browse a data source that overlay
-brings, under the service credential alone. It is named as the overlay's
-previews name it: `<folderId>__<name>`, a root one by its short name.
+brings, under the service credential alone, by its name.
 - The request is pinned to the overlay's version, as a preview of it is, so
   its catalog is read on the overlay's own orchestrator and driver. A
   published connection of the same name is never used.

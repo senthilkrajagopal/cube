@@ -76,6 +76,40 @@ describeWithDatabase('migrate', () => {
     await migrate(pool, { schema, apply: false, logger: quiet });
   });
 
+  test('a schema holding folder-prefixed names is refused at start, to be dropped and seeded again; one of bare names alone migrates (R71 6.2)', async () => {
+    const at13 = async (rows: (schema: string) => string) => {
+      const schema = fresh();
+      await migrate(pool, { schema, apply: true, logger: quiet, migrations: MIGRATIONS.filter((m) => m.version <= 13) });
+      const hash = 'a'.repeat(64);
+      await pool.query(`INSERT INTO ${schema}.models (id) VALUES ('dev');
+        INSERT INTO ${schema}.files (model, hash, content) VALUES ('dev', '${hash}', 'x');
+        INSERT INTO ${schema}.revisions (model, rev, content_hash, file_count, bytes) VALUES ('dev', 1, '${hash}', 1, 1);
+        ${rows(schema).replaceAll('<hash>', hash)}`);
+      return schema;
+    };
+    const item = (s: string, folderId: string, name: string, fullName: string) => `INSERT INTO ${s}.revision_items (model, rev, folder_id, name, kind, full_name, authored_hash)
+      VALUES ('dev', 1, '${folderId}', '${name}', 'cube', '${fullName}', '<hash>');`;
+    const connection = (s: string, name: string, folderId: string) => `INSERT INTO ${s}.connections (model, name, folder_id, driver, auth_method, fields, sealed, version)
+      VALUES ('dev', '${name}', '${folderId}', 'postgres', 'password', '{}', '{}', 1);`;
+    const refusal = /holds folder-prefixed names.*drop the schema and seed it again/;
+
+    const prefixed = await at13((s) => item(s, 'fsales', 'orders', 'fsales__orders'));
+    await expect(migrate(pool, { schema: prefixed, apply: true, logger: quiet })).rejects.toThrow(refusal);
+    // Nothing of 14 applied: the image never starts on it.
+    const { rows: [{ v }] } = await pool.query(`SELECT max(version) AS v FROM ${prefixed}.schema_migrations`);
+    expect(v).toBe(13);
+    const folderSource = await at13((s) => connection(s, 'fsales__warehouse', 'fsales'));
+    await expect(migrate(pool, { schema: folderSource, apply: true, logger: quiet })).rejects.toThrow(refusal);
+
+    // Bare names alone (the root's): migrated, and older code may no longer read it.
+    const bare = await at13((s) => `${item(s, 'froot', 'orders', 'orders')} ${connection(s, 'default', 'froot')}`);
+    await migrate(pool, { schema: bare, apply: true, logger: quiet });
+    await expect(migrate(pool, { schema: bare, apply: true, logger: quiet, migrations: MIGRATIONS.filter((m) => m.version <= 13) }))
+      .rejects.toThrow(/needs xcube schema version 14/);
+    // One name per model, in any case.
+    await expect(pool.query(connection(bare, 'Default', 'froot'))).rejects.toThrow(/connections_name_ci/);
+  });
+
   test('works for a role that owns only its schema, which the bootstrap created', async () => {
     const schema = fresh();
     const missing = fresh();

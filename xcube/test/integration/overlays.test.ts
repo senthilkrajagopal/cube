@@ -192,8 +192,9 @@ describeWithDatabase('overlays: previews of unpublished items', () => {
   const workspace = {
     upserts: [
       { folderId: 'fa', name: 'orders', kind: 'cube', yaml: ordersYaml('      - name: total\n        sql: amount\n        type: sum\n') },
-      { folderId: 'fb', name: 'report', kind: 'cube', yaml: reportYaml },
-      // A copy from fc, which isn't on fb's path: the report's `widgets` means it, as it is in the workspace.
+      // A new cube joining widgets, beside it, and the root's customers.
+      { folderId: 'fc', name: 'report', kind: 'cube', yaml: reportYaml },
+      // The workspace's copy of widgets, as published: its edit.
       { folderId: 'fc', name: 'widgets', kind: 'cube', yaml: plainCube('widgets', 'main.widgets') },
     ],
     deletes: [],
@@ -222,27 +223,26 @@ describeWithDatabase('overlays: previews of unpublished items', () => {
   test('an overlay is pushed once it applies to what is published and compiles', async () => {
     const res = await admin('put', '/overlays/ws1', workspace).expect(201);
     expect(res.body).toMatchObject({ model: 'dev', id: 'ws1', version: 1, created: true, revision });
-    expect(res.body.items.map((i: any) => i.fullName).sort()).toEqual(['fa__orders', 'fb__report', 'fc__widgets']);
+    expect(res.body.items.map((i: any) => i.fullName).sort()).toEqual(['orders', 'report', 'widgets']);
     const status = await admin('get', '/overlays/ws1').expect(200);
     expect(status.body).toMatchObject({ id: 'ws1', version: 1, validatedRevision: revision, instance: { state: 'idle' } });
-    // Each item bound as its previews bind it: the report's `widgets` is the workspace's copy from
-    // fc, found in the overlay first although fc isn't on fb's path; landed, it would not be.
+    // Each item bound as its previews bind it: a name means the one item of that name, the overlay's first.
     expect(status.body.boundRevision).toBe(revision);
     const report = status.body.upserts.find((u: any) => u.name === 'report');
-    expect(report).toMatchObject({ folderId: 'fb', fullName: 'fb__report', bindings: expect.objectContaining({ widgets: 'fc__widgets' }) });
+    expect(report).toMatchObject({ folderId: 'fc', fullName: 'report', bindings: { widgets: 'widgets', customers: 'customers' } });
     expect(res.body.items.find((i: any) => i.name === 'report').bindings).toEqual(report.bindings);
   });
 
   test('a query whose token names the overlay is answered from it; others from what is published', async () => {
-    const res = await load({ measures: ['fa__orders.total'] }, 'ws1');
+    const res = await load({ measures: ['orders.total'] }, 'ws1');
     expect(res.status).toBe(200);
     expect(res.headers['x-xcube-overlay']).toBe('ws1@1');
-    expect(Number(res.body.data[0]['fa__orders.total'])).toBe(60);
-    expect((await load({ measures: ['fa__orders.total'] })).status).toBe(400);
+    expect(Number(res.body.data[0]['orders.total'])).toBe(60);
+    expect((await load({ measures: ['orders.total'] })).status).toBe(400);
     const names = async (overlay?: string) => (await request(server).get('/cubejs-api/v1/meta')
       .set('Authorization', token(overlay)).expect(200)).body.cubes.map((c: any) => c.name).sort();
-    const published = ['base_orders', 'customers', 'fa__orders', 'fa__orders_x', 'fa__v_orders', 'fc__widgets', 'unrelated'];
-    expect(await names('ws1')).toEqual([...published, 'fb__report'].sort());
+    const published = ['base_orders', 'customers', 'orders', 'orders_x', 'unrelated', 'v_orders', 'widgets'];
+    expect(await names('ws1')).toEqual([...published, 'report'].sort());
     expect(await names()).toEqual(published);
   });
 
@@ -251,35 +251,46 @@ describeWithDatabase('overlays: previews of unpublished items', () => {
       upserts: [{ folderId: 'fa', name: 'orders', kind: 'cube', yaml: ordersYaml('      - name: note\n        sql: id\n        type: max\n') }],
     }).expect(201);
     const compiled = [...(core as any).compilerCache.keys()];
-    expect(await valueOf({ measures: ['fa__orders.note'] }, 'small', 'fa__orders.note')).toBe(3);
+    expect(await valueOf({ measures: ['orders.note'] }, 'small', 'orders.note')).toBe(3);
     const served = [...(runtime as any).served.values()];
     const overlay = served.find((r: any) => r.overlay?.id === 'small');
     const published = served.find((r: any) => r.key === overlay.overlay.base);
     const own = [...overlay.modules.values()].filter((r: any) => published.modules.get(r.moduleId) !== r);
     expect(overlay.modules.size).toBe(published.modules.size);
     // The module holding orders and its view; the others are the published revision's, compiled once.
-    expect(own.map((r: any) => r.files.map((f: any) => f.path).sort())).toEqual([['fa__orders.yml', 'fa__v_orders.yml']]);
+    expect(own.map((r: any) => r.files.map((f: any) => f.path).sort())).toEqual([['orders.yml', 'v_orders.yml']]);
     expect([...(core as any).compilerCache.keys()].filter((k) => !compiled.includes(k))).toEqual([own[0].appId]);
     await admin('delete', '/overlays/small').expect(204);
   });
 
-  test('names resolve in the overlay first, then along the item\'s folder path (AC-281)', async () => {
-    expect(await valueOf({ measures: ['fb__report.count', 'fc__widgets.count'] }, 'ws1', 'fc__widgets.count')).toBe(2);
-    const resolved = await admin('post', '/resolve', { folderId: 'fb', names: ['widgets', 'orders', 'customers', 'nothing'], overlay: 'ws1' }).expect(200);
-    expect(resolved.body.names).toEqual({ widgets: 'fc__widgets', orders: 'fa__orders', customers: 'customers', nothing: null });
-    const plain = await admin('post', '/resolve', { folderId: 'fb', names: ['widgets', 'customers'] }).expect(200);
-    expect(plain.body.names).toEqual({ widgets: null, customers: 'customers' });
+  test('an overlay item stands in for the published one of its name, wherever it is (R71 2.6)', async () => {
+    expect(await valueOf({ measures: ['report.count', 'widgets.count'] }, 'ws1', 'widgets.count')).toBe(2);
+    const resolved = await admin('post', '/resolve', { folderId: 'fb', names: ['Report', 'orders', 'customers', 'nothing'], overlay: 'ws1' }).expect(200);
+    expect(resolved.body.names).toEqual({ Report: 'report', orders: 'orders', customers: 'customers', nothing: null });
+    const plain = await admin('post', '/resolve', { folderId: 'fb', names: ['report', 'customers'] }).expect(200);
+    expect(plain.body.names).toEqual({ report: null, customers: 'customers' });
+
+    // A use-only copy: unrelated, published in the root, copied to fb with a measure of its own.
+    await admin('put', '/overlays/copy', {
+      upserts: [{ folderId: 'fb', name: 'unrelated', kind: 'cube', yaml: `${plainCube('unrelated', 'main.widgets')}      - name: top\n        sql: id\n        type: max\n` }],
+    }).expect(201);
+    expect(await valueOf({ measures: ['unrelated.top'] }, 'copy', 'unrelated.top')).toBe(2);
+    expect((await load({ measures: ['unrelated.top'] })).status).toBe(400);
+    const copied = (await request(server).get('/cubejs-api/v1/meta').set('Authorization', token('copy')).expect(200)).body.cubes
+      .find((c: any) => c.name === 'unrelated');
+    expect(copied.meta).toEqual({ xcube: { folderId: 'fb', shortName: 'unrelated' } });
+    await admin('delete', '/overlays/copy').expect(204);
   });
 
   test('previews read the source for what the overlay changes, never an unbuilt rollup', async () => {
     const sqlOf = async (overlay?: string) => (await request(server).get('/cubejs-api/v1/sql')
-      .query({ query: JSON.stringify({ measures: ['fa__orders.count'], timeDimensions: [{ dimension: 'fa__orders.created_at', granularity: 'day' }] }) })
+      .query({ query: JSON.stringify({ measures: ['orders.count'], timeDimensions: [{ dimension: 'orders.created_at', granularity: 'day' }] }) })
       .set('Authorization', token(overlay))
       .expect(200)).body.sql;
     expect((await sqlOf()).preAggregations).toHaveLength(1);
     expect((await sqlOf('ws1')).preAggregations).toHaveLength(0);
     // The view over the changed cube is reached too.
-    expect(await valueOf({ measures: ['fa__v_orders.count'] }, 'ws1', 'fa__v_orders.count')).toBe(3);
+    expect(await valueOf({ measures: ['v_orders.count'] }, 'ws1', 'v_orders.count')).toBe(3);
   });
 
   test('the same push again changes nothing but its expiry; one that doesn\'t compile is refused, and the last good one stays', async () => {
@@ -294,7 +305,7 @@ describeWithDatabase('overlays: previews of unpublished items', () => {
     }).expect(422);
     expect(broken.body.code).toBe('invalid_items');
     expect(broken.body.errors[0]).toMatchObject({ folderId: 'fb', name: 'gadgets' });
-    expect(await valueOf({ measures: ['fa__orders.total'] }, 'ws1', 'fa__orders.total')).toBe(60);
+    expect(await valueOf({ measures: ['orders.total'] }, 'ws1', 'orders.total')).toBe(60);
   });
 
   test('an overlay is applied to whatever is published now; a publish it no longer applies to breaks it', async () => {
@@ -303,20 +314,20 @@ describeWithDatabase('overlays: previews of unpublished items', () => {
       upserts: [{ folderId: 'froot', name: 'extra', kind: 'cube', yaml: plainCube('extra', 'main.customers') }],
     }).expect(201);
     revision = added.body.revision;
-    const res = await load({ measures: ['fa__orders.total'] }, 'ws1');
+    const res = await load({ measures: ['orders.total'] }, 'ws1');
     expect(res.headers['x-xcube-revision']).toBe(`dev@${revision}`);
-    expect(Number(res.body.data[0]['fa__orders.total'])).toBe(60);
+    expect(Number(res.body.data[0]['orders.total'])).toBe(60);
     expect(await valueOf({ measures: ['extra.count'] }, 'ws1', 'extra.count')).toBe(3);
 
     // Nothing published refers to customers, so it may go; the overlay's report joins it.
     const dropped = await admin('post', '/changesets', { baseRevision: revision, deletes: [{ folderId: 'froot', name: 'customers' }] }).expect(201);
     revision = dropped.body.revision;
-    const refused = await load({ measures: ['fa__orders.total'] }, 'ws1');
+    const refused = await load({ measures: ['orders.total'] }, 'ws1');
     expect(refused.status).toBe(409);
-    expect(refused.body.error).toMatch(/Overlay "ws1" doesn't apply to what is published now: fb\/report/);
+    expect(refused.body.error).toMatch(/Overlay "ws1" doesn't apply to what is published now: fc\/report/);
     const status = await admin('get', '/overlays/ws1').expect(200);
     expect(status.body.instance).toMatchObject({ revision, state: 'broken' });
-    expect(status.body.instance.errors[0]).toMatchObject({ folderId: 'fb', name: 'report' });
+    expect(status.body.instance.errors[0]).toMatchObject({ folderId: 'fc', name: 'report' });
   });
 
   test('an override\'s preview doesn\'t inherit a rollup it can\'t use; what the overlay doesn\'t reach keeps its own', async () => {
@@ -327,9 +338,9 @@ describeWithDatabase('overlays: previews of unpublished items', () => {
       .query({ query: JSON.stringify({ measures: [`${cube}.count`], timeDimensions: [{ dimension: `${cube}.created_at`, granularity: 'day' }] }) })
       .set('Authorization', token(overlay))
       .expect(200)).body.sql.preAggregations.length;
-    expect(await rollups('fa__orders_x')).toBe(1);
-    expect(await rollups('fa__orders_x', 'ovr')).toBe(0);
-    expect(await rollups('fa__orders', 'ovr')).toBe(1);
+    expect(await rollups('orders_x')).toBe(1);
+    expect(await rollups('orders_x', 'ovr')).toBe(0);
+    expect(await rollups('orders', 'ovr')).toBe(1);
     await admin('delete', '/overlays/ovr').expect(204);
   });
 
@@ -337,8 +348,8 @@ describeWithDatabase('overlays: previews of unpublished items', () => {
     await admin('put', '/overlays/burst', {
       upserts: [{ folderId: 'fa', name: 'orders', kind: 'cube', yaml: ordersYaml('      - name: burst\n        sql: amount\n        type: max\n') }],
     }).expect(201);
-    const answers = await Promise.all(Array.from({ length: 6 }, () => load({ measures: ['fa__orders.burst'] }, 'burst')));
-    expect(answers.map((a) => [a.status, Number(a.body.data?.[0]?.['fa__orders.burst'])])).toEqual(Array(6).fill([200, 30]));
+    const answers = await Promise.all(Array.from({ length: 6 }, () => load({ measures: ['orders.burst'] }, 'burst')));
+    expect(answers.map((a) => [a.status, Number(a.body.data?.[0]?.['orders.burst'])])).toEqual(Array(6).fill([200, 30]));
     await admin('delete', '/overlays/burst').expect(204);
   });
 
@@ -369,29 +380,29 @@ describeWithDatabase('overlays: previews of unpublished items', () => {
     const first = await admin('put', '/overlays/again', {
       upserts: [{ folderId: 'fa', name: 'orders', kind: 'cube', yaml: ordersYaml('      - name: again\n        sql: amount\n        type: min\n') }],
     }).expect(201);
-    expect(await valueOf({ measures: ['fa__orders.again'] }, 'again', 'fa__orders.again')).toBe(10);
+    expect(await valueOf({ measures: ['orders.again'] }, 'again', 'orders.again')).toBe(10);
     await admin('delete', '/overlays/again').expect(204);
     const second = await admin('put', '/overlays/again', {
       upserts: [{ folderId: 'fa', name: 'orders', kind: 'cube', yaml: ordersYaml('      - name: again\n        sql: amount\n        type: max\n') }],
     }).expect(201);
     expect(second.body.version).toBeGreaterThan(first.body.version);
-    expect(await valueOf({ measures: ['fa__orders.again'] }, 'again', 'fa__orders.again')).toBe(30);
+    expect(await valueOf({ measures: ['orders.again'] }, 'again', 'orders.again')).toBe(30);
     await admin('delete', '/overlays/again').expect(204);
   });
 
   test('a dropped or expired overlay is gone; an unknown one never was', async () => {
     await admin('delete', '/overlays/ws1').expect(204);
     await admin('delete', '/overlays/ws1').expect(204);
-    expect((await load({ measures: ['fa__orders.count'] }, 'ws1')).status).toBe(410);
+    expect((await load({ measures: ['orders.count'] }, 'ws1')).status).toBe(410);
     await admin('get', '/overlays/ws1').expect(404);
-    expect((await load({ measures: ['fa__orders.count'] }, 'nope')).status).toBe(410);
+    expect((await load({ measures: ['orders.count'] }, 'nope')).status).toBe(410);
 
     await admin('put', '/overlays/ws2', {
       upserts: [{ folderId: 'fa', name: 'orders', kind: 'cube', yaml: ordersYaml() }], ttlSeconds: 1,
     }).expect(201);
-    expect(await valueOf({ measures: ['fa__orders.count'] }, 'ws2', 'fa__orders.count')).toBe(3);
+    expect(await valueOf({ measures: ['orders.count'] }, 'ws2', 'orders.count')).toBe(3);
     await new Promise((resolve) => setTimeout(resolve, 1200));
-    expect((await load({ measures: ['fa__orders.count'] }, 'ws2')).status).toBe(410);
-    expect((await load({ measures: ['fa__orders.count'] }, 'bad id!')).status).toBe(403);
+    expect((await load({ measures: ['orders.count'] }, 'ws2')).status).toBe(410);
+    expect((await load({ measures: ['orders.count'] }, 'bad id!')).status).toBe(403);
   });
 });
