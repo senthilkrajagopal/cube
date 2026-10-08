@@ -180,16 +180,66 @@ describe('publish', () => {
     }
   });
 
-  test('aliases: a long name over a long pre-aggregation stem gets a stable hash, and a long pre-aggregation a short alias', () => {
+  test('a rollup keeps its names in Cube Store whatever their length; one built in the source is held to Postgres\'s 63 (R38)', () => {
+    // wechart's seed: a 30-character stem, partitioned by year, with an index.
+    const seed = (extra = '') => cube('froot', 'monthly_orders', [
+      '    sql_table: public.orders',
+      '    dimensions:',
+      '      - name: status',
+      '        sql: status',
+      '        type: string',
+      '      - name: ordered_at',
+      '        sql: ordered_at',
+      '        type: time',
+      '    measures:',
+      '      - name: count',
+      '        type: count',
+      '    pre_aggregations:',
+      '      - name: by_status_month',
+      '        measures: [count]',
+      '        dimensions: [status]',
+      '        time_dimension: ordered_at',
+      '        granularity: month',
+      '        partition_granularity: year',
+      extra,
+      '        indexes:',
+      '          - name: by_status',
+      '            columns: [status]',
+      '',
+    ].filter((l) => l !== '').join('\n'));
+    const kept = publish({ tree, current: [], upserts: [seed()], deletes: [] });
+    expect(kept.errors).toEqual([]);
+    expect(doc(byName(kept.items, 'monthly_orders')).sql_alias).toBeUndefined();
+    expect(doc(byName(kept.items, 'monthly_orders')).pre_aggregations[0].sql_alias).toBeUndefined();
+
+    // Built in Postgres, its partition's table would be 30 + 8 + 26 = 64: aliased, and its index still too long.
+    const inSource = publish({ tree, current: [], upserts: [seed('        external: false')], deletes: [] });
+    expect(inSource.errors).toEqual([{
+      folderId: 'froot',
+      name: 'monthly_orders',
+      kind: 'alias',
+      message: 'Pre-aggregation by_status_month\'s rollup table name would be too long: shorten its name to at most 10 characters',
+    }]);
+    // So too when Cube keeps rollups in the source by default.
+    process.env.CUBEJS_EXTERNAL_DEFAULT = 'false';
+    try {
+      expect(publish({ tree, current: [], upserts: [seed()], deletes: [] }).errors.map((e) => e.kind)).toEqual(['alias']);
+    } finally {
+      delete process.env.CUBEJS_EXTERNAL_DEFAULT;
+    }
+
+    // In the source without an index: the cube's alias shortens, then the pre-aggregation's.
     const long = 'customer_lifetime_orders_by_region';
-    const longOrders = cube('fsales', long, orders('fsales').yaml.split('\n').slice(2).join('\n').replace('{FILTER_PARAMS.orders.', `{FILTER_PARAMS.${long}.`));
-    const { items, errors } = publish({ tree, current: [], upserts: [customers, longOrders], deletes: [] });
-    expect(errors).toEqual([]);
-    const o = doc(byName(items, long));
+    const longOrders = cube('fsales', long, `${orders('fsales').yaml.split('\n').slice(2).join('\n').replace('{FILTER_PARAMS.orders.', `{FILTER_PARAMS.${long}.`)}        external: false\n`);
+    const shortened = publish({ tree, current: [], upserts: [customers, longOrders], deletes: [] });
+    expect(shortened.errors).toEqual([]);
+    const o = doc(byName(shortened.items, long));
     expect(o.sql_alias).toMatch(/^x[a-z2-7]{7}$/);
-    expect(`${o.sql_alias}_by_city`.length).toBeLessThanOrEqual(25);
-    // A short one keeps its name, whatever its folder.
-    expect(doc(byName(publish({ tree, current: [], upserts: [customers, orders('feu')], deletes: [] }).items, 'orders')).sql_alias).toBeUndefined();
+    expect(`${o.sql_alias}_by_city`.length + 26).toBeLessThanOrEqual(63);
+    // The same in Cube Store keeps its name.
+    const inStore = publish({ tree, current: [], upserts: [customers, cube('fsales', long, longOrders.yaml.split('\n').slice(2).join('\n').replace('        external: false\n', ''))], deletes: [] });
+    expect(inStore.errors).toEqual([]);
+    expect(doc(byName(inStore.items, long)).sql_alias).toBeUndefined();
     expect(titleOf('order_items')).toBe('Order Items');
     expect(titleOf('user_id')).toBe('User ID');
   });
@@ -380,42 +430,27 @@ describe('review findings', () => {
   ].filter((l) => l !== '').join('\n'));
 
   test('a pre-aggregation with indexes never gets an alias: the cube\'s alias shortens instead, or it is refused', () => {
-    const withIndexes = simple('fsales', 'regional_orders', [
+    const inSource = (name: string, pa: string, indexes: boolean) => simple('fsales', name, [
       '    pre_aggregations:',
-      '      - name: orders_by_day',
+      `      - name: ${pa}`,
       '        measures: [count]',
-      '        time_dimension: created_at',
-      '        granularity: day',
-      '        indexes:',
-      '          - name: by_city',
-      '            columns: [city]',
+      '        external: false',
+      ...(indexes ? ['        indexes:', '          - name: by_city', '            columns: [city]'] : []),
     ].join('\n'));
-    const { items, errors } = publish({ tree, current: [], upserts: [withIndexes], deletes: [] });
+    // A table of 18 + 1 + 13 + 26 = 58, but an index of 66: the cube's alias shortens.
+    const { items, errors } = publish({ tree, current: [], upserts: [inSource('regional_orders_dl', 'orders_by_day', true)], deletes: [] });
     expect(errors).toEqual([]);
-    const o = doc(byName(items, 'regional_orders'));
+    const o = doc(byName(items, 'regional_orders_dl'));
     expect(o.sql_alias).toMatch(/^x[a-z2-7]{7}$/);
     expect(o.pre_aggregations[0].sql_alias).toBeUndefined();
 
-    const tooLong = simple('fsales', 'orders', [
-      '    pre_aggregations:',
-      '      - name: orders_by_day_and_city_and_more',
-      '        measures: [count]',
-      '        indexes:',
-      '          - name: by_city',
-      '            columns: [city]',
-    ].join('\n'));
-    const refused = publish({ tree, current: [], upserts: [tooLong], deletes: [] });
-    expect(refused.errors[0].message).toMatch(/rollup table name would be too long: shorten its name to at most 16 characters/);
+    const refused = publish({ tree, current: [], upserts: [inSource('orders', 'orders_by_day_and_city_and_more', true)], deletes: [] });
+    expect(refused.errors[0].message).toMatch(/rollup table name would be too long: shorten its name to at most 20 characters/);
 
-    const noIndexes = simple('fsales', 'orders', [
-      '    pre_aggregations:',
-      '      - name: orders_by_day_and_city_and_more',
-      '        measures: [count]',
-    ].join('\n'));
-    const aliased = publish({ tree, current: [], upserts: [noIndexes], deletes: [] });
+    const aliased = publish({ tree, current: [], upserts: [inSource('orders', 'orders_by_day_and_city_and_more_x', false)], deletes: [] });
     expect(aliased.errors).toEqual([]);
     const a = doc(aliased.items[0]);
-    expect(`${a.sql_alias}_${a.pre_aggregations[0].sql_alias}`.length).toBeLessThanOrEqual(25);
+    expect(`${a.sql_alias ?? a.name}_${a.pre_aggregations[0].sql_alias ?? a.pre_aggregations[0].name}`.length + 26).toBeLessThanOrEqual(63);
   });
 
   test('.sql after a cube is its SQL, even with an item named sql in the model', () => {

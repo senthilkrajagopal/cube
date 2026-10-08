@@ -60,6 +60,13 @@ jobs:
           --health-cmd "trino --execute 'SELECT 1'"
           --health-interval 10s
           --health-retries 30
+      # Cube Store, for its rollups and its SQL runner; its query timeout short, as the tests take it.
+      cubestore:
+        image: cubejs/cubestore:v1.7.45
+        env:
+          CUBESTORE_QUERY_TIMEOUT: '10'
+        ports:
+          - 3030:3030
     defaults:
       run:
         working-directory: xcube
@@ -72,6 +79,9 @@ jobs:
           cache-dependency-path: xcube/package-lock.json
       - run: npm ci --no-audit --no-fund
       - run: npm run typecheck
+      - name: Wait for Cube Store
+        shell: bash
+        run: for i in $(seq 60); do (echo > /dev/tcp/127.0.0.1/3030) 2>/dev/null && exit 0; sleep 1; done; exit 1
       - name: Test, with the live-database suites
         run: npm test
         env:
@@ -79,6 +89,8 @@ jobs:
           INTROSPECTION_TEST_MYSQL: 127.0.0.1:3306
           INTROSPECTION_TEST_TRINO: 127.0.0.1:8080
           XCUBE_TEST_DATABASE_URL: postgres://test:test@127.0.0.1:5432/test
+          XCUBE_TEST_CUBESTORE: 127.0.0.1:3030
+          XCUBE_TEST_CUBESTORE_QUERY_TIMEOUT: '10'
           # The Trino client sends the OS user as the Trino user.
           USER: presto
 

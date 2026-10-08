@@ -241,8 +241,17 @@ In both modes:
       `o_r_d_e_r_s`);
     - for a cube on a data source other than Cube's default, or one that
       extends another (see Connections);
-    - for a name that would make a rollup table's stem (25 characters) or a
-      member's alias (63) too long, a stable hash.
+    - for a name that would make a member's alias, or a name its
+      pre-aggregations build in the source database, longer than Postgres's
+      63 bytes, a stable hash. A pre-aggregation's table and index names
+      count with Cube's suffixes: the partition's date (8, 10 by the hour, 12
+      by the minute) and `_<content>_<structure>_<built>` (26). Ones Cube keeps
+      in Cube Store (a rollup, unless `external: false` or
+      `CUBEJS_EXTERNAL_DEFAULT=false`) don't count: Cube Store takes longer
+      names.
+
+    Otherwise an item keeps its own name in SQL and in rollup table names
+    (wechart's R38): a file-set model switched to items rebuilds nothing.
 - **Expressions** are read with Cube's own lexer, so names in string
   literals, lambda parameters and keyword arguments are never taken for
   references.

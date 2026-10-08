@@ -16,8 +16,15 @@ import {
 } from './items';
 import { rewriteReferences, Scope } from './rewrite';
 
-/** The longest `<cubeAlias>_<preAggregation>` whose rollup table name, with Cube's version suffix, fits Postgres's 63. */
+/**
+ * The longest `<cubeAlias>_<preAggregation>` whose rollup table name fits
+ * Postgres's 63 whatever its partitions: what a short alias over a moved
+ * connection is sized to (`connections/aliases.ts`).
+ */
 export const MAX_TABLE_STEM = 25;
+
+/** What Cube appends to a rollup's table and index names: `_<content 8>_<structure 8>_<updated 7>` (`PreAggregations.targetTableName`). */
+const VERSION_SUFFIX = 26;
 
 /** The longest cube alias a data source's salt is added to as is; longer ones get a hash alias. */
 export const MAX_PLAIN_ALIAS = 20;
@@ -154,11 +161,57 @@ function memberNamesOf(def: ItemDefinition, doc: Record<string, any>): string[] 
   return names;
 }
 
-/** Whether a cube alias leaves some member's SQL alias, or rollup table stem, too long. */
+/**
+ * Whether a pre-aggregation is built in the source database, whose names are
+ * held to Postgres's 63 bytes, rather than in Cube Store, whose aren't: Cube
+ * keeps a rollup in Cube Store unless it says `external: false` or
+ * `CUBEJS_EXTERNAL_DEFAULT` is false, and an `original_sql` one in the source
+ * (CubeSymbols.ts:772). A lambda has no table of its own.
+ */
+function inSource(pa: any): boolean {
+  const type = inflection.camelize(String(pa.type ?? 'rollup'), true);
+  if (type === 'rollupLambda') {
+    return false;
+  }
+  if (typeof pa.external === 'boolean') {
+    return !pa.external;
+  }
+  return !(['rollup', 'rollupJoin'].includes(type) && process.env.CUBEJS_EXTERNAL_DEFAULT !== 'false');
+}
+
+/** A partition's date, appended to its table's name: 8, 10 by the hour, 12 by the minute (`partitionTableName`). */
+function partitionSuffix(pa: any): number {
+  const granularity = pa.partition_granularity ?? pa.partitionGranularity;
+  if (!granularity) {
+    return 0;
+  }
+  return ({ hour: 10, minute: 12 } as Record<string, number>)[granularity] ?? 8;
+}
+
+function indexNamesOf(pa: any): string[] {
+  return Array.isArray(pa.indexes) ? pa.indexes.map((i: any) => i?.name).filter((n: unknown) => typeof n === 'string') : [];
+}
+
+/**
+ * The longest name Cube builds in the source database for a pre-aggregation
+ * under these aliases: its table's, or an index's (`<alias>_<index>`,
+ * PreAggregations.ts:417), each with its partition and version suffixes. 0
+ * for one kept in Cube Store.
+ */
+function longestName(cubeAlias: string, paAlias: string, pa: any): number {
+  if (!inSource(pa)) {
+    return 0;
+  }
+  const stem = sqlName(`${cubeAlias}_${paAlias}`);
+  const longest = Math.max(stem.length, ...indexNamesOf(pa).map((index) => sqlName(`${stem}_${index}`).length));
+  return longest + partitionSuffix(pa) + VERSION_SUFFIX;
+}
+
+/** Whether a cube alias makes some member's SQL alias, or a name its pre-aggregations build, longer than 63. */
 function tooLong(alias: string, def: ItemDefinition, doc: Record<string, any>): boolean {
   const times = new Set<string>((Array.isArray(doc.dimensions) ? doc.dimensions : [])
     .filter((d: any) => d?.type === 'time').map((d: any) => d.name));
-  return preAggregationsOf(doc).some((pa) => sqlName(`${alias}_${pa.sql_alias ?? pa.sqlAlias ?? pa.name}`).length > MAX_TABLE_STEM)
+  return preAggregationsOf(doc).some((pa) => longestName(alias, pa.sql_alias ?? pa.sqlAlias ?? pa.name, pa) > MAX_IDENTIFIER)
     || memberNamesOf(def, doc).some((m) => sqlName(`${alias}__${m}`).length + (times.has(m) ? GRANULARITY_SUFFIX : 0) > MAX_IDENTIFIER);
 }
 
@@ -172,8 +225,9 @@ function tooLong(alias: string, def: ItemDefinition, doc: Record<string, any>): 
  *   ones included;
  * - a cube that extends another has one of its own, or Cube would give it its
  *   parent's (`CubeSymbols` sets the parent as its prototype);
- * - one that would make a rollup table stem or a member's alias too long is a
- *   short stable hash.
+ * - one that would make a member's alias, or a name its pre-aggregations
+ *   build in the source database, longer than Postgres's 63 is a short stable
+ *   hash. Otherwise an item keeps its own name in SQL and rollup tables (R38).
  */
 function generatedAlias(entry: Entry, byName: Map<string, Entry>): string | undefined {
   const { def, doc } = entry;
@@ -245,7 +299,7 @@ function checkAliases(entries: Entry[]): ItemError[] {
 
     for (const pa of preAggregationsOf(doc)) {
       let paAlias: string = pa.sql_alias ?? pa.sqlAlias ?? pa.name;
-      if (resolved && sqlName(`${alias}_${paAlias}`).length > MAX_TABLE_STEM) {
+      if (resolved && longestName(alias, paAlias, pa) > MAX_IDENTIFIER) {
         // Cube names a pre-aggregation's indexes after its alias when it has one
         // (PreAggregations.ts:417, 450), so only one without indexes may get one.
         const hasIndexes = Array.isArray(pa.indexes) ? pa.indexes.length > 0 : Boolean(pa.indexes);
@@ -253,8 +307,9 @@ function checkAliases(entries: Entry[]): ItemError[] {
           paAlias = `p${base32(`${def.name}.${pa.name}`, 6)}`;
           pa.sql_alias = paAlias;
         }
-        if (sqlName(`${alias}_${paAlias}`).length > MAX_TABLE_STEM) {
-          const room = MAX_TABLE_STEM - alias.length - 1;
+        if (longestName(alias, paAlias, pa) > MAX_IDENTIFIER) {
+          const indexRoom = Math.max(0, ...indexNamesOf(pa).map((index) => 1 + sqlName(index).length));
+          const room = MAX_IDENTIFIER - VERSION_SUFFIX - partitionSuffix(pa) - alias.length - 1 - indexRoom;
           errors.push({
             ...at,
             kind: 'alias',
