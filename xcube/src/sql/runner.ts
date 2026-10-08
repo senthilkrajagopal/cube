@@ -61,6 +61,8 @@ export class SqlRunError extends Error {
     public readonly partial: SqlRows | null = null,
     /** A stopped run the database runs on (Cube Store): when it ends at the latest, `endsBy: null` when nothing bounds it. */
     public readonly runsOn: { endsBy: Date | null } | null = null,
+    /** Why a refusal refused, for the client to word: `cubestore_router_join`. */
+    public readonly reason: string | null = null,
   ) {
     super(message);
   }
@@ -164,6 +166,9 @@ export interface SqlSession {
   /** Rolls back, and lets the connection go; never throws. */
   close(): Promise<void>;
 }
+
+/** Refuses a statement a database's own check found not to be one read (BigQuery's dry run, Cube Store's plan). */
+export type Refuse = (message: string, statement: string, reason?: string) => never;
 
 export type SessionDialect = 'postgres' | 'redshift' | 'mysql' | 'snowflake' | 'bigquery' | 'mssql' | 'oracle' | 'dremio' | 'cubestore';
 
@@ -388,7 +393,7 @@ async function snowflakeSession(driver: any, caps: SqlCaps): Promise<SqlSession>
  * the job, with `jobTimeoutMs` (and `maximumBytesBilled` when asked), its
  * results read a page at a time to the cap.
  */
-async function bigquerySession(driver: any, caps: SqlCaps, refuse: (type: string) => never): Promise<SqlSession> {
+async function bigquerySession(driver: any, caps: SqlCaps, refuse: Refuse): Promise<SqlSession> {
   const bq = driver.bigquery;
   const location = driver.options?.location;
   let job: any = null;
@@ -397,7 +402,7 @@ async function bigquerySession(driver: any, caps: SqlCaps, refuse: (type: string
       const [dry] = await bq.createQueryJob({ query: sql, dryRun: true, useLegacySql: false, location });
       const type = dry?.metadata?.statistics?.query?.statementType;
       if (type !== 'SELECT') {
-        refuse(String(type ?? 'unknown'));
+        refuse(`BigQuery's dry run reads the statement as ${String(type ?? 'unknown')}: only a SELECT runs here`, String(type ?? 'unknown').toLowerCase());
       }
       [job] = await bq.createQueryJob({
         query: sql,
@@ -597,6 +602,30 @@ async function dremioSession(driver: any): Promise<SqlSession> {
 }
 
 /**
+ * Whether a Cube Store plan joins on its router: a join not under a
+ * `ClusterSend`. Its router runs it, and nothing stops that once it starts
+ * (`endsAtCubeStoreTimeout`); a join multiplies what it reads.
+ */
+export function joinsOnRouter(plan: string): boolean {
+  const lines = plan.split('\n').filter((l) => l.trim()).map((l) => ({ depth: l.length - l.trimStart().length, text: l.trim() }));
+  return lines.some((line, i) => {
+    if (!/^(Cross)?Join\b/.test(line.text)) {
+      return false;
+    }
+    // Its ancestors: each line before it less indented than the last one found.
+    for (let k = i - 1, { depth } = line; k >= 0; k--) {
+      if (lines[k].depth < depth) {
+        if (lines[k].text.startsWith('ClusterSend')) {
+          return false;
+        }
+        ({ depth } = lines[k]);
+      }
+    }
+    return true;
+  });
+}
+
+/**
  * Whether Cube Store's own query timeout ends a query, from its logical plan
  * (`EXPLAIN`). A query over its tables runs on a select worker (under
  * `ClusterSend`), whose process Cube Store kills at its timeout. The router
@@ -605,26 +634,13 @@ async function dremioSession(driver: any): Promise<SqlSession> {
  * never yields runs to its end, the timeout with it.
  */
 export function endsAtCubeStoreTimeout(plan: string): boolean {
-  const lines = plan.split('\n').filter((l) => l.trim()).map((l) => ({ depth: l.length - l.trimStart().length, text: l.trim() }));
-  if (!lines.some((l) => l.text.startsWith('ClusterSend'))) {
-    return false;
-  }
-  return lines.every((line, i) => {
-    if (!/^(Cross)?Join\b/.test(line.text)) {
-      return true;
-    }
-    // Its ancestors: each line before it less indented than the last one found.
-    for (let k = i - 1, { depth } = line; k >= 0; k--) {
-      if (lines[k].depth < depth) {
-        if (lines[k].text.startsWith('ClusterSend')) {
-          return true;
-        }
-        ({ depth } = lines[k]);
-      }
-    }
-    return false;
-  });
+  return /^\s*ClusterSend/m.test(plan) && !joinsOnRouter(plan);
 }
+
+/** The refusal of a Cube Store query that joins on its router. */
+export const ROUTER_JOIN_REFUSAL = 'Cube Store\'s router would run this query\'s join itself, and nothing stops that work once it starts, '
+  + 'not even Cube Store\'s own timeout: join Cube Store\'s tables, whose joins run on its select workers, '
+  + 'or read one catalog or system table without a join';
 
 /**
  * Cube Store: a connection of the run's own. It answers every row at once,
@@ -636,15 +652,20 @@ export function endsAtCubeStoreTimeout(plan: string): boolean {
  * (`CUBESTORE_QUERY_TIMEOUT`) stops it. Its answer, on the connection kept
  * open, says when that is.
  */
-async function cubeStoreSession(driver: any): Promise<SqlSession> {
+async function cubeStoreSession(driver: any, refuse: Refuse): Promise<SqlSession> {
   let pending: Promise<any> | null = null;
   let killable = false;
   return {
     async run(sql, rows) {
       if (!/^\s*explain\b/i.test(sql)) {
-        // Its plan says where it runs: only work on select workers ends at Cube Store's timeout.
-        const plan: any = await driver.query(`EXPLAIN ${sql}`, []).catch(() => null);
-        killable = Boolean(plan?.length) && endsAtCubeStoreTimeout(String(plan[0]?.['logical plan'] ?? ''));
+        // Its plan says where it runs: a join on the router is refused; only work on select
+        // workers ends at Cube Store's timeout. A plan that can't be made fails as the query would.
+        const answer: any = await driver.query(`EXPLAIN ${sql}`, []);
+        const plan = String(answer?.[0]?.['logical plan'] ?? '');
+        if (joinsOnRouter(plan)) {
+          refuse(ROUTER_JOIN_REFUSAL, 'select', 'cubestore_router_join');
+        }
+        killable = endsAtCubeStoreTimeout(plan);
       } else {
         killable = true;
       }
@@ -679,7 +700,7 @@ export function openSession(
   dialect: SessionDialect,
   driver: any,
   caps: SqlCaps,
-  refuseBigQuery: (type: string) => never,
+  refuse: Refuse,
 ): Promise<SqlSession> {
   switch (dialect) {
     case 'postgres':
@@ -690,7 +711,7 @@ export function openSession(
     case 'snowflake':
       return snowflakeSession(driver, caps);
     case 'bigquery':
-      return bigquerySession(driver, caps, refuseBigQuery);
+      return bigquerySession(driver, caps, refuse);
     case 'mssql':
       return mssqlSession(driver);
     case 'oracle':
@@ -698,7 +719,7 @@ export function openSession(
     case 'dremio':
       return dremioSession(driver);
     default:
-      return cubeStoreSession(driver);
+      return cubeStoreSession(driver, refuse);
   }
 }
 

@@ -733,6 +733,7 @@ export function initAdminRoutes(
       res.status(status).json({
         error: e.message,
         code: e.code,
+        ...(e.reason ? { reason: e.reason } : {}),
         statement: e.statement,
         redactedSql: e.redactedSql,
         ...(e.durationMs === null ? {} : { durationMs: e.durationMs }),

@@ -754,9 +754,19 @@ cancel). One run per `runId` at a time.
     timeout at all. A cross join of `VALUES` stopped at a 30 s cap computed
     for 37 minutes, and other queries starved.
 
-  xcube reads a Cube Store SELECT's plan (`EXPLAIN`) before running it. A run
-  stopped at its time cap, or cancelled, is answered at once, as `422 timeout`
-  or `cancelled`, with `stillRunning: true` and `endsBy`:
+  xcube reads a Cube Store SELECT's plan (`EXPLAIN`) before running it.
+  - **A join its router would run is refused before it runs:** a join not
+    under a `ClusterSend`, of `VALUES`, of its catalog, or of a table with
+    either. It answers `400 not_read_only` with `reason:
+    "cubestore_router_join"`. Without a join, the router's work grows only
+    with what it reads (Cube Store 1.7.45 has no table functions or recursive
+    CTEs). A huge single expression, such as `repeat('x', 2000000000)`, isn't
+    caught.
+  - A plan Cube Store can't make fails the run as the query would
+    (`query_failed`).
+
+  A run stopped at its time cap, or cancelled, is answered at once, as `422
+  timeout` or `cancelled`, with `stillRunning: true` and `endsBy`:
   - `endsBy` is when Cube Store's timeout ends it at the latest (the run's
     start plus `XCUBE_CUBESTORE_QUERY_TIMEOUT`), for a plan whose joins all
     run on select workers;
@@ -1180,7 +1190,7 @@ none were known yet):
 
 | Status | `code` | |
 | --- | --- | --- |
-| 400 | `not_read_only` | The check refused it; `statement` is its kind (`insert`, `select` …) |
+| 400 | `not_read_only` | The check refused it; `statement` is its kind (`insert`, `select` …). Cube Store's router joins carry `reason: "cubestore_router_join"` |
 | 400 | `several_statements` | |
 | 404 | `unknown_connection`, `unknown_overlay` | |
 | 409 | `run_in_progress` | A run of this `runId` runs |

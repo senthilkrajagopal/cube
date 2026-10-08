@@ -481,6 +481,16 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
       const answer = await admin('post', '/cubestore/sql', { runId: crypto.randomUUID(), sql: refused }).expect(400);
       expect(answer.body.code).toBe('not_read_only');
     }
+    // A join on its router (here, of its catalog) is refused; one catalog table, or a join of its tables, runs.
+    const catalogJoin = await admin('post', '/cubestore/sql', {
+      runId: crypto.randomUUID(), sql: 'SELECT count(*) AS n FROM system.tables a CROSS JOIN system.tables b',
+    }).expect(400);
+    expect(catalogJoin.body).toMatchObject({ code: 'not_read_only', reason: 'cubestore_router_join' });
+    await admin('post', '/cubestore/sql', { runId: crypto.randomUUID(), sql: 'SELECT table_name FROM information_schema.tables' }).expect(200);
+    const tableJoin = await admin('post', '/cubestore/sql', {
+      runId: crypto.randomUUID(), sql: `SELECT count(*) AS n FROM sqlr_${suffix}.t a CROSS JOIN sqlr_${suffix}.t b`,
+    }).expect(200);
+    expect(tableJoin.body.rows).toEqual([['9']]);
     expect((await cubeStore.query(`SELECT count(*) AS n FROM sqlr_${suffix}.t`, []))[0].n).toBe('3');
   });
   /** Runs a slow statement with a run id, and cancels it once the database is on it. */
@@ -532,19 +542,15 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
       expect(answer.body).toMatchObject({ code: 'cancelled', stillRunning: true });
       expect((await state(cancelId)).state).toBe('stopping');
       await untilEnded(cancelId);
-      // A query its router runs (VALUES alone): Cube Store's timeout doesn't end it; stopping, unbounded, until it answers.
+      // A join its router would run (VALUES alone): nothing would stop it, so it is refused before it runs.
       const routerId = crypto.randomUUID();
       const letters = 'abcdefgh'.split('');
       const routed = `WITH t(x) AS (VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10)) SELECT sum(${letters.map((l) => `${l}.x`).join(' + ')}) AS n FROM ${letters.map((l) => `t ${l}`).join(', ')}`;
       const routerStarted = Date.now();
-      const stoppedRouter = await admin('post', '/cubestore/sql', { runId: routerId, sql: routed, timeoutMs: 1000 }).expect(422);
-      expect(stoppedRouter.body).toMatchObject({ code: 'timeout', stillRunning: true, endsBy: null, error: expect.stringMatching(/nothing bounds it/) });
-      expect(await state(routerId, otherServer)).toEqual({ model, runId: routerId, state: 'stopping' });
-      // Past Cube Store's own timeout, and xcube's grace for a bounded one: still stopping.
-      await sleep(Math.max(0, routerStarted + CUBESTORE_TIMEOUT * 1000 + 6000 - Date.now()));
-      expect((await state(routerId)).state).toBe('stopping');
-      const routerEnded = await untilEnded(routerId);
-      expect(routerEnded - routerStarted).toBeGreaterThan(CUBESTORE_TIMEOUT * 1000 + 6000);
+      const refused = await admin('post', '/cubestore/sql', { runId: routerId, sql: routed, timeoutMs: 1000 }).expect(400);
+      expect(refused.body).toMatchObject({ code: 'not_read_only', reason: 'cubestore_router_join', statement: 'select', error: expect.stringMatching(/router/) });
+      expect(Date.now() - routerStarted).toBeLessThan(2000);
+      expect(await state(routerId)).toEqual({ model, runId: routerId, state: 'ended' });
       // A run that answers is ended at once.
       const quick = crypto.randomUUID();
       await admin('post', '/cubestore/sql', { runId: quick, sql: 'SELECT 1 AS n' }).expect(200);

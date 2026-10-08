@@ -2,13 +2,13 @@ import { EventEmitter } from 'events';
 import { Readable } from 'stream';
 
 import {
-  cellOf, endsAtCubeStoreTimeout, openSession, RowCollector, SqlRunError, type SqlCaps,
+  cellOf, endsAtCubeStoreTimeout, joinsOnRouter, openSession, RowCollector, SqlRunError, type SqlCaps,
 } from '../../src/sql/runner';
 import { MAX_RUNS, SqlRuns, type SqlRunRegistry, type SqlTarget } from '../../src/sql/runs';
 
 const caps: SqlCaps = { maxRows: 3, timeoutMs: 30000, maxBytes: 1024 * 1024 };
-const noRefusal = (type: string): never => {
-  throw new Error(`refused ${type}`);
+const noRefusal = (message: string): never => {
+  throw new Error(`refused: ${message}`);
 };
 
 describe('the SQL runner: cells and caps', () => {
@@ -46,6 +46,11 @@ describe('Cube Store\'s plans: which its timeout ends', () => {
     expect(endsAtCubeStoreTimeout('Projection, [n]\n  Aggregate\n    Join on: []\n      SubqueryAlias\n        Scan information_schema.columns, source: InfoSchemaTableProvider(table: Columns)')).toBe(false);
     // A join above its select workers is the router's.
     expect(endsAtCubeStoreTimeout('Projection\n  Join on: []\n    ClusterSend, indices: [[1]]\n      Scan s.t\n    Values')).toBe(false);
+    expect(joinsOnRouter('Projection\n  Join on: []\n    ClusterSend, indices: [[1]]\n      Scan s.t\n    Values')).toBe(true);
+    expect(joinsOnRouter('Projection, [n]\n  Aggregate\n    ClusterSend, indices: [[26], [26]]\n      Join on: []\n        Scan probe.t\n        Scan probe.t')).toBe(false);
+    expect(joinsOnRouter('Projection, [n]\n  Aggregate\n    Join on: []\n      Values\n      Values')).toBe(true);
+    expect(joinsOnRouter('Projection\n  CrossJoin\n    Scan information_schema.tables\n    Scan information_schema.columns')).toBe(true);
+    expect(joinsOnRouter('Projection\n  Scan information_schema.tables')).toBe(false);
     expect(endsAtCubeStoreTimeout('Projection\n  ClusterSend, indices: [[1]]\n    Scan s.t')).toBe(true);
     expect(endsAtCubeStoreTimeout('')).toBe(false);
   });
@@ -122,10 +127,12 @@ describe('the SQL runner: each database\'s session, on drivers shaped as Cube\'s
     expect(rows).toMatchObject({ columns: [{ name: 'a', type: 'INT64' }], rows: [[1], [2], [3]], truncated: 'rows' });
 
     statementType = 'SCRIPT';
-    const refused = await openSession('bigquery', driver, caps, (type) => {
-      throw new SqlRunError('not_read_only', type);
+    const refused = await openSession('bigquery', driver, caps, (message, kind) => {
+      throw new SqlRunError('not_read_only', message, null, kind);
     });
-    await expect(refused.run('SELECT 1; SELECT 2', new RowCollector(3, 1024))).rejects.toMatchObject({ code: 'not_read_only', message: 'SCRIPT' });
+    await expect(refused.run('SELECT 1; SELECT 2', new RowCollector(3, 1024))).rejects.toMatchObject({
+      code: 'not_read_only', message: expect.stringMatching(/as SCRIPT/), statement: 'script',
+    });
   });
 
   test('SQL Server: in a transaction always rolled back; rows as arrays to the cap, then the request cancelled', async () => {
@@ -240,7 +247,8 @@ describe('the SQL runner: each database\'s session, on drivers shaped as Cube\'s
 describe('the SQL runner: runs', () => {
   /** A plan Cube Store runs on a select worker, and one its router runs. */
   const WORKER_PLAN = 'Projection, [n]\n  Aggregate\n    ClusterSend, indices: [[1]]\n      Scan s.t, source: CubeTable';
-  const ROUTER_PLAN = 'Projection, [n]\n  Aggregate\n    Join on: []\n      Values\n      Values';
+  const ROUTER_PLAN = 'Projection, [n]\n  Aggregate\n    Scan information_schema.columns, source: InfoSchemaTableProvider(table: Columns)';
+  const ROUTER_JOIN_PLAN = 'Projection, [n]\n  Aggregate\n    Join on: []\n      Values\n      Values';
   /** A Cube Store-shaped driver: answers its plan, then every row at once, or waits until let go. */
   const cubeStoreTarget = (answer: () => Promise<any[]>, secrets: string[] = [], plan = WORKER_PLAN): SqlTarget & { released: jest.Mock; sent: string[] } => {
     const released = jest.fn();
@@ -436,6 +444,18 @@ describe('the SQL runner: runs', () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(await runs.state('m', 'r1')).toEqual({ state: 'ended' });
   }, 15000);
+
+  test('a query that would join on Cube Store\'s router is refused before it runs, with its reason', async () => {
+    const target = cubeStoreTarget(async () => [], [], ROUTER_JOIN_PLAN);
+    const runs = new SqlRuns('here', () => null, () => undefined);
+    await expect(runs.run('m', target, request({ runId: 'j1', sql: 'SELECT 1' }))).rejects.toMatchObject({
+      code: 'not_read_only', reason: 'cubestore_router_join', statement: 'select', redactedSql: 'SELECT ?', message: expect.stringMatching(/router/),
+    });
+    expect(target.sent).toEqual([]);
+    // Its own EXPLAIN only plans: answered, not refused.
+    const explained = await runs.run('m', target, request({ runId: 'j2', sql: 'EXPLAIN SELECT 1' }));
+    expect(explained).toMatchObject({ statement: 'explain', rowCount: 1, columns: [{ name: 'logical plan', type: null }] });
+  });
 
   test('one run per id, and at most so many at once on an instance', async () => {
     const runs = new SqlRuns('here', () => null, () => undefined);

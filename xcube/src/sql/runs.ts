@@ -185,8 +185,8 @@ export class SqlRuns {
     try {
       try {
         built = await target.build(caps);
-        session = await withTimeout(openSession(dialect, built.driver, caps, (type) => {
-          throw fail('not_read_only', `BigQuery's dry run reads the statement as ${type}: only a SELECT runs here`);
+        session = await withTimeout(openSession(dialect, built.driver, caps, (message, kind, why) => {
+          throw new SqlRunError('not_read_only', message, redactedSql, kind, null, null, null, why ?? null);
         }), CONNECT_MS, 'Connecting');
       } catch (e: any) {
         if (reason) {
