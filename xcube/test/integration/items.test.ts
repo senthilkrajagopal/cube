@@ -179,6 +179,19 @@ describeWithDatabase('xcube items and changesets', () => {
     expect(ordersMeta.meta).toEqual({ xcube: { folderId: 'froot', shortName: 'orders' } });
   });
 
+  test('the revision and refresh-worker routes say whether this instance answers the model in rollup-only mode', async () => {
+    expect((await admin.get('/revision').expect(200)).body.rollupOnly).toBe(false);
+    expect((await admin.get('/refresh-worker').expect(200)).body.rollupOnly).toBe(false);
+    process.env.CUBEJS_ROLLUP_ONLY = 'true';
+    try {
+      expect((await admin.get('/revision').expect(200)).body.rollupOnly).toBe(true);
+      expect((await admin.get('/refresh-worker').expect(200)).body.rollupOnly).toBe(true);
+    } finally {
+      delete process.env.CUBEJS_ROLLUP_ONLY;
+    }
+    expect((await admin.get('/revision').expect(200)).body.rollupOnly).toBe(false);
+  });
+
   const big = (folderId = 'fsales') => orders(folderId, '      - name: big\n        sql: total_amount\n        type: max', 'big_orders');
 
   test('a changeset adds a folder\'s cube under its own name, referring up its path', async () => {

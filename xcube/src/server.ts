@@ -6,6 +6,7 @@ import {
   type OrchestratorApiOptions,
 } from '@cubejs-backend/server-core';
 import type { ApiGatewayOptions } from '@cubejs-backend/api-gateway';
+import { getEnv } from '@cubejs-backend/shared';
 import type { DriverFactoryByDataSource } from '@cubejs-backend/query-orchestrator';
 // Only a type in the package's index: the class is needed to read its protected cache.
 import { OrchestratorStorage } from '@cubejs-backend/server-core/dist/src/core/OrchestratorStorage';
@@ -51,6 +52,16 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
    */
   public get xcube(): XcubeRuntime | undefined {
     return runtimeOf(this.options) ?? globalRuntime();
+  }
+
+  /**
+   * Whether a context's orchestrator runs in rollup-only mode, as Cube
+   * resolves it (`OptsHandler.getOrchestratorInitializedOptions`): its
+   * `orchestratorOptions.rollupOnlyMode`, else `CUBEJS_ROLLUP_ONLY`.
+   */
+  public async rollupOnlyFor(context: any): Promise<boolean> {
+    const given: any = (await this.orchestratorOptions(context)) || {};
+    return given.rollupOnlyMode !== undefined ? Boolean(given.rollupOnlyMode) : Boolean(getEnv('rollupOnlyMode'));
   }
 
   protected override createOrchestratorApi(getDriver: DriverFactoryByDataSource, options: OrchestratorApiOptions): OrchestratorApi {

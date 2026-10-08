@@ -1178,10 +1178,11 @@ queue with others). Oldest first:
 #### `GET …/refresh-worker`
 
 Each refresh worker's last run of each module of the model, as it recorded it
-(within 5 s of the run), and the model's current revision:
+(within 5 s of the run), the model's current revision, and `rollupOnly` as
+`GET …/revision` gives it:
 
 ```json
-{ "model": "dev", "revision": 12, "workers": [{
+{ "model": "dev", "revision": 12, "rollupOnly": false, "workers": [{
   "instance": "worker-1/1/3dfa66", "revision": 12, "servedKey": "xcube:dev:12:…",
   "lastTickAt": "…", "modules": [{
     "module": "m1a2b3c4d5e", "revision": 12, "lastTickAt": "…", "finished": true,
@@ -1472,6 +1473,13 @@ draft's name is free).
 
 `instance` is what the answering process serves: `active`, `activating`,
 `failed` (with `error`) or `none`. `404` when there is no such model.
+
+`rollupOnly` says whether the answering process answers the model's queries
+in rollup-only mode: its `orchestratorOptions.rollupOnlyMode` for the model,
+else `CUBEJS_ROLLUP_ONLY`, as Cube resolves it. Cube itself reports it
+nowhere. Instances may differ: it is the answering one's. `null` where no
+Cube is attached. In that mode, a query no pre-aggregation serves is refused
+with *No pre-aggregation table has been built for this query yet*.
 
 ## Introspection API
 

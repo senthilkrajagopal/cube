@@ -103,6 +103,8 @@ export interface ServingCore {
   xcubeGateway(): { sql(request: any): Promise<void> };
   /** A Cube Store driver of the caller's own, from Cube's settings; `null` without Cube Store. */
   cubeStoreDriver?(): Promise<any>;
+  /** Whether a context's orchestrator runs in rollup-only mode. */
+  rollupOnlyFor?(context: any): Promise<boolean>;
   logger: (message: string, params?: any) => void;
 }
 
@@ -3411,7 +3413,24 @@ export class XcubeRuntime {
         id: m.id, version: m.version, cubes: m.members.length, copies: m.copies.length,
       }))
       : undefined;
-    return { ...status, ...(modules ? { modules } : {}), instance: this.instanceStatus(model) as InstanceModelStatus };
+    return {
+      ...status,
+      ...(modules ? { modules } : {}),
+      instance: this.instanceStatus(model) as InstanceModelStatus,
+      rollupOnly: await this.rollupOnly(model),
+    };
+  }
+
+  /**
+   * Whether this instance answers the model's queries in rollup-only mode
+   * (`CUBEJS_ROLLUP_ONLY`, or its orchestrator options), as it resolves them
+   * for the model; `null` where no Cube is attached. Cube itself never says.
+   */
+  public async rollupOnly(model: string): Promise<boolean | null> {
+    if (!this.core?.rollupOnlyFor) {
+      return null;
+    }
+    return this.core.rollupOnlyFor({ securityContext: { [this.servingOptions.modelClaim]: model }, requestId: `xcube-admin-${crypto.randomUUID()}` });
   }
 
   /**

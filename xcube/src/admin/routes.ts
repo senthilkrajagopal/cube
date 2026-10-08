@@ -601,7 +601,7 @@ export function initAdminRoutes(
     const model = modelOf(req);
     const status = await requireModel(model);
     const workers = await runtime.refreshWorkers(model);
-    res.json({ model, revision: status.current?.revision ?? null, workers });
+    res.json({ model, revision: status.current?.revision ?? null, rollupOnly: status.rollupOnly, workers });
   }));
 
   app.post(`${base}/changesets`, auth, json, handle('changesets', async (req, res) => {
