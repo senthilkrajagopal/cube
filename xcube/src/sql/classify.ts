@@ -385,10 +385,15 @@ function nest(tokens: Token[], length: number) {
   }
 }
 
+const isWord = (t: Token | undefined, ...values: string[]) => t?.kind === 'word' && (values.length === 0 || values.includes(t.value));
+const isOp = (t: Token | undefined, value: string) => t?.kind === 'op' && t.value === value;
+
 /** The statement with its literals as `?` and its comments out. */
 function redactWith(sql: string, lexed: Lexed): string {
   const spans: { start: number; end: number; with: string }[] = [
-    ...lexed.tokens.filter((t) => t.kind === 'string' || t.kind === 'number').map((t) => ({ start: t.start, end: t.end, with: '?' })),
+    // A bound parameter's place (`$1`) is no literal.
+    ...lexed.tokens.filter((t, k) => t.kind === 'string' || (t.kind === 'number' && !(isOp(lexed.tokens[k - 1], '$') && lexed.tokens[k - 1].end === t.start)))
+      .map((t) => ({ start: t.start, end: t.end, with: '?' })),
     ...lexed.comments.map(([start, end]) => ({ start, end, with: ' ' })),
   ].sort((a, b) => a.start - b.start);
   let out = '';
@@ -421,9 +426,6 @@ export function redactSql(sql: string, dialect: SqlDialect): string {
     throw e;
   }
 }
-
-const isWord = (t: Token | undefined, ...values: string[]) => t?.kind === 'word' && (values.length === 0 || values.includes(t.value));
-const isOp = (t: Token | undefined, value: string) => t?.kind === 'op' && t.value === value;
 
 /** A name's forms a database could match a keyword by. */
 function wordForms(word: string): string[] {
@@ -587,6 +589,127 @@ export function classifySql(sql: string, dialect: SqlDialect): ClassifiedSql {
   }
   const run = (primary.cut === null ? sql : sql.slice(0, primary.cut)).trim();
   return { statement: primary.statement, sql: run, redactedSql: redactSql(run, dialect) };
+}
+
+/** A parameter written into a statement's code as `{{name}}`, with its span. */
+export interface Placeholder {
+  name: string;
+  start: number;
+  end: number;
+}
+
+/** Why a statement's parameters can't be taken: what the client can show. */
+export type ParameterRefusal = 'missing_value' | 'unused_value' | 'malformed_placeholder' | 'placeholder_written' | 'invalid_value';
+
+/** A statement whose parameters can't be taken, and why. */
+export class ParameterError extends Error {
+  public constructor(public readonly reason: ParameterRefusal, message: string, public readonly redactedSql: string) {
+    super(message);
+  }
+}
+
+/** A parameter's name: ASCII letters, digits and underscores, not starting with a digit. */
+export const PARAMETER_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** A placeholder written by hand in a statement's code, as the database's driver would bind it: its text, or nothing. */
+function writtenPlaceholder(dialect: SqlDialect, tokens: Token[], k: number): string | null {
+  const t = tokens[k];
+  const next = tokens[k + 1];
+  const prev = tokens[k - 1];
+  const touches = (a: Token | undefined, b: Token | undefined) => Boolean(a && b && a.end === b.start);
+  if (t.kind !== 'op') {
+    return null;
+  }
+  switch (dialect) {
+    case 'postgres':
+    case 'redshift':
+      return t.value === '$' && next?.kind === 'number' && touches(t, next) ? `$${next.value}` : null;
+    case 'mysql':
+      return t.value === '?' ? '?' : null;
+    case 'snowflake':
+      if (t.value === '?') {
+        return '?';
+      }
+      // `:1`, never the `::` of a cast nor a path's `v:field`.
+      return t.value === ':' && next?.kind === 'number' && touches(t, next) && !(isOp(prev, ':') && touches(prev, t)) ? `:${next.value}` : null;
+    case 'bigquery':
+      if (t.value === '?') {
+        return '?';
+      }
+      return t.value === '@' && next?.kind === 'word' && touches(t, next) && !(isOp(prev, '@') && touches(prev, t)) ? `@${next.value.toLowerCase()}` : null;
+    case 'mssql':
+      // `@name`, never `@@VERSION` and the like.
+      return t.value === '@' && (next?.kind === 'word' || next?.kind === 'quoted') && touches(t, next) && !(isOp(prev, '@') && touches(prev, t))
+        && !isOp(next, '@') ? `@${next.value.toLowerCase()}` : null;
+    case 'oracle':
+      return t.value === ':' && (next?.kind === 'word' || next?.kind === 'number') && touches(t, next) ? `:${next.value.toLowerCase()}` : null;
+    default:
+      return null;
+  }
+}
+
+/** One reading's placeholders, refusing a malformed `{{…}}` and a placeholder written by hand. */
+function placeholdersIn(sql: string, dialect: SqlDialect, reading: Reading, redacted: () => string): Placeholder[] {
+  const { tokens } = lex(sql, RULES[dialect], reading);
+  const found: Placeholder[] = [];
+  const blank = (from: number, to: number) => /^\s*$/.test(sql.slice(from, to));
+  for (let k = 0; k < tokens.length; k++) {
+    const t = tokens[k];
+    if (isOp(t, '{') && isOp(tokens[k + 1], '{') && tokens[k + 1].start === t.end) {
+      const [, word, close, again] = tokens.slice(k + 1, k + 5);
+      const name = word?.kind === 'word' ? sql.slice(word.start, word.end) : '';
+      if (!PARAMETER_NAME.test(name) || !blank(tokens[k + 1].end, word.start) || !isOp(close, '}') || !isOp(again, '}')
+        || again.start !== close.end || !blank(word.end, close.start)) {
+        throw new ParameterError(
+          'malformed_placeholder',
+          'A {{…}} in the statement isn\'t a parameter: write {{name}}, the name letters, digits and underscores, not starting with a digit',
+          redacted(),
+        );
+      }
+      found.push({ name, start: t.start, end: again.end });
+      k += 4;
+    } else {
+      const written = writtenPlaceholder(dialect, tokens, k);
+      if (written) {
+        throw new ParameterError(
+          'placeholder_written',
+          `The statement holds ${written}, a placeholder of the database's own: with parameters, write each as {{name}}`,
+          redacted(),
+        );
+      }
+    }
+  }
+  return found;
+}
+
+/**
+ * The `{{name}}` parameters in a statement's code: never in its strings,
+ * comments or quoted names, read as the database's lexer reads them, and the
+ * same in every reading. Throws `ParameterError` for a malformed one and a
+ * placeholder of the database's own written by hand; `SqlRefusal` for a
+ * statement that can't be read.
+ */
+export function placeholdersOf(sql: string, dialect: SqlDialect): Placeholder[] {
+  const rules = RULES[dialect];
+  let redactedSql: string | undefined;
+  const redacted = () => {
+    redactedSql ??= redactSql(sql, dialect);
+    return redactedSql;
+  };
+  let results: Placeholder[][];
+  try {
+    results = rules.readings.map((reading) => placeholdersIn(sql, dialect, reading, redacted));
+  } catch (e) {
+    if (e instanceof LexError) {
+      throw new SqlRefusal('not_read_only', `xcube can't read the statement: ${e.message}`, null, redacted());
+    }
+    throw e;
+  }
+  const [primary] = results;
+  if (results.some((r) => JSON.stringify(r) !== JSON.stringify(primary))) {
+    throw new SqlRefusal('not_read_only', 'xcube can\'t read the statement one way: it reads differently as this database may be set', null, redacted());
+  }
+  return primary;
 }
 
 /**

@@ -644,4 +644,74 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
     expect(stop.code).toBe('cancelled');
     expect(stop.ms).toBeLessThan(5000);
   });
+
+  describe('bound parameters: an injection string bound as Text comes back as data, the statement unchanged', () => {
+    const INJECTION = '\'; DROP TABLE x; --';
+    const parameters = {
+      t: { type: 'text', value: INJECTION },
+      n: { type: 'number', value: '41.5' },
+      d: { type: 'date', value: '2026-02-28' },
+      b: { type: 'boolean', value: true },
+    };
+    // `hits` compares against the value: one row, 0, had it ended the statement there'd be none, or an error.
+    const bound = async (name: string, statement: string) => {
+      const res = await run(name, { sql: statement, parameters });
+      expect({ status: res.status, error: res.body.error }).toEqual({ status: 200, error: undefined });
+      expect(JSON.stringify(res.body.redactedSql)).not.toContain('DROP');
+      return res.body;
+    };
+
+    test('PostgreSQL', async () => {
+      const count = async () => (await run('default', { sql: `SELECT count(*) FROM ${warehouse}.orders` }).expect(200)).body.rows;
+      const before = await count();
+      const body = await bound('default', `SELECT {{t}} AS v, {{n}} + 1 AS n, {{d}} AS d, {{b}} AS b,
+        (SELECT count(*) FROM ${warehouse}.orders WHERE customer = {{t}}) AS hits`);
+      expect(body.rows).toEqual([[INJECTION, '42.5', expect.stringMatching(/^2026-02-28/), true, '0']]);
+      expect(body.redactedSql).toContain('$1::text');
+      // The table read is as it was.
+      expect(await count()).toEqual(before);
+      const refused = await run('default', { sql: 'SELECT {{t}}, {{u}}', parameters: { t: parameters.t } }).expect(400);
+      expect(refused.body).toMatchObject({ code: 'invalid_parameters', reason: 'missing_value', error: '{{u}} has no value' });
+      const written = await run('default', { sql: 'SELECT $1, {{t}}', parameters: { t: parameters.t } }).expect(400);
+      expect(written.body).toMatchObject({ code: 'invalid_parameters', reason: 'placeholder_written' });
+      expect((await run('default', { sql: 'SELECT {{t}}', parameters: { 'not-a-name': parameters.t } }).expect(400)).body.code).toBe('bad_request');
+    });
+
+    (MYSQL ? test : test.skip)('MySQL, through a prepared statement, its rows still streamed as arrays', async () => {
+      const body = await bound('mysql', `SELECT {{t}} AS v, {{n}} + 1 AS n, {{d}} AS d, {{b}} AS b,
+        (SELECT count(*) FROM (SELECT 'a' AS name UNION ALL SELECT 'b') AS v WHERE name = {{t}}) AS hits`);
+      // A bound Boolean is 1, a LONGLONG, and big numbers come as strings.
+      expect(body.rows).toEqual([[INJECTION, '42.5', expect.stringMatching(/^2026-02-28/), '1', '0']]);
+      // Streamed to the cap, as `query` streams.
+      const capped = await run('mysql', {
+        sql: 'SELECT n FROM (SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3) AS t WHERE n > {{n}} - 41.5 ORDER BY n',
+        parameters: { n: parameters.n },
+        maxRows: 1,
+      }).expect(200);
+      expect(capped.body).toMatchObject({ rows: [['1']], truncated: 'rows' });
+    });
+
+    (MSSQL ? test : test.skip)('SQL Server', async () => {
+      const body = await bound('mssql', `SELECT {{t}} AS v, {{n}} + 1 AS n, {{d}} AS d, {{b}} AS b,
+        (SELECT count(*) FROM (VALUES ('a'), ('b')) AS v(name) WHERE name = {{t}}) AS hits`);
+      // Its driver answers a DECIMAL, and the count, as strings.
+      expect(body.rows).toEqual([[INJECTION, '42.5', expect.stringMatching(/^2026-02-28/), true, '0']]);
+    });
+
+    (ORACLE ? test : test.skip)('Oracle, a Boolean included (23ai)', async () => {
+      const body = await bound('oracle', `SELECT {{t}} AS v, {{n}} + 1 AS n, {{d}} AS d, {{b}} AS b,
+        (SELECT count(*) FROM (SELECT 'a' AS name FROM dual UNION ALL SELECT 'b' FROM dual) WHERE name = {{t}}) AS hits FROM dual`);
+      expect(body.rows).toEqual([[INJECTION, 42.5, expect.stringMatching(/^2026-02-2[78]/), true, 0]]);
+    });
+
+    (DREMIO_URL ? test : test.skip)('Dremio takes no bound values', async () => {
+      const refused = await run('dremio', { sql: 'SELECT {{t}}', parameters: { t: parameters.t } }).expect(400);
+      expect(refused.body).toMatchObject({ code: 'parameters_unsupported', reason: 'dremio', error: 'Dremio takes no bound values: run the statement without parameters' });
+    });
+
+    (CUBESTORE ? test : test.skip)('Cube Store takes no bound values', async () => {
+      const refused = await admin('post', '/cubestore/sql', { runId: crypto.randomUUID(), sql: 'SELECT {{t}}', parameters: { t: parameters.t } }).expect(400);
+      expect(refused.body).toMatchObject({ code: 'parameters_unsupported', reason: 'cubestore' });
+    });
+  });
 });

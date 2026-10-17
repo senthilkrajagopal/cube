@@ -30,6 +30,7 @@ import { ConnectionError } from '../connections/connections';
 import { CredentialError } from '../credentials/credentials';
 import { MODEL_ID, SnapshotError } from '../model/snapshot';
 import { checkDataSourceName } from '../names/items';
+import { PARAMETER_NAME } from '../sql/classify';
 import type { QueueEntry } from '../gateway';
 import { SqlRunError, type SqlFailure } from '../sql/runner';
 import { adminAuth } from './auth';
@@ -203,6 +204,14 @@ const sqlSchema = Joi.object({
     .default(10 * 1024 * 1024),
   // BigQuery only: its job fails, without charge, past this many bytes billed.
   maxBytesBilled: Joi.number().integer().min(1).max(Number.MAX_SAFE_INTEGER),
+  // `{{name}}`'s values, bound, never written into the SQL; each checked against its type when the run binds it.
+  parameters: Joi.object().pattern(
+    Joi.string().pattern(PARAMETER_NAME).max(64),
+    Joi.object({
+      type: Joi.string().valid('text', 'number', 'date', 'boolean').required(),
+      value: Joi.alternatives(Joi.string().max(100000), Joi.boolean()).required(),
+    }),
+  ).max(100),
 });
 
 const sqlCancelSchema = Joi.object({
@@ -213,6 +222,8 @@ const sqlCancelSchema = Joi.object({
 const SQL_STATUS: Record<SqlFailure, number> = {
   not_read_only: 400,
   several_statements: 400,
+  invalid_parameters: 400,
+  parameters_unsupported: 400,
   unknown_connection: 404,
   unknown_overlay: 404,
   run_in_progress: 409,

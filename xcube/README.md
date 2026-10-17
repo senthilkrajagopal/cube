@@ -1282,8 +1282,35 @@ Runs read-only SQL on a stored connection (see SQL runner). With
 `?overlay={id}`, on that overlay's own data source of that name instead.
 
 ```json
-{ "sql": "SELECT …", "runId": "<uuid>", "maxRows": 10000, "timeoutMs": 30000, "maxBytes": 10485760 }
+{ "sql": "SELECT … WHERE region = {{region}} AND placed > {{since}}", "runId": "<uuid>", "maxRows": 10000, "timeoutMs": 30000, "maxBytes": 10485760,
+  "parameters": { "region": { "type": "text", "value": "EU" }, "since": { "type": "date", "value": "2026-01-01" } } }
 ```
+
+**Bound parameters** (`parameters`, optional, at most 100). Each `{{name}}`
+in the statement's code (`{{ name }}` too; a name of ASCII letters, digits
+and `_`, not starting with a digit, case-sensitive) is bound to its value,
+never written into the SQL.
+- **Finding them.** xcube finds them with the database's own lexer, never in
+  a string, a comment or a quoted name.
+- **What runs.** It writes placeholders of its own in their places, each
+  between spaces and typed:
+  - PostgreSQL and Redshift: `$1::numeric`;
+  - MySQL and Snowflake: `?`, cast where typed;
+  - SQL Server: `@p1`, `CAST(@p1 AS DECIMAL(38, 2))`;
+  - Oracle: `:p1`, `TO_NUMBER`/`TO_DATE` where typed;
+  - BigQuery: `@p1`, with its `types` on the dry run and the job.
+
+  The read-only check reads the statement as it runs, so `redactedSql` is
+  that, values left out. The values are never logged.
+- **Values:**
+  - `text`, a string;
+  - `number`, a decimal string of at most 38 digits, at most 30 after the
+    point;
+  - `date`, `YYYY-MM-DD`;
+  - `boolean`, `true` or `false`.
+- **Without `parameters`,** `{{…}}` is the statement's own text, as before.
+- **Where binding isn't proven:** Dremio and Cube Store take none
+  (`400 parameters_unsupported`). Oracle takes a Boolean only from 23ai.
 
 → `200`:
 
@@ -1309,6 +1336,8 @@ none were known yet):
 | --- | --- | --- |
 | 400 | `not_read_only` | The check refused it; `statement` is its kind (`insert`, `select` …). Cube Store's router joins carry `reason: "cubestore_router_join"` |
 | 400 | `several_statements` | |
+| 400 | `invalid_parameters` | `reason`: `missing_value`, `unused_value`, `malformed_placeholder`, `placeholder_written` (a `$1`, `?`, `@x` or `:x` written by hand), `invalid_value` |
+| 400 | `parameters_unsupported` | `reason`: `dremio`, `cubestore`, `oracle_boolean` |
 | 404 | `unknown_connection`, `unknown_overlay` | |
 | 409 | `run_in_progress` | A run of this `runId` runs |
 | 422 | `timeout`, `cancelled` | Stopped |

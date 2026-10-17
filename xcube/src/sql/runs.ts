@@ -1,7 +1,10 @@
 import { redact } from '../connections/connections';
 import {
-  classifySql, SqlRefusal, withRowCap, type SqlDialect,
+  classifySql, ParameterError, redactSql, SqlRefusal, withRowCap, type SqlDialect,
 } from './classify';
+import {
+  bindParameters, UNBOUND_DIALECTS, type SqlBind, type SqlParameter,
+} from './parameters';
 import {
   isTimeout, openSession, RowCollector, SqlRunError, type SessionDialect, type SqlAnswer, type SqlCaps, type SqlRows, type SqlSession,
 } from './runner';
@@ -18,6 +21,8 @@ export interface SqlTarget {
 export interface SqlRunRequest extends SqlCaps {
   sql: string;
   runId: string;
+  /** `{{name}}`'s values, bound, never written into the SQL (`parameters.ts`); absent, `{{…}}` is the SQL's own text. */
+  parameters?: Record<string, SqlParameter>;
 }
 
 /** Where runs are noted while they run, so that a cancel reaches the instance running one. */
@@ -109,8 +114,22 @@ export class SqlRuns {
     };
     let classified: ReturnType<typeof classifySql>;
     let sql: string;
+    let binds: SqlBind[] = [];
     try {
-      classified = classifySql(request.sql, dialect as SqlDialect);
+      let text = request.sql;
+      if (request.parameters) {
+        if (UNBOUND_DIALECTS.has(dialect as SqlDialect) && Object.keys(request.parameters).length) {
+          throw new SqlRunError(
+            'parameters_unsupported',
+            `${dialect === 'dremio' ? 'Dremio' : 'Cube Store'} takes no bound values: run the statement without parameters`,
+            redactSql(request.sql, dialect as SqlDialect),
+            null, null, null, null, dialect,
+          );
+        }
+        // The statement as it runs, xcube's placeholders in its {{name}}s' places: what the check reads.
+        ({ sql: text, binds } = bindParameters(request.sql, dialect as SqlDialect, request.parameters));
+      }
+      classified = classifySql(text, dialect as SqlDialect);
       // Cube Store answers every row at once: asked for one more than the cap.
       sql = dialect === 'cubestore' && classified.statement === 'select'
         ? withRowCap(classified.sql, 'cubestore', request.maxRows + 1)
@@ -118,6 +137,9 @@ export class SqlRuns {
     } catch (e) {
       if (e instanceof SqlRefusal) {
         throw new SqlRunError(e.code, e.message, e.redactedSql, e.statement);
+      }
+      if (e instanceof ParameterError) {
+        throw new SqlRunError('invalid_parameters', e.message, e.redactedSql, null, null, null, null, e.reason);
       }
       throw e;
     }
@@ -197,13 +219,17 @@ export class SqlRuns {
       if (reason) {
         throw stopped(null, none);
       }
+      const unbindable = binds.length ? session.unbindable?.(binds) : null;
+      if (unbindable) {
+        throw new SqlRunError('parameters_unsupported', unbindable, redactedSql, statement, null, null, null, `${dialect}_boolean`);
+      }
 
       const ranAt = Date.now();
       const clock = setTimeout(() => stop('timeout'), request.timeoutMs + CLOCK_GRACE_MS);
       clock.unref?.();
       const rows = new RowCollector(request.maxRows, request.maxBytes);
       try {
-        await Promise.race([session.run(sql, rows), abandoned]);
+        await Promise.race([session.run(sql, rows, binds), abandoned]);
       } catch (e: any) {
         if (e instanceof SqlRunError) {
           throw e;

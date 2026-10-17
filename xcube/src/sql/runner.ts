@@ -17,6 +17,7 @@
  *   for one row more than the cap.
  */
 import type { StatementKind } from './classify';
+import type { SqlBind } from './parameters';
 
 export interface SqlColumn {
   name: string;
@@ -48,7 +49,7 @@ export interface SqlAnswer extends SqlRows {
 
 /** How a run failed: refused, stopped, or failed on the database. */
 export type SqlFailure = 'not_read_only' | 'several_statements' | 'timeout' | 'cancelled' | 'connect_failed' | 'query_failed'
-  | 'unknown_connection' | 'unknown_overlay' | 'run_in_progress' | 'busy';
+  | 'unknown_connection' | 'unknown_overlay' | 'run_in_progress' | 'busy' | 'invalid_parameters' | 'parameters_unsupported';
 
 export class SqlRunError extends Error {
   public constructor(
@@ -154,9 +155,11 @@ export class RowCollector {
   }
 }
 
-/** A run's connection: the statement run on it, stopped on the database, and let go. */
+/** A run's connection: the statement run on it, with its binds, stopped on the database, and let go. */
 export interface SqlSession {
-  run(sql: string, rows: RowCollector): Promise<void>;
+  run(sql: string, rows: RowCollector, binds?: SqlBind[]): Promise<void>;
+  /** Why this connection can't bind these values, if it can't (an Oracle before 23ai, a Boolean). */
+  unbindable?(binds: SqlBind[]): string | null;
   /** Stops the statement on the database, as far as it can; never throws. */
   cancel(): Promise<void>;
   /** Where the database can't stop a statement (Cube Store): resolves once it has really ended; never rejects. */
@@ -210,8 +213,10 @@ async function pgSession(driver: any, dialect: 'postgres' | 'redshift', caps: Sq
     throw e;
   }
   return {
-    async run(sql, rows) {
-      const cursor = client.query(new Cursor(sql, [], { rowMode: 'array', types: { getTypeParser: driver.getTypeParser } }));
+    async run(sql, rows, binds = []) {
+      // `$n` is the n-th: each typed in the SQL (`$1::numeric`), its value text or a boolean.
+      const values = binds.map((b) => b.value);
+      const cursor = client.query(new Cursor(sql, values, { rowMode: 'array', types: { getTypeParser: driver.getTypeParser } }));
       const columnsOf = (result: any) => {
         if (!rows.columns.length && result?.fields) {
           rows.setColumns(result.fields.map((f: any) => ({
@@ -302,9 +307,14 @@ async function mysqlSession(driver: any, caps: SqlCaps): Promise<SqlSession> {
     }
   };
   return {
-    run(sql, rows) {
+    run(sql, rows, binds = []) {
       return new Promise<void>((resolve, reject) => {
-        const query = conn.query({ sql, rowsAsArray: true, supportBigNumbers: true, bigNumberStrings: true });
+        // With values, a prepared statement: the server binds them. It streams as `query` does. Cube's driver
+        // puts a promise of `query` in `execute`'s place (MySqlDriver.ts): mysql2's own is its prototype's.
+        const options = { sql, rowsAsArray: true, supportBigNumbers: true, bigNumberStrings: true };
+        const query = binds.length
+          ? Object.getPrototypeOf(conn).execute.call(conn, { ...options, values: binds.map((b) => b.value) })
+          : conn.query(options);
         query.on('fields', (fields: any[]) => {
           if (Array.isArray(fields)) {
             rows.setColumns(fields.map((f) => ({ name: f.name, type: Types[f.columnType ?? f.type] ?? null })));
@@ -346,10 +356,12 @@ async function snowflakeSession(driver: any, caps: SqlCaps): Promise<SqlSession>
   const conn = await driver.getConnection();
   let statement: any = null;
   return {
-    run(sql, rows) {
+    run(sql, rows, binds = []) {
       return new Promise<void>((resolve, reject) => {
         statement = conn.execute({
           sqlText: sql,
+          // `?` by position, each cast in the SQL to its type (`?::NUMBER(38, 2)`).
+          ...(binds.length ? { binds: binds.map((b) => b.value) } : {}),
           streamResult: true,
           rowMode: 'array',
           fetchAsString: ['Number', 'Date'],
@@ -388,6 +400,15 @@ async function snowflakeSession(driver: any, caps: SqlCaps): Promise<SqlSession>
   };
 }
 
+/** A value's BigQuery type: NUMERIC holds 29 digits before the point and 9 after; BIGNUMERIC, the rest. */
+function bigQueryType(bind: SqlBind): string {
+  if (bind.type !== 'number') {
+    return { text: 'STRING', date: 'DATE', boolean: 'BOOL' }[bind.type];
+  }
+  const [whole, part = ''] = String(bind.value).replace('-', '').split('.');
+  return whole.length <= 29 && part.length <= 9 ? 'NUMERIC' : 'BIGNUMERIC';
+}
+
 /**
  * BigQuery: a dry run first, which must call the statement a SELECT; then
  * the job, with `jobTimeoutMs` (and `maximumBytesBilled` when asked), its
@@ -398,8 +419,15 @@ async function bigquerySession(driver: any, caps: SqlCaps, refuse: Refuse): Prom
   const location = driver.options?.location;
   let job: any = null;
   return {
-    async run(sql, rows) {
-      const [dry] = await bq.createQueryJob({ query: sql, dryRun: true, useLegacySql: false, location });
+    async run(sql, rows, binds = []) {
+      // Named `@p1`, each with its type: on the dry run too, which must see the statement as it runs.
+      const bound = binds.length ? {
+        params: Object.fromEntries(binds.map((b) => [b.id, b.value])),
+        types: Object.fromEntries(binds.map((b) => [b.id, bigQueryType(b)])),
+      } : {};
+      const [dry] = await bq.createQueryJob({
+        query: sql, dryRun: true, useLegacySql: false, location, ...bound,
+      });
       const type = dry?.metadata?.statistics?.query?.statementType;
       if (type !== 'SELECT') {
         refuse(`BigQuery's dry run reads the statement as ${String(type ?? 'unknown')}: only a SELECT runs here`, String(type ?? 'unknown').toLowerCase());
@@ -408,6 +436,7 @@ async function bigquerySession(driver: any, caps: SqlCaps, refuse: Refuse): Prom
         query: sql,
         useLegacySql: false,
         location,
+        ...bound,
         jobTimeoutMs: String(caps.timeoutMs),
         ...(caps.maxBytesBilled ? { maximumBytesBilled: String(caps.maxBytesBilled) } : {}),
       });
@@ -435,6 +464,9 @@ async function bigquerySession(driver: any, caps: SqlCaps, refuse: Refuse): Prom
   };
 }
 
+// eslint-disable-next-line global-require
+const mssqlTypes = () => require('mssql');
+
 /**
  * SQL Server: the run's own pool of one, `requestTimeout`, the statement in a
  * transaction that is always rolled back; its rows streamed to the cap.
@@ -450,13 +482,17 @@ async function mssqlSession(driver: any): Promise<SqlSession> {
   }
   let request: any = null;
   return {
-    run(sql, rows) {
+    run(sql, rows, binds = []) {
       return new Promise<void>((resolve, reject) => {
         let stopped = false;
         let sets = 0;
         request = transaction.request();
         request.stream = true;
         request.arrayRowMode = true;
+        // Named `@p1`: text as NVARCHAR (a number or a date cast in the SQL), a boolean as BIT.
+        for (const bind of binds) {
+          request.input(bind.id, bind.type === 'boolean' ? mssqlTypes().Bit : mssqlTypes().NVarChar(mssqlTypes().MAX), bind.value);
+        }
         // The request ends once SQL Server takes the cancel: only then may the transaction roll back.
         const stop = () => {
           stopped = true;
@@ -516,8 +552,18 @@ async function oracleSession(driver: any, caps: SqlCaps): Promise<SqlSession> {
     throw e;
   }
   return {
-    async run(sql, rows) {
-      const result = await conn.execute(sql, [], {
+    unbindable(binds) {
+      // A boolean binds into SQL only from Oracle Database 23ai, whose SQL has BOOLEAN.
+      return binds.some((b) => b.type === 'boolean') && Number(conn.oracleServerVersion ?? 0) < 2300000000
+        ? `Oracle binds a Boolean into SQL only from Oracle Database 23ai; this one is ${conn.oracleServerVersionString ?? 'older'}`
+        : null;
+    },
+    async run(sql, rows, binds = []) {
+      // Named `:p1`: text (a number or a date converted in the SQL), a boolean as BOOLEAN.
+      const values = Object.fromEntries(binds.map((b) => [b.id, {
+        dir: db.BIND_IN, type: b.type === 'boolean' ? db.DB_TYPE_BOOLEAN : db.STRING, val: b.value,
+      }]));
+      const result = await conn.execute(sql, values, {
         resultSet: true,
         outFormat: db.OUT_FORMAT_ARRAY,
         // One round trip per read: a stop loses at most the fetch it interrupts.
