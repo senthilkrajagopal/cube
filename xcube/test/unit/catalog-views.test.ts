@@ -2,6 +2,7 @@
 import { BaseDriver } from '@cubejs-backend/base-driver';
 
 import { catalogView, driverClasses, loadsIncrementally } from '../../src';
+import { SwitchableDriver } from '../../src/connections/switchable';
 
 /**
  * Stand-ins named as Cube's drivers, which the views are chosen by: each
@@ -127,7 +128,7 @@ describe('catalogView', () => {
 
   test('keeps each foreign key\'s target schema', async () => {
     const driver = new PostgresDriver((sql) => {
-      if (sql.includes('FOREIGN KEY')) {
+      if (sql.includes('contype = \'f\'')) {
         return [{
           table_schema: 'public',
           table_name: 'orders',
@@ -146,6 +147,12 @@ describe('catalogView', () => {
     const [column] = await catalogView(driver).getColumnsForSpecificTables([{ schema_name: 'public', table_name: 'orders' }]);
 
     expect(column.foreign_keys).toEqual([{ target_schema: 'crm', target_table: 'customers', target_column: 'id' }]);
+
+    // A stored connection's driver is a proxy running each method on the real driver: the view's key queries still ask.
+    const switchable = new SwitchableDriver('warehouse', driver);
+    const [through] = await catalogView(switchable.proxy).getColumnsForSpecificTables([{ schema_name: 'public', table_name: 'orders' }]);
+    expect(through.foreign_keys).toEqual([{ target_schema: 'crm', target_table: 'customers', target_column: 'id' }]);
+    expect(driver.queries.some(([sql]) => sql === 'upstream postgres foreign keys')).toBe(false);
   });
 
   describe('Postgres', () => {
@@ -154,7 +161,10 @@ describe('catalogView', () => {
 
       expect(view.getTablesForSpecificSchemasQuery('$1')).toContain('pg_catalog.pg_matviews');
       expect(view.getColumnsForSpecificTablesQuery('true')).toContain("c.relkind = 'm'");
-      expect(view.foreignKeysQuery()).toContain('target.table_schema as "target_schema"');
+      // From pg_constraint, which a login that doesn't own the table reads too.
+      expect(view.foreignKeysQuery()).toContain('pg_catalog.pg_constraint');
+      expect(view.foreignKeysQuery()).toContain('unnest(con.conkey, con.confkey)');
+      expect(view.primaryKeysQuery()).toContain('con.contype = \'p\'');
     });
 
     test('leaves drivers built on it without pg_matviews, and their own key queries, alone', () => {

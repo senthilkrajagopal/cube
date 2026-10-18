@@ -71,6 +71,27 @@ const baseTablesQuery: Method = function (schemasPlaceholders: string) {
     `;
 };
 
+/**
+ * BaseDriver's `primaryKeys` and `foreignKeys`, run on the view. A stored
+ * connection's driver is a proxy that runs each method on the real driver
+ * (`SwitchableDriver`): its own `foreignKeys` would ask the driver's own
+ * query, never the view's.
+ */
+async function keysOf(view: any, method: 'primaryKeysQuery' | 'foreignKeysQuery', conditionString: string, parameters: unknown[]): Promise<any[]> {
+  const query = view[method](conditionString);
+  if (!query) {
+    return [];
+  }
+  try {
+    return await view.query(query, parameters);
+  } catch (error: any) {
+    view.logger?.(`${method === 'primaryKeysQuery' ? 'Primary' : 'Foreign'} Keys Query failed. Keys are left out`, {
+      error: (error?.stack || error).toString(),
+    });
+    return [];
+  }
+}
+
 /** BaseDriver's, keeping each foreign key's target schema. */
 const baseColumnsForSpecificTables: Method = async function (tables: QueryTablesResult[]): Promise<QueryColumnsResult[]> {
   const groupedBySchema: Record<string, string[]> = {};
@@ -98,8 +119,8 @@ const baseColumnsForSpecificTables: Method = async function (tables: QueryTables
   const query = this.getColumnsForSpecificTablesQuery(conditionString);
 
   const [primaryKeys, foreignKeys] = await Promise.all([
-    this.primaryKeys(conditionString, parameters),
-    this.foreignKeys(conditionString, parameters),
+    keysOf(this, 'primaryKeysQuery', conditionString, parameters),
+    keysOf(this, 'foreignKeysQuery', conditionString, parameters),
   ]);
 
   const columns: QueryColumnsResult[] = await this.query(query, parameters);
@@ -181,6 +202,35 @@ const postgresForeignKeysQuery: Method = function (conditionString?: string) {
          constraint_type = 'FOREIGN KEY'
          AND columns.table_schema NOT IN ${IGNORED_SCHEMAS}
          ${conditionString ? ` AND (${conditionString})` : ''}
+    `;
+};
+
+/**
+ * PostgreSQL's keys from its own catalog, `pg_constraint`, which any login
+ * that can see a table reads: information_schema's constraint views list
+ * only tables the login owns, or holds more than SELECT on. A key of several
+ * columns pairs them by position (`conkey`, `confkey`). `conditionString`
+ * names `columns.table_schema` and `columns.table_name`.
+ */
+const postgresKeysQuery = (contype: 'p' | 'f'): Method => function (conditionString?: string) {
+  const target = contype === 'f'
+    ? `, fns.nspname AS ${this.quoteIdentifier('target_schema')}, fcl.relname AS ${this.quoteIdentifier('target_table')},
+          fatt.attname AS ${this.quoteIdentifier('target_column')}`
+    : '';
+  return `SELECT * FROM (
+        SELECT ns.nspname AS ${this.quoteIdentifier('table_schema')}, cl.relname AS ${this.quoteIdentifier('table_name')},
+          att.attname AS ${this.quoteIdentifier('column_name')}${target}
+        FROM pg_catalog.pg_constraint con
+        JOIN pg_catalog.pg_class cl ON cl.oid = con.conrelid
+        JOIN pg_catalog.pg_namespace ns ON ns.oid = cl.relnamespace
+        CROSS JOIN LATERAL unnest(con.conkey${contype === 'f' ? ', con.confkey' : ''}) AS k(attnum${contype === 'f' ? ', fattnum' : ''})
+        JOIN pg_catalog.pg_attribute att ON att.attrelid = con.conrelid AND att.attnum = k.attnum
+        ${contype === 'f' ? `JOIN pg_catalog.pg_class fcl ON fcl.oid = con.confrelid
+        JOIN pg_catalog.pg_namespace fns ON fns.oid = fcl.relnamespace
+        JOIN pg_catalog.pg_attribute fatt ON fatt.attrelid = con.confrelid AND fatt.attnum = k.fattnum` : ''}
+        WHERE con.contype = '${contype}' AND ns.nspname NOT IN ${IGNORED_SCHEMAS}
+      ) AS columns
+      ${conditionString ? `WHERE (${conditionString})` : ''}
     `;
 };
 
@@ -333,8 +383,13 @@ export function catalogView(driver: BaseDriver): CatalogDriver {
     !['RedshiftDriver', 'CrateDriver', 'MaterializeDriver'].some(name => classes.includes(name))) {
     overrides.getTablesForSpecificSchemasQuery = postgresTablesQuery;
     overrides.getColumnsForSpecificTablesQuery = postgresColumnsQuery;
+    // Its own catalog: what information_schema hides from a login that doesn't own the table.
+    overrides.primaryKeysQuery = postgresKeysQuery('p');
+    overrides.foreignKeysQuery = postgresKeysQuery('f');
+  } else {
+    // Redshift's catalog has no LATERAL: information_schema, for what its login owns.
+    replace('PostgresDriver', 'foreignKeysQuery', postgresForeignKeysQuery);
   }
-  replace('PostgresDriver', 'foreignKeysQuery', postgresForeignKeysQuery);
 
   replace('MySqlDriver', 'primaryKeysQuery', mysqlPrimaryKeysQuery);
   replace('MySqlDriver', 'foreignKeysQuery', mysqlForeignKeysQuery);

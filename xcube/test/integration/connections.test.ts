@@ -114,9 +114,11 @@ describeWithDatabase('connections: data sources served from sealed credentials',
     await sql(`CREATE SCHEMA ${warehouse};
       CREATE TABLE ${warehouse}.orders (id int PRIMARY KEY, amount int);
       INSERT INTO ${warehouse}.orders VALUES (1, 10), (2, 32);
+      CREATE TABLE ${warehouse}.customers (id int PRIMARY KEY);
+      CREATE TABLE ${warehouse}.purchases (id int PRIMARY KEY, customer_id int REFERENCES ${warehouse}.customers (id));
       CREATE ROLE ${role} LOGIN PASSWORD 'second-password';
       GRANT USAGE ON SCHEMA ${warehouse} TO ${role};
-      GRANT SELECT ON ${warehouse}.orders TO ${role};`);
+      GRANT SELECT ON ${warehouse}.orders, ${warehouse}.customers, ${warehouse}.purchases TO ${role};`);
     keysDir = fs.mkdtempSync(path.join(os.tmpdir(), 'xcube-credential-keys-'));
     key = generateCredentialKey();
     fs.writeFileSync(path.join(keysDir, `${key.kid}.pem`), key.pem);
@@ -266,6 +268,17 @@ describeWithDatabase('connections: data sources served from sealed credentials',
     const health = await reported('default', (i) => i.version === res.body.version);
     expect(health.instances[0]).toMatchObject({ version: res.body.version, state: 'live', current: true });
     expect((await load().expect(200)).body.data[0]['orders.total']).toBe('42');
+  });
+
+  test('the catalog reports a foreign key through a stored connection, to a login that only reads the table', async () => {
+    // `default` signs in as the role now, which owns nothing: information_schema hides the key from it.
+    const columns = await request(server).post('/cubejs-api/v1/introspection/data-sources/default/columns')
+      .set('Authorization', jwt.sign({ wechartModel: 'dev' }, API_SECRET))
+      .send({ tables: [{ schema: warehouse, table: 'purchases' }] })
+      .expect(200);
+    const byName = Object.fromEntries(columns.body.tables[0].columns.map((c: any) => [c.name, c]));
+    expect(byName.customer_id).toMatchObject({ primaryKey: false, foreignKeys: [{ schema: warehouse, table: 'customers', column: 'id' }] });
+    expect(byName.id).toMatchObject({ primaryKey: true, foreignKeys: [] });
   });
 
   test('an instance re-reports the connections it holds, keeping what it reported, so a report within the hour means running', async () => {

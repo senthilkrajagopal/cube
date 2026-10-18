@@ -1632,6 +1632,20 @@ answers `404`, naming it.
 }
 ```
 
+**Keys, by driver.**
+- **PostgreSQL:** read from `pg_catalog.pg_constraint`, so a login that only
+  reads a table sees its keys too. Its `information_schema` lists a table's
+  constraints only to a login that owns it, or holds more than SELECT on it.
+  A key over several columns pairs them by position.
+- **MySQL:** read from `information_schema.KEY_COLUMN_USAGE`, for the tables
+  the login can see.
+- **None reported:** every other driver. Cube's Redshift driver turns its
+  key queries off. SQL Server's, Oracle's, Snowflake's, BigQuery's, Dremio's,
+  DuckDB's, Presto's, Trino's and Cube Store's drivers have none.
+
+`foreignKeys` is then `[]` and `primaryKey` `false`. That holds for a stored
+connection as for Cube's own data sources.
+
 #### `POST …/data-sources/{dataSource}/scaffold`
 
 A cube for each of the tables, as for `/columns`, returned and not saved.
