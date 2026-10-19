@@ -326,7 +326,7 @@ policies still apply within:
   default) every folder admits everyone, and only the model's own policies
   apply.
 - **A query into a folder the groups don't reach** is refused before Cube
-  runs it, by `/v1/load`, `/v1/sql` and `/v1/dry-run` alike: `403`,
+  runs it, by `/v1/load`, `/v1/sql`, `/v1/dry-run` and `/v1/cubesql` alike: `403`,
   `{ "error": "None of these groups reaches folder <folderId> (<cube>)" }`,
   naming the first such cube or view. Cube's own refusal would be a hidden
   member, answered `500`, or SQL selecting nothing (`1 = 0`). `/v1/meta` leaves
@@ -367,8 +367,13 @@ policies still apply within:
   One naming no model serves every model.
 - **HS256 tokens** signed with `CUBEJS_API_SECRET` still go to Cube's own check. They are taken for a model only until it has keys, and a token naming no model only until no model has any. `XCUBE_HS256=off` refuses them all.
 - **The SQL API.**
-  - A `checkSqlAuth` from `cube.js` is held to the HS256 rules: no role, and no model that has keys.
-  - Cube's default check gives a context naming no model. Keep the SQL port (`CUBEJS_PG_SQL_PORT`) off unless it is needed.
+  - **`POST /v1/cubesql`** answers on the REST port with no Postgres-wire listener. With neither `CUBEJS_PG_SQL_PORT` nor `CUBEJS_SQL_PORT` set, xcube starts Cube's SQL interface itself (Cube starts it only with a port), and the native side then opens no Postgres server. Leave `CUBESQL_PG_PORT` unset too: cubesql opens one on that port by itself.
+  - A statement runs as the request's own token, through the same gateway as `/v1/load`: the folder gate, the model's policies, `/v1/meta`'s filtering. A statement naming a cube or view in a folder the groups don't reach is refused before it runs, with `/v1/load`'s `403` body.
+  - It never switches user (`__user`, `SET user`), whatever `canSwitchSqlUser` or `CUBEJS_SQL_SUPER_USER` says: that would trade the token's context for `checkSqlAuth`'s.
+  - **Rows.** Each scan of a cube is capped at `CUBEJS_DB_QUERY_LIMIT` (default `50000`), also when the statement has no `LIMIT`; `CUBESQL_NON_STREAMING_QUERY_MAX_ROW_LIMIT` may lower it. `/v1/load` caps at the same limit, but a query with no `limit` gets `CUBEJS_DB_QUERY_DEFAULT_LIMIT` (default `10000`). A statement that aggregates over a capped scan (post-processing) aggregates the capped rows; `CUBESQL_FAIL_ON_LIMITLESS_POST_PROCESSING=true` refuses one with no `LIMIT` instead.
+  - **Time.** The query runs on the same orchestrator, under the same `CUBEJS_DB_QUERY_TIMEOUT`. With `"throwContinueWait": true` in the body, a query still queued answers `{ "error": "Continue wait" }`, as `/v1/load` does, to be posted again; without it the request waits for the result.
+  - A `checkSqlAuth` from `cube.js` (for the Postgres-wire port) is held to the HS256 rules: no role, and no model that has keys.
+  - Cube's default check gives a context naming no model. Keep the Postgres-wire port off unless it is needed.
 - **Websockets.** Cube checks a socket's token once, when it connects. Token expiry and key changes don't close a socket already open; folder permissions still apply to each query. Keep `CUBEJS_WEB_SOCKETS` off unless it is needed.
 - **The playground secret.** `CUBEJS_PLAYGROUND_AUTH_SECRET` is ignored while xcube serves models. With it, Cube takes any security context it signs, on every route.
 - **Logs.** A refused token is logged as `sha256:<16 hex>`, never the token.

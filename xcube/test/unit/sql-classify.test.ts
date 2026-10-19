@@ -1,5 +1,5 @@
 import {
-  classifySql, redactSql, SqlRefusal, withRowCap, type SqlDialect,
+  classifySql, redactSql, relationNames, SqlRefusal, withRowCap, type SqlDialect,
 } from '../../src/sql/classify';
 
 /** The refusal's code and statement kind, or `ok` and the kind. */
@@ -349,5 +349,19 @@ describe('Cube Store\'s row cap', () => {
     expect(withRowCap('WITH x AS (SELECT a FROM s.t LIMIT 900) SELECT * FROM x', 'cubestore', 101))
       .toBe('WITH x AS (SELECT a FROM s.t LIMIT 900) SELECT * FROM x\nLIMIT 101');
     expect(() => withRowCap('SELECT * FROM s.t LIMIT ALL', 'cubestore', 101)).toThrow(SqlRefusal);
+  });
+});
+
+describe('the relations a /v1/cubesql statement reads, for the folder gate', () => {
+  test.each([
+    ['SELECT MEASURE(orders.count) FROM orders', ['orders']],
+    ['SELECT 1 FROM "Orders" o JOIN public.Sales s ON 1 = 1', ['Orders', 'sales']],
+    ['SELECT 1 FROM orders AS o, "public"."sales" s, lines WHERE 1 = 1', ['orders', 'sales', 'lines']],
+    ['WITH t AS (SELECT * FROM orders) SELECT * FROM t LEFT JOIN (SELECT 1 FROM sales) x ON true', ['orders', 't', 'sales']],
+    ['SELECT EXTRACT(YEAR FROM day), SUBSTRING(name FROM 2), TRIM(BOTH FROM code) FROM orders', ['orders']],
+    ["SELECT 'FROM sales' -- FROM lines\nFROM orders", ['orders']],
+    ['SELECT 1', []],
+  ])('%s', (sql, names) => {
+    expect(relationNames(sql)).toEqual(names);
   });
 });

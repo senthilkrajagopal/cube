@@ -18,6 +18,7 @@ import {
   RequestContext,
   UserError,
 } from '@cubejs-backend/api-gateway';
+import { SQLServer, type SQLServerConstructorOptions } from '@cubejs-backend/api-gateway/dist/src/sql-server';
 import {
   transformCube,
   transformDimension,
@@ -49,6 +50,7 @@ import { Connections } from './connections/connections';
 import {
   MODULE_KEY, OVERLAY_ID, OverlaySourceError, type XcubeRuntime,
 } from './runtime/runtime';
+import { relationNames } from './sql/classify';
 import { ROLE_KEY } from './security/verifier';
 
 /** A UUID derived from text, for the compiler id of a merged meta (the SQL API wants a UUID). */
@@ -213,6 +215,37 @@ export class XcubeApiGateway extends ApiGateway {
     protected readonly groupsOf: (context: RequestContext) => Promise<string[]> = async () => [],
   ) {
     super(apiSecret, compilerApi, adapterApi, logger, options);
+  }
+
+  /**
+   * Cube's SQL interface, behind `/v1/cubesql`: a statement naming a cube or
+   * view in a folder the token's groups don't reach is refused before it
+   * runs, as `/v1/load` refuses its query (403, naming the folder). The gate
+   * keeps such a cube out of the token's view anyway, but Cube's SQL planner
+   * would answer only that the table isn't found. Created inside Cube's
+   * constructor: the runtime is read when a statement runs.
+   */
+  protected override createSQLServerInstance(options: SQLServerConstructorOptions): SQLServer {
+    const gateway = this;
+    return new (class extends SQLServer {
+      public override async execSql(sqlQuery: string, stream: any, securityContext?: any, ...rest: any[]) {
+        await gateway.refuseUnreachedRelations(sqlQuery, securityContext);
+        return super.execSql(sqlQuery, stream, securityContext, ...rest);
+      }
+    })(this, options);
+  }
+
+  /** Refuses a SQL statement naming a cube or view whose folder the context's groups don't reach (`createSQLServerInstance`). */
+  protected async refuseUnreachedRelations(sql: string, securityContext: any) {
+    const runtime = this.xcubeRuntime?.();
+    if (!runtime?.serving) {
+      return;
+    }
+    const context = { securityContext } as unknown as RequestContext;
+    const refused = runtime.refusedFolderOf(relationNames(sql), context, await this.groupsOf(context));
+    if (refused) {
+      throw new CubejsHandlerError(403, 'Forbidden', `None of these groups reaches folder ${refused.folderId} (${refused.cube})`);
+    }
   }
 
   /**

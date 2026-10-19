@@ -1795,6 +1795,11 @@ export class XcubeRuntime {
    * answered 500). Nothing while the model's security is off.
    */
   public refusedFolder(query: unknown, context: any, groups: string[]): { cube: string; folderId: string } | undefined {
+    return this.refusedFolderOf([...cubesOfQuery(query)], context, groups);
+  }
+
+  /** The first of these cubes or views whose folder the gate keeps these groups out of (`refusedFolder`). */
+  public refusedFolderOf(cubes: string[], context: any, groups: string[]): { cube: string; folderId: string } | undefined {
     const model = this.modelOfContext(context);
     const permissions = model === undefined ? undefined : this.permissions.get(model);
     if (!permissions?.security) {
@@ -1803,7 +1808,7 @@ export class XcubeRuntime {
     const reach = new Set(groups);
     const served = this.revisionOfContext(context);
     const folders = served ? foldersOfFiles(served.source.files) : new Map<string, string>();
-    for (const cube of cubesOfQuery(query)) {
+    for (const cube of cubes) {
       // One the revision doesn't hold is Cube's to refuse.
       const folderId = folders.get(cube);
       if (folderId !== undefined && !admits(permissions, folderId, reach)) {

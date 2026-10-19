@@ -55,6 +55,23 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
   }
 
   /**
+   * Cube's SQL interface, for `/v1/cubesql` on the REST API, with no
+   * Postgres-wire listener. Cube starts the interface only with a port
+   * (`sqlPort`, `pgSqlPort`), and its listener binds every address. Without
+   * one, the native side registers no Postgres server (cubesql's
+   * `postgres_bind_address`, unless `CUBESQL_PG_PORT` names one). A query on
+   * it runs as the REST request's own context, through the same gateway,
+   * folder gate and policies as `/v1/load`. It never switches user
+   * (`__user`, `SET user`): that would trade the verified token's context for
+   * `checkSqlAuth`'s.
+   */
+  public async initSqlInterface(options: Record<string, any>) {
+    const sqlServer = this.initSQLServer();
+    await sqlServer.init({ ...options, sqlPort: undefined, pgSqlPort: undefined, canSwitchSqlUser: async () => false });
+    return sqlServer;
+  }
+
+  /**
    * Whether a context's orchestrator runs in rollup-only mode, as Cube
    * resolves it (`OptsHandler.getOrchestratorInitializedOptions`): its
    * `orchestratorOptions.rollupOnlyMode`, else `CUBEJS_ROLLUP_ONLY`.
@@ -291,6 +308,10 @@ export class XcubeServer extends CubejsServer {
   /** Compiles every model's current revision before Cube listens, so it is never ready on a cold model. */
   public override async listen(options: http.ServerOptions = {}) {
     await this.xcubeCore.xcube?.attach(this.xcubeCore);
+    if (!this.config.sqlPort && !this.config.pgSqlPort) {
+      // `/v1/cubesql` without the Postgres-wire port; shut down with Cube's own (`CubejsServer.shutdown`).
+      this.sqlServer = await this.xcubeCore.initSqlInterface(this.config);
+    }
     return super.listen(options);
   }
 

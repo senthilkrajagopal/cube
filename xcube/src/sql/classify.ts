@@ -591,6 +591,67 @@ export function classifySql(sql: string, dialect: SqlDialect): ClassifiedSql {
   return { statement: primary.statement, sql: run, redactedSql: redactSql(run, dialect) };
 }
 
+/**
+ * The relations a PostgreSQL-dialect statement names after FROM and JOIN (a
+ * FROM list's too), as the database resolves them: an unquoted name folded to
+ * lower case, a quoted one as written, a qualified one by its last part. For
+ * Cube's SQL API, whose tables are cubes and views. Best effort: a statement
+ * that can't be read names none.
+ */
+export function relationNames(sql: string): string[] {
+  let tokens: Token[];
+  try {
+    ({ tokens } = lex(sql, RULES.postgres, RULES.postgres.readings[0]));
+  } catch {
+    return [];
+  }
+  const names = new Set<string>();
+  const nameAt = (k: number): number => {
+    // `a.b.c`: the last part names the relation.
+    let at = k;
+    while (isOp(tokens[at + 1], '.') && (tokens[at + 2]?.kind === 'word' || tokens[at + 2]?.kind === 'quoted')) {
+      at += 2;
+    }
+    const t = tokens[at];
+    if (t?.kind === 'quoted') {
+      names.add(t.value);
+    } else if (t?.kind === 'word') {
+      names.add(sql.slice(t.start, t.end).toLowerCase());
+    }
+    return at;
+  };
+  // The function each open parenthesis calls: `EXTRACT(YEAR FROM day)` reads no relation.
+  const calls: string[] = [];
+  for (let k = 0; k < tokens.length; k++) {
+    if (isOp(tokens[k], '(')) {
+      calls.push(isWord(tokens[k - 1]) ? tokens[k - 1].value : '');
+    } else if (isOp(tokens[k], ')')) {
+      calls.pop();
+    }
+    const inCall = ['EXTRACT', 'SUBSTRING', 'TRIM', 'OVERLAY'].includes(calls[calls.length - 1]);
+    if (isWord(tokens[k], 'FROM', 'JOIN') && !inCall && (tokens[k + 1]?.kind === 'word' || tokens[k + 1]?.kind === 'quoted')) {
+      let at = nameAt(k + 1);
+      // A FROM list: `FROM a x, b y`.
+      for (;;) {
+        let next = at + 1;
+        if (isWord(tokens[next], 'AS')) {
+          next += 1;
+        }
+        if ((tokens[next]?.kind === 'word' && !/^(WHERE|GROUP|ORDER|LIMIT|HAVING|UNION|INTERSECT|EXCEPT|JOIN|INNER|LEFT|RIGHT|FULL|CROSS|ON|OFFSET|WINDOW|NATURAL)$/.test(tokens[next].value))
+          || tokens[next]?.kind === 'quoted') {
+          next += 1;
+        }
+        if (isOp(tokens[next], ',') && (tokens[next + 1]?.kind === 'word' || tokens[next + 1]?.kind === 'quoted')) {
+          at = nameAt(next + 1);
+        } else {
+          break;
+        }
+      }
+    }
+  }
+  return [...names];
+}
+
 /** A parameter written into a statement's code as `{{name}}`, with its span. */
 export interface Placeholder {
   name: string;

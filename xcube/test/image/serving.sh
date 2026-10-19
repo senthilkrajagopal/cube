@@ -181,6 +181,22 @@ status="$(signed GET /meta)"
 [ "$status" = 200 ] && grep -q '"name":"doubled"' /tmp/xcube-admin.json || { echo "the admin field list answered $status"; exit 1; }
 echo "Security check passed: keys and folder groups pushed with the service credential; the gate admits g_sub and refuses the rest."
 
+# /v1/cubesql on the REST port, as a user's token, with no Postgres-wire listener.
+cubesql() {
+  curl -s -o /tmp/xcube-cubesql.json -w '%{http_code}' -H "Authorization: $1" -H 'Content-Type: application/json' \
+    --data '{"query": "SELECT MEASURE(doubled.total) AS total FROM doubled"}' "$CUBE_URL/cubejs-api/v1/cubesql"
+}
+status="$(cubesql "$(node "$keys/tokens.js" user g_sub "$revision")")"
+[ "$status" = 200 ] && grep -q '{"data":\[\["84"\]\]}' /tmp/xcube-cubesql.json || { echo "/v1/cubesql for g_sub answered $status: $(cat /tmp/xcube-cubesql.json)"; exit 1; }
+status="$(cubesql "$(node "$keys/tokens.js" user nobody "$revision")")"
+[ "$status" = 403 ] && grep -q 'None of these groups reaches folder' /tmp/xcube-cubesql.json || { echo "/v1/cubesql for nobody answered $status: $(cat /tmp/xcube-cubesql.json)"; exit 1; }
+# Every listening TCP socket in the container (state 0A), by port: only the REST port. Docker's
+# embedded DNS on a user-defined network (127.0.0.11, `0B00007F`) listens in it too, and isn't ours.
+listening="$(docker exec "$NAME" cat /proc/net/tcp /proc/net/tcp6 \
+  | awk '$4 == "0A" && $2 !~ /^0B00007F:/ { split($2, a, ":"); print a[2] }' | sort -u | tr '\n' ' ')"
+[ "$listening" = "0FA0 " ] || { echo "the container listens on (hex ports): $listening"; exit 1; }
+echo "SQL API check passed: /v1/cubesql answers g_sub and refuses the rest, and only port 4000 listens."
+
 # Slice 5: a workspace's change pushed as an overlay, previewed by a token naming it.
 tripled_item='{"folderId": "fsub", "name": "doubled", "kind": "cube", "yaml": "cubes:\n  - name: doubled\n    sql: \"SELECT id, amount * 3 AS amount FROM {serving_check.sql()}\"\n    measures:\n      - name: total\n        sql: amount\n        type: sum\n"}'
 status="$(signed PUT /overlays/ws-check "{\"upserts\": [$tripled_item]}")"

@@ -87,6 +87,7 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
   let runtime: XcubeRuntime;
   let core: XcubeServerCore;
   let server: http.Server;
+  let sqlInterface: Awaited<ReturnType<XcubeServerCore['initSqlInterface']>> | undefined;
 
   beforeAll(async () => {
     process.env.CUBEJS_DB_TYPE = 'duckdb';
@@ -136,10 +137,14 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
     const app = express();
     app.use(bodyParser.json({ limit: '50mb' }));
     await core.initApp(app);
+    // As XcubeServer.listen starts it: Cube's SQL interface, with no Postgres-wire port.
+    // Given a `cube.js` that would let any user switch.
+    sqlInterface = await core.initSqlInterface({ canSwitchSqlUser: async () => true });
     server = app.listen(0);
   });
 
   afterAll(async () => {
+    await sqlInterface?.shutdown('fast');
     server?.close();
     await runtime?.stop();
     await core?.shutdown();
@@ -177,6 +182,19 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
     const res = await load(token, measure);
     expect(res.status).toBe(200);
     return Number(res.body.data[0][measure]);
+  };
+  // `/v1/cubesql` answers JSON lines: a schema line, then data lines (or one error line).
+  const cubesql = async (token: string, query: string) => {
+    const res = await request(server).post('/cubejs-api/v1/cubesql').set('Authorization', token).send({ query })
+      .buffer(true)
+      .parse((r: any, cb: any) => {
+        let text = '';
+        r.setEncoding('utf8');
+        r.on('data', (chunk: string) => { text += chunk; });
+        r.on('end', () => cb(null, text));
+      });
+    const lines = (res.body as string).split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    return { status: res.status, lines, body: lines[0] };
   };
   const metaNames = async (token: string) => {
     const res = await request(server).get('/cubejs-api/v1/meta').set('Authorization', token).expect(200);
@@ -295,6 +313,30 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
       .set('Authorization', userToken(['g_ab']))
       .expect(200);
     expect(allowed.body.sql.sql[0]).not.toMatch(/1 = 0/);
+  });
+
+  test('/v1/cubesql answers as the user\'s own token, under the same folder gate and policies as /v1/load', async () => {
+    const answered = await cubesql(userToken(['g_ab']), 'SELECT MEASURE(sales.count) AS n FROM sales');
+    expect(answered.status).toBe(200);
+    expect(answered.lines[0].schema).toEqual([{ name: 'n', column_type: 'Int64' }]);
+    expect(answered.lines[1]).toEqual({ data: [['3']] });
+    // Refused before it runs, with /v1/load's body, by whichever way the cube is named.
+    for (const sql of ['SELECT MEASURE(sales.count) FROM sales', 'SELECT MEASURE(s.count) FROM "sales" s', 'SELECT 1 FROM public.Sales s JOIN orders o ON 1 = 1']) {
+      const refused = await cubesql(userToken(['nobody']), sql);
+      expect({ sql, status: refused.status, body: refused.body })
+        .toEqual({ sql, status: 403, body: { error: 'None of these groups reaches folder fa (sales)' } });
+    }
+    // A view in /A/B, closed to a group admitted to /A only.
+    expect((await cubesql(userToken(['g_ac']), 'SELECT MEASURE(v_sales.count) FROM v_sales')).status).toBe(403);
+    expect((await cubesql(userToken(['g_ac']), 'SELECT MEASURE(sales.count) FROM sales')).lines[1]).toEqual({ data: [['3']] });
+    // No switching to another user's context, whatever `cube.js` allows.
+    const switched = await cubesql(userToken(['nobody']), "SELECT MEASURE(sales.count) FROM sales WHERE __user = 'admin'");
+    expect(switched.status).toBe(403);
+    const unswitched = await cubesql(userToken(['g_ab']), "SELECT MEASURE(sales.count) FROM sales WHERE __user = 'admin'");
+    expect(unswitched.body.error).toMatch(/cannot change security context via __user/);
+    // An authored row-level policy applies as it does on /v1/load.
+    expect((await cubesql(userToken(['g_a']), 'SELECT MEASURE(secured.count) FROM secured')).lines[1]).toEqual({ data: [['2']] });
+    expect((await cubesql(userToken(['sa']), 'SELECT MEASURE(secured.count) FROM secured')).lines[1]).toEqual({ data: [['3']] });
   });
 
   test('a view in /A/B is closed to a group admitted to /A but not /A/B, though the /A cube is open to it', async () => {
