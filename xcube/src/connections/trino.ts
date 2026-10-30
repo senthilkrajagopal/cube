@@ -9,6 +9,7 @@
  */
 import { Transform } from 'stream';
 import type { TrinoDriver as CubeTrinoDriver } from '@cubejs-backend/trino-driver';
+import { withoutEnv } from './env';
 
 /** Cube's own default, in seconds: ten minutes. A SQL run's own clock stops its statement sooner. */
 const QUERY_TIMEOUT_S = 600;
@@ -37,30 +38,6 @@ export function trinoError(e: any): Error {
     code: e?.errorName,
     errorCode: e?.errorCode,
   });
-}
-
-/**
- * Builds with every `CUBEJS_` variable out of the environment, put back before
- * anything else runs. A stand-in catalog and schema are set while it builds:
- * without them Cube's constructor reads the deprecated `CUBEJS_DB_CATALOG` and
- * `CUBEJS_DB_SCHEMA`, and logs so on every build. The config replaces both.
- */
-function withoutCubeEnv<T>(build: () => T): T {
-  const hidden = Object.entries(process.env).filter(([key]) => key.startsWith('CUBEJS_'));
-  for (const [key] of hidden) {
-    delete process.env[key];
-  }
-  process.env.CUBEJS_DB_PRESTO_CATALOG = '-';
-  process.env.CUBEJS_DB_NAME = '-';
-  try {
-    return build();
-  } finally {
-    delete process.env.CUBEJS_DB_PRESTO_CATALOG;
-    delete process.env.CUBEJS_DB_NAME;
-    for (const [key, value] of hidden) {
-      process.env[key] = value;
-    }
-  }
 }
 
 let driverClass: (new (config: Record<string, unknown>) => CubeTrinoDriver) | undefined;
@@ -150,7 +127,8 @@ function trinoDriverClass() {
 /** A Trino driver from a connection's config (`DRIVERS.trino.config`). */
 export function makeTrinoDriver(config: Record<string, unknown>): CubeTrinoDriver {
   const DriverClass = trinoDriverClass();
-  return withoutCubeEnv(() => new DriverClass({
+  // Without stand-ins, Cube's constructor reads the deprecated `CUBEJS_DB_CATALOG` and `CUBEJS_DB_SCHEMA`.
+  return withoutEnv(['CUBEJS_'], { CUBEJS_DB_PRESTO_CATALOG: '-', CUBEJS_DB_NAME: '-' }, () => new DriverClass({
     ...config,
     queryTimeout: config.queryTimeout ?? QUERY_TIMEOUT_S,
     jsonParser: TRINO_JSON,

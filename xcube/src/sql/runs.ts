@@ -116,6 +116,16 @@ export class SqlRuns {
     let sql: string;
     let binds: SqlBind[] = [];
     try {
+      if (dialect === 'athena' && request.maxBytesBilled !== undefined) {
+        // AC-1047: a query can't carry its own; only the workgroup's cutoff stops one by what it scans.
+        throw new SqlRunError(
+          'cap_unsupported',
+          'Athena takes no maxBytesBilled: it caps what a query scans only by its workgroup\'s setting '
+            + '(BytesScannedCutoffPerQuery). Run without maxBytesBilled, and set the cap on the workgroup',
+          redactSql(request.sql, dialect),
+          null, null, null, null, 'athena_workgroup_cutoff',
+        );
+      }
       let text = request.sql;
       if (request.parameters) {
         if (UNBOUND_DIALECTS.has(dialect as SqlDialect) && Object.keys(request.parameters).length) {

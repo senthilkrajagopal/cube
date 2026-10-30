@@ -39,10 +39,26 @@ const POISON = {
   CUBEJS_DB_PRESTO_AUTH_TOKEN: 'poison-presto-token',
   CUBEJS_DB_SCHEMA: 'poison-schema',
   CUBEJS_DB_SSL_CA: '/poison-ca',
+  CUBEJS_AWS_KEY: 'poison-aws-key-id',
+  CUBEJS_AWS_SECRET: 'poison-aws-secret-key',
+  CUBEJS_AWS_REGION: 'us-east-2',
+  CUBEJS_AWS_S3_OUTPUT_LOCATION: 's3://poison-output/',
+  CUBEJS_AWS_ATHENA_WORKGROUP: 'poison-workgroup',
+  CUBEJS_AWS_ATHENA_CATALOG: 'poison-athena-catalog',
+  CUBEJS_AWS_ATHENA_ASSUME_ROLE_ARN: 'arn:aws:iam::1:role/poison-role',
   PGPASSWORD: 'poison-pgpassword',
   PGHOST: 'poison-pghost',
 };
 Object.assign(process.env, POISON);
+// The AWS SDK's own, set for the Athena case alone: other drivers' cases don't fence them.
+const AWS_POISON = {
+  AWS_ACCESS_KEY_ID: 'AKIAPOISONPOISONPOIS',
+  AWS_SECRET_ACCESS_KEY: 'poison-sdk-secret',
+  AWS_SESSION_TOKEN: 'poison-sdk-session',
+  AWS_REGION: 'us-east-2',
+  AWS_ENDPOINT_URL: 'https://poison-endpoint.example',
+  AWS_PROFILE: 'poison-profile',
+};
 process.on('unhandledRejection', () => undefined); // SQL Server's driver connects in its constructor.
 
 // The image's own modules: this script runs inside it.
@@ -68,6 +84,7 @@ const cases = {
   clickhouse: [{ host: 'xc-host', port: 8443, database: 'xc-db', user: 'xc-user', ssl: true }, 'password', { password: 'xc-password' }],
   trino: [{ host: 'xc-host', port: 443, catalog: 'xc-catalog', schema: 'xc-schema', user: 'xc-user' }, 'password', { password: 'xc-password' }],
   'trino (jwt)': [{ host: 'xc-host', port: 443, catalog: 'xc-catalog', schema: 'xc-schema', user: 'xc-user' }, 'jwt', { token: 'xc-token' }, 'trino'],
+  athena: [{ region: 'eu-west-1', workGroup: 'xc-workgroup', s3OutputLocation: 's3://xc-results/', catalog: 'xc-catalog', database: 'xc-db', accessKeyId: 'AKIAXCXCXCXCXCXCXCXC' }, 'access-key', { secretAccessKey: 'xc-secret' }],
 };
 
 // Each value the connection gives, as the driver would hold it: a JSON secret by its values.
@@ -98,7 +115,7 @@ const seen = (value, values) => {
   walk(value, 0);
   return [...found];
 };
-const POISONED = Object.values(POISON).filter((p) => p.length > 3);
+const POISONED = [...Object.values(POISON), ...Object.values(AWS_POISON)].filter((p) => p.length > 3);
 
 (async () => {
   let failed = false;
@@ -107,6 +124,9 @@ const POISONED = Object.values(POISON).filter((p) => p.length > 3);
     const spec = DRIVERS[driverType];
     // BigQuery's constructor refuses an export bucket type it can't use: poison it with one it can.
     process.env.CUBEJS_DB_EXPORT_BUCKET_TYPE = driverType === 'bigquery' ? 'gcp' : POISON.CUBEJS_DB_EXPORT_BUCKET_TYPE;
+    if (driverType === 'athena') {
+      Object.assign(process.env, AWS_POISON);
+    }
     try {
       const config = { ...spec.config(fields, auth, secrets), dataSource: 'conn_x', maxPoolSize: 1 };
       const driver = spec.make ? spec.make(config) : CubejsServerCore.createDriver(spec.cubeType, config);
@@ -125,6 +145,14 @@ const POISONED = Object.values(POISON).filter((p) => p.length > 3);
       if (driverType === 'trino' && (driver.config.exportBucket || driver.config.ssl === undefined || driver.config.queryTimeout !== 600)) {
         leaked.push('Trino\'s export bucket, TLS or query timeout from the environment');
       }
+      if (driverType === 'athena') {
+        const { region, endpoint, credentials, exportBucket, readOnly } = driver.config;
+        const signing = await driver.athena.config.credentials();
+        if (region !== 'eu-west-1' || endpoint !== 'https://athena.eu-west-1.amazonaws.com' || exportBucket || readOnly !== true
+          || typeof credentials === 'function' || signing.accessKeyId !== 'AKIAXCXCXCXCXCXCXCXC' || signing.sessionToken) {
+          leaked.push('Athena\'s region, endpoint, key, export bucket or read-only from the environment');
+        }
+      }
       const expected = given(fields, secrets);
       const reached = seen(parts, expected);
       const dropped = expected.filter((v) => !reached.includes(v));
@@ -138,6 +166,8 @@ const POISONED = Object.values(POISON).filter((p) => p.length > 3);
     } catch (e) {
       console.log(`FAIL ${name}: ${e.message}`);
       failed = true;
+    } finally {
+      Object.keys(AWS_POISON).forEach((key) => delete process.env[key]);
     }
   }
   process.exit(failed ? 1 : 0);

@@ -178,6 +178,18 @@ const CLICKHOUSE_AFTER_FROM = new Set([
 /** EXPLAIN's kinds on ClickHouse; its settings come after, as `name = value`, between commas. */
 const CLICKHOUSE_EXPLAIN_KINDS = new Set(['AST', 'SYNTAX', 'QUERY', 'TREE', 'PLAN', 'PIPELINE', 'ESTIMATE']);
 
+/** Trino's, and Athena's (its engine is Trino's). */
+const TRINO_RULES: Rules = {
+  ...base,
+  trino: true,
+  // A quote doubled in a string or a name, never a backslash, and comments that don't nest (Trino's grammar).
+  readings: readings([false], [false]),
+  deniedWords: new Set(WRITES),
+  // Its connectors' passthrough table functions, `TABLE(pg.system.query(query => '…'))`: the source database runs the SQL as written.
+  deniedFunction: /^(query|raw_query)$/,
+  deniedFunctionIs: { what: 'table function', why: 'it sends its SQL to the catalog\'s own database, which runs it as written' },
+};
+
 const RULES: Record<SqlDialect, Rules> = {
   postgres: {
     ...base,
@@ -268,17 +280,9 @@ const RULES: Record<SqlDialect, Rules> = {
   },
   // Until it has rules of its own, read every way and refused at the session (the runner doesn't run on it yet).
   duckdb: { ...base, readings: readings(BOTH, BOTH), deniedWords: new Set(WRITES) },
-  trino: {
-    ...base,
-    trino: true,
-    // A quote doubled in a string or a name, never a backslash, and comments that don't nest (Trino's grammar).
-    readings: readings([false], [false]),
-    deniedWords: new Set(WRITES),
-    // Its connectors' passthrough table functions, `TABLE(pg.system.query(query => '…'))`: the source database runs the SQL as written.
-    deniedFunction: /^(query|raw_query)$/,
-    deniedFunctionIs: { what: 'table function', why: 'it sends its SQL to the catalog\'s own database, which runs it as written' },
-  },
-  athena: { ...base, readings: readings(BOTH, BOTH), deniedWords: new Set(WRITES) },
+  trino: TRINO_RULES,
+  // Its engine (v3) is Trino's, with UNLOAD writing a query's result to S3: `UNLOAD (SELECT …) TO 's3://…'`.
+  athena: { ...TRINO_RULES, deniedWords: new Set([...WRITES, 'UNLOAD']) },
   cubestore: {
     ...base,
     hashComment: true,

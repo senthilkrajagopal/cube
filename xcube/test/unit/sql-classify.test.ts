@@ -424,6 +424,28 @@ describe('the SQL runner\'s check: one read', () => {
     ]);
   });
 
+  test('Athena: Trino\'s rules, and UNLOAD, which writes a result to S3 (AC-1044)', () => {
+    reads('athena', [
+      'SELECT \'unload\' AS "unload" FROM t',
+      'SELECT * FROM TABLE(exclude_columns(input => TABLE(t), columns => DESCRIPTOR(a)))',
+      'WITH session AS (SELECT 1 AS a) SELECT a FROM session',
+    ]);
+    expect(verdict('EXPLAIN (TYPE DISTRIBUTED) SELECT 1', 'athena')).toBe('ok:explain');
+    expect(() => classifySql('UNLOAD (SELECT * FROM t) TO \'s3://b/x/\' WITH (format = \'PARQUET\')', 'athena')).toThrow(/UNLOAD/);
+    expect(() => classifySql('SELECT * FROM TABLE(system.query(query => \'DELETE FROM t\'))', 'athena')).toThrow(/^The table function query is refused/);
+    refuses('athena', [
+      ['UNLOAD (SELECT 1) TO \'s3://b/\'', 'not_read_only:unload'],
+      ['CALL system.x()', 'not_read_only:call'],
+      ['MSCK REPAIR TABLE t', 'not_read_only:msck'],
+      ['EXPLAIN ANALYZE SELECT 1', 'not_read_only:explain'],
+      ['SET SESSION a = 1', 'not_read_only:set'],
+      ['CREATE TABLE t AS SELECT 1', 'not_read_only:create'],
+      ['SELECT 1; SELECT 2', 'several_statements:-'],
+    ]);
+    // Trino's own reads it lexes as Trino does: a backslash ends nothing in a string.
+    expect(verdict('SELECT \'a\\\'; DELETE FROM t; --\'', 'athena')).toBe('several_statements:-');
+  });
+
   test('a refusal says why, with its code', () => {
     try {
       classifySql('WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d', 'postgres');

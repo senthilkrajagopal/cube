@@ -202,7 +202,7 @@ const sqlSchema = Joi.object({
     .default(30000),
   maxBytes: Joi.number().integer().min(1024).max(100 * 1024 * 1024)
     .default(10 * 1024 * 1024),
-  // BigQuery only: its job fails, without charge, past this many bytes billed.
+  // BigQuery only: its job fails, without charge, past this many bytes billed. Athena refuses it (its workgroup caps).
   maxBytesBilled: Joi.number().integer().min(1).max(Number.MAX_SAFE_INTEGER),
   // `{{name}}`'s values, bound, never written into the SQL; each checked against its type when the run binds it.
   parameters: Joi.object().pattern(
@@ -224,6 +224,7 @@ const SQL_STATUS: Record<SqlFailure, number> = {
   several_statements: 400,
   invalid_parameters: 400,
   parameters_unsupported: 400,
+  cap_unsupported: 400,
   unknown_connection: 404,
   unknown_overlay: 404,
   run_in_progress: 409,

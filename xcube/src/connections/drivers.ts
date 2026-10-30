@@ -8,6 +8,7 @@
  * leaves it empty. A driver spreads its config over those defaults, so none
  * of them reaches a connection.
  */
+import { makeAthenaDriver } from './athena';
 import { makeClickHouseDriver } from './clickhouse';
 import { makeTrinoDriver } from './trino';
 
@@ -545,7 +546,7 @@ export const DRIVERS: Record<DriverType, DriverSpec> = {
         readOnly: true,
       };
     },
-    make: notYet('Athena'),
+    make: makeAthenaDriver,
   },
 };
 

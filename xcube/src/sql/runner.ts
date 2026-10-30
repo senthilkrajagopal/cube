@@ -51,7 +51,8 @@ export interface SqlAnswer extends SqlRows {
 
 /** How a run failed: refused, stopped, or failed on the database. */
 export type SqlFailure = 'not_read_only' | 'several_statements' | 'timeout' | 'cancelled' | 'connect_failed' | 'query_failed'
-  | 'unknown_connection' | 'unknown_overlay' | 'run_in_progress' | 'busy' | 'invalid_parameters' | 'parameters_unsupported';
+  | 'unknown_connection' | 'unknown_overlay' | 'run_in_progress' | 'busy' | 'invalid_parameters' | 'parameters_unsupported'
+  | 'cap_unsupported';
 
 export class SqlRunError extends Error {
   public constructor(
@@ -64,7 +65,7 @@ export class SqlRunError extends Error {
     public readonly partial: SqlRows | null = null,
     /** A stopped run the database runs on (Cube Store): when it ends at the latest, `endsBy: null` when nothing bounds it. */
     public readonly runsOn: { endsBy: Date | null } | null = null,
-    /** Why a refusal refused, for the client to word: `cubestore_router_join`. */
+    /** Why a refusal refused, for the client to word: `cubestore_router_join`, `athena_workgroup_cutoff`. */
     public readonly reason: string | null = null,
   ) {
     super(message);
@@ -871,6 +872,97 @@ async function trinoSession(driver: any, caps: SqlCaps): Promise<SqlSession> {
 }
 
 /**
+ * Whether an Athena result page's first row is its header: a SELECT's first
+ * page starts with its columns' names, as a row of strings.
+ */
+const isHeader = (row: any, columns: SqlColumn[]) => {
+  const cells: any[] = row?.Data ?? [];
+  return cells.length === columns.length && cells.every((cell, i) => cell?.VarCharValue === columns[i].name);
+};
+
+/**
+ * Athena: its API, through the driver's own client. The query starts in the
+ * connection's workgroup and catalog, is polled until it ends, and its
+ * result is read a page (at most 1,000 rows) at a time, only to the cap. At
+ * the time cap or on a cancel it is stopped by its id (StopQueryExecution).
+ * Athena has no read-only transaction: the check (`classify.ts`) and the
+ * role's grants are the guard. Every value comes as a string, or null.
+ */
+async function athenaSession(driver: any, caps: SqlCaps): Promise<SqlSession> {
+  const { athena, config } = driver;
+  let queryId: string | undefined;
+  let stopping = false;
+  const stop = async () => {
+    if (queryId) {
+      await athena.stopQueryExecution({ QueryExecutionId: queryId });
+    }
+  };
+  return {
+    async run(sql, rows) {
+      ({ QueryExecutionId: queryId } = await athena.startQueryExecution({
+        QueryString: sql,
+        WorkGroup: config.workGroup,
+        ResultConfiguration: { OutputLocation: config.S3OutputLocation },
+        QueryExecutionContext: { Catalog: config.catalog, ...(config.database ? { Database: config.database } : {}) },
+      }));
+      if (stopping) {
+        // Cancelled while it started: stopped now it has an id.
+        await quietly(stop);
+        return;
+      }
+      for (let i = 0; ; i++) {
+        const { QueryExecution: execution } = await athena.getQueryExecution({ QueryExecutionId: queryId });
+        const status = execution?.Status ?? {};
+        if (status.State === 'SUCCEEDED' || stopping) {
+          break;
+        }
+        if (status.State === 'FAILED' || status.State === 'CANCELLED') {
+          throw Object.assign(new Error(status.StateChangeReason ?? status.AthenaError?.ErrorMessage ?? `Athena's query was ${status.State.toLowerCase()}`), {
+            code: status.AthenaError?.ErrorType,
+          });
+        }
+        await sleep(Math.min(1000, 100 * 2 ** i));
+      }
+      let first = true;
+      let NextToken: string | undefined;
+      while (!stopping) {
+        const page = await athena.getQueryResults({
+          QueryExecutionId: queryId,
+          // One past the cap, and the header on the first page.
+          MaxResults: Math.min(1000, caps.maxRows + 1 - rows.rows.length + (first ? 1 : 0)),
+          NextToken,
+        });
+        let data: any[] = page.ResultSet?.Rows ?? [];
+        if (first) {
+          const info: any[] = page.ResultSet?.ResultSetMetadata?.ColumnInfo ?? [];
+          rows.setColumns(info.map((c) => ({ name: String(c.Name ?? c.Label), type: c.Type == null ? null : String(c.Type) })));
+          if (isHeader(data[0], rows.columns)) {
+            data = data.slice(1);
+          }
+          first = false;
+        }
+        for (const row of data) {
+          if (stopping || !rows.add((row.Data ?? []).map((cell: any) => cell?.VarCharValue ?? null))) {
+            return;
+          }
+        }
+        ({ NextToken } = page);
+        if (!NextToken) {
+          return;
+        }
+      }
+    },
+    async cancel() {
+      stopping = true;
+      await quietly(stop);
+    },
+    async close() {
+      await quietly(() => driver.release?.());
+    },
+  };
+}
+
+/**
  * Whether a Cube Store plan joins on its router: a join not under a
  * `ClusterSend`. Its router runs it, and nothing stops that once it starts
  * (`endsAtCubeStoreTimeout`); a join multiplies what it reads.
@@ -991,8 +1083,9 @@ export function openSession(
       return clickhouseSession(driver, caps);
     case 'trino':
       return trinoSession(driver, caps);
-    case 'duckdb':
     case 'athena':
+      return athenaSession(driver, caps);
+    case 'duckdb':
       return Promise.reject(new SqlRunError('connect_failed', `The SQL runner doesn't run on ${dialect} data sources yet`));
     case 'cubestore':
       return cubeStoreSession(driver, refuse);
@@ -1027,6 +1120,7 @@ export function isTimeout(dialect: SessionDialect, e: any): boolean {
       return code === 'EXCEEDED_TIME_LIMIT' || /query timed out/.test(message);
     case 'dremio':
     case 'duckdb':
+    // Its own timeout is the workgroup's, minutes at the least: the run's clock stops a query first.
     case 'athena':
     case 'cubestore':
       return false;

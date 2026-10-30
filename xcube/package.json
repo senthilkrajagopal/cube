@@ -38,7 +38,9 @@
     "ramda": "^0.27.2"
   },
   "devDependencies": {
+    "@aws-sdk/client-athena": "3.1038.0",
     "@cubejs-backend/api-gateway": "1.7.45",
+    "@cubejs-backend/athena-driver": "1.7.45",
     "@cubejs-backend/base-driver": "1.7.45",
     "@cubejs-backend/clickhouse-driver": "1.7.45",
     "@cubejs-backend/dremio-driver": "1.7.45",
