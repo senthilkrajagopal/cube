@@ -592,6 +592,12 @@ Pool sizes and timeouts still come from the environment.
 - **BigQuery's constructor checks `CUBEJS_DB_EXPORT_BUCKET_TYPE`** against
   its own types. An environment naming, say, `s3` stops BigQuery connections
   from building.
+- **Cube's TLS settings still reach Postgres, Redshift and MySQL** (a known
+  gap, not yet mended). With `CUBEJS_DB_SSL` on, Cube's driver reads
+  `CUBEJS_DB_SSL_CA`, `_CERT`, `_KEY`, `_CIPHERS`, `_PASSPHRASE` and
+  `_SERVERNAME` from the environment: a connection of these kinds then
+  presents Cube's own TLS files, or fails to build when a named file is
+  missing. `test/image/drivers-env.js` fails on it, for these four drivers.
 
 **Credential keys.**
 - **The key.** xcube holds X25519 private keys, one file per key in
@@ -1820,6 +1826,11 @@ for xcube's schema; each suite uses a schema of its own), `INTROSPECTION_TEST_PO
 `test/image/serving.sh <image>` boots an image serving models against a
 Postgres, imports a snapshot and queries it; CI runs it on every build.
 
+`test/image/duckdb.sh <image>` runs the image on a docker network with no way
+out, beside an S3 store: DuckDB's extensions must load from the image, and
+an S3 connection must read its own location and nothing else. CI doesn't run
+it.
+
 ## Moving to another Cube version
 
 xcube relies on parts of Cube that a release can change. Each has a check
@@ -1836,6 +1847,7 @@ that fails when it changes:
 | The queue options Cube builds, with xcube's heartbeat | `test/unit/config.test.ts`, through Cube's own `OptsHandler` |
 | Each driver's option names: every connection field reaches the driver, and no `CUBEJS_DB_*` or `PG*` value does | `test/image/drivers-env.js`, in the image (CI) |
 | Policies, routing, overlays, connections and refresh, end to end | The integration tests and `test/image/serving.sh` |
+| DuckDB's extensions for the image's platform, and its `allowed_directories` on `s3://` | `test/image/duckdb.sh`, in the image (by hand) |
 
 To move:
 
