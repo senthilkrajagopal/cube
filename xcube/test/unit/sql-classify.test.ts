@@ -359,6 +359,71 @@ describe('the SQL runner\'s check: one read', () => {
     expect(() => classifySql('SELECT settings FROM t', 'clickhouse')).toThrow(/its own SETTINGS clause/);
   });
 
+  test('Trino: its strings, names and comments; EXPLAIN\'s options; WITH FUNCTION and a query named session', () => {
+    reads('trino', [
+      'SELECT \'it\'\'s; CALL x\', "a""b" FROM t -- CALL x',
+      'SELECT \'a\\\', 1 FROM t',
+      'SELECT 1 /* a /* not nested */',
+      'SELECT * FROM TABLE(exclude_columns(input => TABLE(t), columns => DESCRIPTOR(a))) JOIN TABLE(sequence(start => 1, stop => 3)) s ON true',
+      'SELECT * FROM TABLE(ice.system.table_changes(schema_name => \'s\', table_name => \'t\'))',
+      'SELECT query, "query" FROM system.runtime.queries',
+      'WITH FUNCTION twice(x bigint) RETURNS bigint RETURN x * 2 SELECT twice(2)',
+      'WITH session AS (SELECT 1 AS a) SELECT a FROM session',
+      'WITH session(a) AS (SELECT 1) SELECT a FROM session',
+    ]);
+    for (const sql of ['EXPLAIN SELECT 1', 'EXPLAIN (TYPE DISTRIBUTED, FORMAT JSON) SELECT 1', 'EXPLAIN (TYPE IO) WITH a AS (SELECT 1) SELECT * FROM a']) {
+      expect([sql, verdict(sql, 'trino')]).toEqual([sql, 'ok:explain']);
+    }
+  });
+
+  test('Trino: each of AC-1044\'s statements refused before it runs, saying which', () => {
+    const said: [string, RegExp][] = [
+      ['CALL hive.system.drop_stats(\'s\', \'t\')', /this is a CALL statement/],
+      ['SET SESSION query_max_run_time = \'1h\'', /this is a SET SESSION statement/],
+      ['RESET SESSION query_max_run_time', /this is a RESET SESSION statement/],
+      ['USE hive.s', /this is a USE statement/],
+      ['PREPARE p FROM SELECT 1', /this is a PREPARE statement/],
+      ['EXECUTE p', /this is an EXECUTE statement/],
+      ['EXECUTE IMMEDIATE \'DELETE FROM t\'', /this is an EXECUTE statement/],
+      ['START TRANSACTION READ WRITE', /this is a START TRANSACTION statement/],
+      ['COMMIT', /this is a COMMIT statement/],
+      ['GRANT SELECT ON t TO u', /this is a GRANT statement/],
+      ['DENY DELETE ON t TO u', /this is a DENY statement/],
+      ['REFRESH MATERIALIZED VIEW mv', /this is a REFRESH statement/],
+      ['ANALYZE t', /this is an ANALYZE statement/],
+      ['MERGE INTO t USING s ON t.a = s.a WHEN MATCHED THEN DELETE', /this is a MERGE statement/],
+      ['TRUNCATE TABLE t', /this is a TRUNCATE statement/],
+      ['COMMENT ON TABLE t IS \'x\'', /this is a COMMENT statement/],
+      ['ALTER TABLE t EXECUTE optimize', /this is an ALTER TABLE statement/],
+      ['EXPLAIN ANALYZE SELECT 1', /EXPLAIN ANALYZE runs the statement/],
+      ['EXPLAIN ANALYZE VERBOSE SELECT 1', /EXPLAIN ANALYZE runs the statement/],
+      ['SELECT * FROM TABLE(pg.system.query(query => \'DELETE FROM t\'))', /^The table function query is refused: it sends its SQL to the catalog's own database/],
+      ['SELECT * FROM TABLE(es.system.raw_query(schema => \'s\', index => \'i\', query => \'{}\'))', /^The table function raw_query is refused/],
+      ['SELECT * FROM TABLE(pg.system."QUERY"(query => \'x\'))', /^The table function query is refused/],
+      ['WITH SESSION query_max_run_time = \'1h\' SELECT 1', /^WITH SESSION sets the query's session properties/],
+      ['EXPLAIN WITH SESSION hive.x = 1 SELECT 1', /^WITH SESSION sets/],
+      ['SELECT 1 /* x */; DELETE FROM t', /one statement/],
+    ];
+    for (const [sql, message] of said) {
+      expect([sql, (() => {
+        try {
+          classifySql(sql, 'trino');
+          return 'ran';
+        } catch (e: any) {
+          expect(e).toBeInstanceOf(SqlRefusal);
+          return e.message;
+        }
+      })()]).toEqual([sql, expect.stringMatching(message)]);
+    }
+    refuses('trino', [
+      ['SET SESSION a = 1', 'not_read_only:set'],
+      ['SELECT * FROM TABLE(pg.system.query(query => \'x\'))', 'not_read_only:select'],
+      ['EXPLAIN ANALYZE SELECT 1', 'not_read_only:explain'],
+      ['SELECT \'a\\\'; DELETE FROM t; --\'', 'several_statements:-'],
+      ['SELECT * FROM t; ', 'ok:select'],
+    ]);
+  });
+
   test('a refusal says why, with its code', () => {
     try {
       classifySql('WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d', 'postgres');

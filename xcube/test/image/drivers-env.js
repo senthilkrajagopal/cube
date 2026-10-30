@@ -35,6 +35,10 @@ const POISON = {
   CUBEJS_DB_CLICKHOUSE_READONLY: 'false',
   CUBEJS_DB_CLICKHOUSE_COMPRESSION: 'true',
   CUBEJS_DB_EXPORT_BUCKET_S3_ENDPOINT: 'https://poison-s3-endpoint',
+  CUBEJS_DB_PRESTO_CATALOG: 'poison-catalog',
+  CUBEJS_DB_PRESTO_AUTH_TOKEN: 'poison-presto-token',
+  CUBEJS_DB_SCHEMA: 'poison-schema',
+  CUBEJS_DB_SSL_CA: '/poison-ca',
   PGPASSWORD: 'poison-pgpassword',
   PGHOST: 'poison-pghost',
 };
@@ -62,6 +66,8 @@ const cases = {
   dremio: [{ host: 'xc-host', port: 9047, user: 'xc-user' }, 'password', { password: 'xc-password' }],
   'dremio (cloud)': [{ url: 'https://xc-dremio.example/v0/projects/p' }, 'token', { token: 'xc-token' }, 'dremio'],
   clickhouse: [{ host: 'xc-host', port: 8443, database: 'xc-db', user: 'xc-user', ssl: true }, 'password', { password: 'xc-password' }],
+  trino: [{ host: 'xc-host', port: 443, catalog: 'xc-catalog', schema: 'xc-schema', user: 'xc-user' }, 'password', { password: 'xc-password' }],
+  'trino (jwt)': [{ host: 'xc-host', port: 443, catalog: 'xc-catalog', schema: 'xc-schema', user: 'xc-user' }, 'jwt', { token: 'xc-token' }, 'trino'],
 };
 
 // Each value the connection gives, as the driver would hold it: a JSON secret by its values.
@@ -115,6 +121,9 @@ const POISONED = Object.values(POISON).filter((p) => p.length > 3);
       }
       if (driverType === 'clickhouse' && (driver.config.readOnly !== true || driver.config.compression?.request !== false || driver.config.exportBucket)) {
         leaked.push('ClickHouse\'s read-only, compression or export bucket from the environment');
+      }
+      if (driverType === 'trino' && (driver.config.exportBucket || driver.config.ssl === undefined || driver.config.queryTimeout !== 600)) {
+        leaked.push('Trino\'s export bucket, TLS or query timeout from the environment');
       }
       const expected = given(fields, secrets);
       const reached = seen(parts, expected);

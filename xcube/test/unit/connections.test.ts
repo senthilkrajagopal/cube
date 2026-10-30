@@ -277,8 +277,8 @@ describe('read-only drivers: DuckDB, ClickHouse, Trino and Athena', () => {
     expect(DRIVERS.duckdb.config({ kind: 'motherduck', database: 'md' }, 'token', { token: 't' })).toMatchObject({ motherDuck: { database: 'md', token: 't' }, s3: undefined });
   });
 
-  test('none connects yet: each says so, and the target binds a secret to where it reaches', () => {
-    expect(() => DRIVERS.trino.make!({})).toThrow('xcube doesn\'t connect Trino data sources yet');
+  test('DuckDB and Athena don\'t connect yet: each says so, and the target binds a secret to where it reaches', () => {
+    expect(() => DRIVERS.athena.make!({})).toThrow('xcube doesn\'t connect Athena data sources yet');
     const aad = (driver: DriverType, fields: Record<string, string | boolean>) => secretAadV1(driver, 'password', fields).toString();
     expect(aad('clickhouse', { host: 'h', database: 'd', user: 'u' })).toBe(aad('clickhouse', { host: 'h', database: 'other', user: 'v' }));
     expect(aad('clickhouse', { host: 'h', ssl: false })).not.toBe(aad('clickhouse', { host: 'h' }));

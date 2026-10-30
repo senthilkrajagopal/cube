@@ -17,6 +17,7 @@
  *   for one row more than the cap.
  */
 import { randomUUID } from 'crypto';
+import { trinoError } from '../connections/trino';
 import type { StatementKind } from './classify';
 import type { SqlBind } from './parameters';
 
@@ -791,6 +792,85 @@ async function clickhouseSession(driver: any, caps: SqlCaps): Promise<SqlSession
 }
 
 /**
+ * Trino: its client protocol, through the run's own client. The statement
+ * goes with `query_max_run_time` at the run's time cap, and its result is
+ * read a page at a time, only to the cap. At the cap, at the time cap or on
+ * a cancel, the query is killed by its id; the client stops polling as it
+ * next would. Trino has no read-only transaction its client can hold: the
+ * check (`classify.ts`) and the user's grants are the guard.
+ */
+async function trinoSession(driver: any, caps: SqlCaps): Promise<SqlSession> {
+  const { client } = driver;
+  const seconds = Math.max(1, Math.ceil(caps.timeoutMs / 1000));
+  let queryId: string | null = null;
+  let stopping = false;
+  const kill = () => new Promise<void>((resolve) => {
+    if (!queryId) {
+      resolve();
+      return;
+    }
+    client.kill(queryId, () => resolve());
+  });
+  return {
+    run(sql, rows) {
+      return new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const settle = (e?: unknown) => {
+          if (!settled) {
+            settled = true;
+            if (e) {
+              reject(trinoError(e));
+            } else {
+              resolve();
+            }
+          }
+        };
+        const columnsOf = (columns: any[]) => {
+          if (!rows.columns.length && Array.isArray(columns)) {
+            rows.setColumns(columns.map((c) => ({ name: String(c.name), type: c.type == null ? null : String(c.type) })));
+          }
+        };
+        client.execute({
+          query: sql,
+          catalog: driver.config.catalog,
+          schema: driver.config.schema,
+          session: `query_max_run_time=${seconds}s`,
+          // The client's own clock, behind the run's: it kills the query too.
+          timeout: seconds + 30,
+          cancel: () => stopping || settled,
+          state: (_error: unknown, id: string) => {
+            queryId = id ?? queryId;
+            if (stopping) {
+              kill();
+            }
+          },
+          columns: (_error: unknown, columns: any[]) => columnsOf(columns),
+          data: (_error: unknown, data: unknown[][], columns: any[]) => {
+            if (settled) {
+              return;
+            }
+            columnsOf(columns);
+            if (!(data ?? []).every((row) => rows.add(row))) {
+              settle();
+              kill();
+            }
+          },
+          success: () => settle(),
+          error: (e: unknown) => settle(e),
+        });
+      });
+    },
+    async cancel() {
+      stopping = true;
+      await quietly(kill);
+    },
+    async close() {
+      await quietly(() => driver.release?.());
+    },
+  };
+}
+
+/**
  * Whether a Cube Store plan joins on its router: a join not under a
  * `ClusterSend`. Its router runs it, and nothing stops that once it starts
  * (`endsAtCubeStoreTimeout`); a join multiplies what it reads.
@@ -909,8 +989,9 @@ export function openSession(
       return dremioSession(driver);
     case 'clickhouse':
       return clickhouseSession(driver, caps);
-    case 'duckdb':
     case 'trino':
+      return trinoSession(driver, caps);
+    case 'duckdb':
     case 'athena':
       return Promise.reject(new SqlRunError('connect_failed', `The SQL runner doesn't run on ${dialect} data sources yet`));
     case 'cubestore':
@@ -941,9 +1022,11 @@ export function isTimeout(dialect: SessionDialect, e: any): boolean {
     case 'clickhouse':
       // TIMEOUT_EXCEEDED: its max_execution_time.
       return code === '159' || e?.type === 'TIMEOUT_EXCEEDED' || /\(TIMEOUT_EXCEEDED\)/.test(message);
+    case 'trino':
+      // EXCEEDED_TIME_LIMIT: its query_max_run_time; or the client's own clock.
+      return code === 'EXCEEDED_TIME_LIMIT' || /query timed out/.test(message);
     case 'dremio':
     case 'duckdb':
-    case 'trino':
     case 'athena':
     case 'cubestore':
       return false;

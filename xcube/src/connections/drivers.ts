@@ -9,6 +9,7 @@
  * of them reaches a connection.
  */
 import { makeClickHouseDriver } from './clickhouse';
+import { makeTrinoDriver } from './trino';
 
 export const DRIVER_TYPES = [
   'postgres', 'redshift', 'mysql', 'snowflake', 'bigquery', 'mssql', 'oracle', 'dremio', 'duckdb', 'clickhouse', 'trino', 'athena',
@@ -515,7 +516,7 @@ export const DRIVERS: Record<DriverType, DriverSpec> = {
         credentials: undefined,
       };
     },
-    make: notYet('Trino'),
+    make: makeTrinoDriver,
   },
   /** Amazon Athena: an access key of the data source's own, or the Cube pods' role where the deployment allows it. */
   athena: {

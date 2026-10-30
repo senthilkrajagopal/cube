@@ -87,10 +87,14 @@ interface Rules {
   cubeStore: boolean;
   /** ClickHouse: only the table functions that read nothing outside it, and no SETTINGS or FORMAT clause. */
   clickhouse: boolean;
+  /** Trino: no `WITH SESSION` setting the query's session properties. */
+  trino: boolean;
   /** Names refused anywhere, unquoted: statements that write or lock, and the words that start them. */
   deniedWords: Set<string>;
   /** A called function's name (its last part) that acts outside the transaction. */
   deniedFunction?: RegExp;
+  /** What a denied function is and does, where the transaction's words don't fit (Trino has none). */
+  deniedFunctionIs?: { what: string; why: string };
   /** A name refused anywhere, called or not (Oracle calls a function without arguments without parentheses). */
   deniedName?: RegExp;
 }
@@ -143,6 +147,7 @@ const base = {
   explain: 'read',
   cubeStore: false,
   clickhouse: false,
+  trino: false,
 } as const;
 
 /**
@@ -261,9 +266,18 @@ const RULES: Record<SqlDialect, Rules> = {
     deniedWords: new Set(WRITES.filter((w) => w !== 'MERGE')),
     deniedFunction: CLICKHOUSE_FUNCTIONS,
   },
-  // Until each has rules of its own, read every way and refused at the session (the runner doesn't run on them yet).
+  // Until it has rules of its own, read every way and refused at the session (the runner doesn't run on it yet).
   duckdb: { ...base, readings: readings(BOTH, BOTH), deniedWords: new Set(WRITES) },
-  trino: { ...base, readings: readings(BOTH, BOTH), deniedWords: new Set(WRITES) },
+  trino: {
+    ...base,
+    trino: true,
+    // A quote doubled in a string or a name, never a backslash, and comments that don't nest (Trino's grammar).
+    readings: readings([false], [false]),
+    deniedWords: new Set(WRITES),
+    // Its connectors' passthrough table functions, `TABLE(pg.system.query(query => '…'))`: the source database runs the SQL as written.
+    deniedFunction: /^(query|raw_query)$/,
+    deniedFunctionIs: { what: 'table function', why: 'it sends its SQL to the catalog\'s own database, which runs it as written' },
+  },
   athena: { ...base, readings: readings(BOTH, BOTH), deniedWords: new Set(WRITES) },
   cubestore: {
     ...base,
@@ -286,6 +300,9 @@ const EXPLAIN_OPTIONS = new Set([
 ]);
 
 const SET_OPERATORS = new Set(['UNION', 'INTERSECT', 'EXCEPT', 'MINUS']);
+
+/** Statements named by their first two words, where the first alone doesn't say which: SET SESSION, START TRANSACTION. */
+const TWO_WORD_STATEMENTS = new Set(['SET', 'START', 'RESET', 'ALTER', 'CREATE', 'DROP', 'SHOW']);
 
 /** What may come between a set operator and the query after it. */
 const SET_QUANTIFIERS = new Set(['ALL', 'DISTINCT', 'CORRESPONDING', 'BY', 'NAME', 'STRICT']);
@@ -599,7 +616,8 @@ function check(sql: string, rules: Rules, reading: Reading, redacted: () => stri
     refuse('Read Cube Store\'s tables instead, with a LIMIT: information_schema.tables and .columns, system.tables, system.partitions, system.chunks, system.indexes', first.value.toLowerCase());
   } else {
     const kind = first.kind === 'word' ? first.value.toLowerCase() : null;
-    refuse(`Only a SELECT${rules.explain === 'read' ? ' or an EXPLAIN' : ''} runs here${kind ? `: this is ${/^[aeiou]/.test(kind) ? 'an' : 'a'} ${kind.toUpperCase()} statement` : ''}`, kind);
+    const named = kind && TWO_WORD_STATEMENTS.has(first.value) && isWord(tokens[start + 1]) ? `${first.value} ${tokens[start + 1].value}` : kind?.toUpperCase();
+    refuse(`Only a SELECT${rules.explain === 'read' ? ' or an EXPLAIN' : ''} runs here${kind ? `: this is ${/^[aeio]|^u(?!se)/.test(kind) ? 'an' : 'a'} ${named} statement` : ''}`, kind);
   }
 
   // Nothing in it writes or locks.
@@ -625,7 +643,8 @@ function check(sql: string, rules: Rules, reading: Reading, redacted: () => stri
         refuse(`${name.toUpperCase()} is refused: it can act outside a read`, statement);
       }
       if (rules.deniedFunction?.test(name) && isOp(tokens[k + 1], '(')) {
-        refuse(`The function ${name} is refused: it acts outside a read-only transaction`, statement);
+        const { what, why } = rules.deniedFunctionIs ?? { what: 'function', why: 'it acts outside a read-only transaction' };
+        refuse(`The ${what} ${name} is refused: ${why}`, statement);
       }
       if (rules.cubeStore && name === 'system' && isOp(tokens[k + 1], '.')
         && (tokens[k + 2]?.kind === 'word' || tokens[k + 2]?.kind === 'quoted')
@@ -637,6 +656,11 @@ function check(sql: string, rules: Rules, reading: Reading, redacted: () => stri
 
   if (rules.clickhouse) {
     checkClickHouse(tokens, (message) => refuse(message, statement));
+  }
+  // `WITH SESSION query_max_run_time = '1h' SELECT …`; a query named session is `WITH session AS (…)`.
+  if (rules.trino && isWord(tokens[query], 'WITH') && isWord(tokens[query + 1], 'SESSION')
+    && !isWord(tokens[query + 2], 'AS') && !isOp(tokens[query + 2], '(')) {
+    refuse('WITH SESSION sets the query\'s session properties: the runner sets them, and a statement here doesn\'t', statement);
   }
 
   // One statement: every query at the top level after its first follows a set operator.

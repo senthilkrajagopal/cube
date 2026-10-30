@@ -355,8 +355,8 @@ describe('the SQL runner: ClickHouse', () => {
 });
 
 describe('the SQL runner: drivers it doesn\'t run on yet', () => {
-  test('DuckDB, Trino and Athena refuse to open a session, touching nothing of the driver', async () => {
-    for (const dialect of ['duckdb', 'trino', 'athena'] as const) {
+  test('DuckDB and Athena refuse to open a session, touching nothing of the driver', async () => {
+    for (const dialect of ['duckdb', 'athena'] as const) {
       await expect(openSession(dialect, {}, caps, noRefusal)).rejects.toMatchObject({
         code: 'connect_failed',
         message: `The SQL runner doesn't run on ${dialect} data sources yet`,

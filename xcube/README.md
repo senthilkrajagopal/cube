@@ -757,6 +757,12 @@ top of them:
      Oracle's `UTL_` and `DBMS_` packages but `DBMS_XPLAN`, `DBMS_LOB` and
      `DBMS_RANDOM`; ClickHouse's `url`, `s3`, `file`, `remote`, `mysql` and
      the other functions that reach outside its tables).
+   - Trino's own statements are refused, by name: `CALL`, `SET SESSION`,
+     `RESET`, `USE`, `PREPARE`, `EXECUTE`, `START TRANSACTION`, `COMMIT`,
+     `GRANT`, `DENY`, `REFRESH`, `ANALYZE`, `TRUNCATE`, `COMMENT`, `EXPLAIN
+     ANALYZE`; so are its `query` and `raw_query` table functions, which send
+     their SQL to a catalog's own database, and a `WITH SESSION` prefix: the
+     runner sets the session.
    - ClickHouse's FROM clause calls only `numbers`, `zeros`,
      `generate_series`, `generateRandom`, `values`, `null`, `view`, `merge`,
      `format` and `dictionary`, and a statement's own `SETTINGS` or `FORMAT`
@@ -777,19 +783,21 @@ top of them:
    function writes. On SQL Server it isn't read-only, but rolled back.
    BigQuery's dry run must call the statement a `SELECT` before it runs.
    ClickHouse runs it with `readonly=2`, so its login must not be at
-   `readonly=1` (Cube's own queries set settings too). Snowflake and Dremio
-   have the check alone.
+   `readonly=1` (Cube's own queries set settings too). Snowflake, Dremio and
+   Trino have the check alone.
 4. **A connection of the run's own**, a pool of one, never one Cube serves
    with, dropped afterwards: nothing it sets outlives the run.
 
 What only a SELECT-only login closes: a SELECT calling a function that writes,
 on Snowflake (external functions), SQL Server and Dremio; and on Oracle a
-function with an autonomous transaction.
+function with an autonomous transaction; and on Trino whatever a catalog's
+connector does on a read.
 
 **Caps per run**, sent with each run (R50's by default):
 - **Rows** (`maxRows`, 10,000; at most 100,000): read as they come, one past
   the cap, and no further. Oracle's are read from a result set 100 at a time,
-  and Dremio's a page of 500 at a time, only to the cap. ClickHouse's
+  and Dremio's a page of 500 at a time, only to the cap. Trino's a page at
+  a time, as Trino sends them, and the query is killed at the cap. ClickHouse's
   `max_result_rows` stops it in whole blocks past the cap. Cube Store answers every row at
   once, so a SELECT there is asked for one past the cap by its own top-level
   `LIMIT`, added or lowered (a subquery would lose its order).
@@ -798,7 +806,7 @@ function with an autonomous transaction.
   `MAX_EXECUTION_TIME` (MariaDB's `max_statement_time`), Snowflake's
   `STATEMENT_TIMEOUT_IN_SECONDS`, SQL Server's `requestTimeout`, Oracle's
   `callTimeout`, BigQuery's `jobTimeoutMs`, ClickHouse's
-  `max_execution_time` (in whole seconds). Then a clock of xcube's, 2 s
+  `max_execution_time` and Trino's `query_max_run_time` (in whole seconds). Then a clock of xcube's, 2 s
   later, cancels it on the database: Dremio's job through its API. Cube Store
   can't stop a query (below).
 - **Bytes** (`maxBytes`, 10 MB; at most 100 MB) of the answer's rows as JSON.
@@ -808,7 +816,8 @@ function with an autonomous transaction.
 **A run stopped at its time cap, or cancelled, answers the rows it read
 before**, marked `truncated: "stopped"`, beside its `422` and `code`. How many
 depends on when the database sends them:
-- every row that arrived on PostgreSQL, Redshift, MySQL and ClickHouse;
+- every row that arrived on PostgreSQL, Redshift, MySQL and ClickHouse, and
+  Trino's in whole pages;
 - SQL Server's in whole 4 KB network packets: a result smaller than one
   arrives only at its end;
 - Oracle's in whole fetches of 100 rows;
@@ -821,7 +830,7 @@ noted in xcube's database while it runs (`sql_runs`), and a cancel for another
 instance's reaches it through the notification channel. The statement is
 cancelled on the database (`pg_cancel_backend`, `KILL QUERY`, Snowflake's and
 BigQuery's cancels, SQL Server's attention, Oracle's break, Dremio's job
-cancel). On ClickHouse the run lets go of its request, which ends the query
+cancel, Trino's kill by query id). On ClickHouse the run lets go of its request, which ends the query
 there (`cancel_http_readonly_queries_on_client_close`), and tries `KILL QUERY`,
 which a SELECT-only login may not. One run per `runId` at a time.
 
@@ -885,7 +894,8 @@ which a SELECT-only login may not. One run per `runId` at a time.
 - dates as ISO 8601;
 - numbers as Cube's driver gives them: PostgreSQL's `int8` and `numeric`,
   MySQL's `BIGINT` and `DECIMAL`, Snowflake's numbers, every number of SQL
-  Server's, and ClickHouse's 64-bit integers and decimals, as strings;
+  Server's, ClickHouse's 64-bit integers and decimals, and Trino's integers
+  past 2^53, as strings;
 - a ClickHouse join's unmatched cells as `null` (`join_use_nulls`);
 - Cube Store's values as strings.
 
