@@ -65,6 +65,30 @@
       "field": "credentials",
       "fields": { "projectId": "golden-project", "location": "US" },
       "aad": "[\"wechart/data-source-secret/v1\",\"bigquery\",\"credentials\",[[\"projectId\",\"golden-project\"]]]"
+    },
+    {
+      "driver": "clickhouse",
+      "field": "password",
+      "fields": { "host": "ch.example.com", "port": 8443, "ssl": true },
+      "aad": "[\"wechart/data-source-secret/v1\",\"clickhouse\",\"password\",[[\"host\",\"ch.example.com\"],[\"port\",\"8443\"],[\"ssl\",\"true\"]]]"
+    },
+    {
+      "driver": "trino",
+      "field": "token",
+      "fields": { "host": "t.example.com", "port": 443 },
+      "aad": "[\"wechart/data-source-secret/v1\",\"trino\",\"token\",[[\"host\",\"t.example.com\"],[\"port\",\"443\"],[\"sslCa\",\"\"],[\"sslRejectUnauthorized\",\"\"]]]"
+    },
+    {
+      "driver": "athena",
+      "field": "secretAccessKey",
+      "fields": { "region": "us-east-1", "workGroup": "primary" },
+      "aad": "[\"wechart/data-source-secret/v1\",\"athena\",\"secretAccessKey\",[[\"region\",\"us-east-1\"],[\"workGroup\",\"primary\"]]]"
+    },
+    {
+      "driver": "duckdb",
+      "field": "token",
+      "fields": { "kind": "motherduck", "database": "my_db" },
+      "aad": "[\"wechart/data-source-secret/v1\",\"duckdb\",\"token\",[[\"database\",\"my_db\"],[\"endpoint\",\"\"],[\"kind\",\"motherduck\"],[\"path\",\"\"],[\"region\",\"\"],[\"s3Location\",\"\"],[\"ssl\",\"\"]]]"
     }
   ],
   "envelopes": [

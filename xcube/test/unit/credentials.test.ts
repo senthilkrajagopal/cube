@@ -127,7 +127,7 @@ describe('wechart\'s golden vectors, scheme v1', () => {
   const golden = JSON.parse(fs.readFileSync(path.join(fixtures, 'golden-v1.json'), 'utf8'));
 
   test('every binding is the one xcube computes, byte for byte', () => {
-    expect(golden.aad.length).toBe(8);
+    expect(golden.aad.length).toBe(12);
     for (const vector of golden.aad) {
       expect({ driver: vector.driver, aad: secretAadV1(vector.driver, vector.field, vector.fields).toString('utf8') })
         .toEqual({ driver: vector.driver, aad: vector.aad });
