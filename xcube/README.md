@@ -592,12 +592,10 @@ Pool sizes and timeouts still come from the environment.
 - **BigQuery's constructor checks `CUBEJS_DB_EXPORT_BUCKET_TYPE`** against
   its own types. An environment naming, say, `s3` stops BigQuery connections
   from building.
-- **Cube's TLS settings still reach Postgres, Redshift and MySQL** (a known
-  gap, not yet mended). With `CUBEJS_DB_SSL` on, Cube's driver reads
-  `CUBEJS_DB_SSL_CA`, `_CERT`, `_KEY`, `_CIPHERS`, `_PASSPHRASE` and
-  `_SERVERNAME` from the environment: a connection of these kinds then
-  presents Cube's own TLS files, or fails to build when a named file is
-  missing. `test/image/drivers-env.js` fails on it, for these four drivers.
+- **Cube's TLS settings are out of sight** while a Postgres, Redshift or
+  MySQL driver is built (`CUBEJS_DB_SSL` and `CUBEJS_DB_SSL_*`, a data
+  source's too). Cube's driver reads them, and the files they name, before
+  the connection's own TLS replaces them.
 
 **Credential keys.**
 - **The key.** xcube holds X25519 private keys, one file per key in

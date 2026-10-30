@@ -8,9 +8,12 @@
  * leaves it empty. A driver spreads its config over those defaults, so none
  * of them reaches a connection.
  */
+import { CubejsServerCore } from '@cubejs-backend/server-core';
+
 import { makeAthenaDriver } from './athena';
 import { makeClickHouseDriver } from './clickhouse';
 import { makeDuckdbDriver } from './duckdb';
+import { withoutEnv } from './env';
 import { makeTrinoDriver } from './trino';
 
 export const DRIVER_TYPES = [
@@ -82,6 +85,24 @@ function tls(fields: Fields, secrets: Record<string, string>, clientCert: boolea
  * the password usable against an attacker in between (wechart's decision).
  */
 const TLS_TARGET = ['ssl', 'sslRejectUnauthorized', 'sslCa'];
+
+/**
+ * Cube's TLS settings, a data source's too (`CUBEJS_DB_SSL`, `_CA`, `_CERT`,
+ * `_KEY`, `_CIPHERS`, `_PASSPHRASE`, `_SERVERNAME`, `_REJECT_UNAUTHORIZED`;
+ * `CUBEJS_DS_<name>_[PRE_AGGREGATIONS_]DB_SSL…`).
+ */
+const CUBE_TLS = /^CUBEJS_(DS_.+_)?DB_SSL/;
+
+/**
+ * Builds Cube's own driver with Cube's TLS settings out of sight: its
+ * constructor reads them (`getSslOptions`) before the config's `ssl` replaces
+ * them, and reads, or fails on, the files they name.
+ */
+const withoutCubeTls = (cubeType: string) => (config: Record<string, unknown>) => withoutEnv(
+  [CUBE_TLS],
+  {},
+  () => CubejsServerCore.createDriver(cubeType as any, config as any),
+);
 
 const tlsFields = [
   text('ssl', { kind: 'boolean' }),
@@ -229,6 +250,7 @@ export const DRIVERS: Record<DriverType, DriverSpec> = {
       password: auth === 'password' ? s.password : () => '',
       ssl: tls(f, s, auth === 'client-certificate', true),
     }),
+    make: withoutCubeTls('postgres'),
   },
   redshift: {
     cubeType: 'redshift',
@@ -246,6 +268,7 @@ export const DRIVERS: Record<DriverType, DriverSpec> = {
       // Its export bucket is the environment's, with AWS keys it would send to this host in an UNLOAD.
       exportBucket: undefined,
     }),
+    make: withoutCubeTls('redshift'),
   },
   mysql: {
     cubeType: 'mysql',
@@ -267,6 +290,7 @@ export const DRIVERS: Record<DriverType, DriverSpec> = {
         ssl: ssl || undefined,
       };
     },
+    make: withoutCubeTls('mysql'),
   },
   snowflake: {
     cubeType: 'snowflake',

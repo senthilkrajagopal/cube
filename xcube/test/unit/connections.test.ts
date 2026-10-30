@@ -3,6 +3,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { CubejsServerCore } from '@cubejs-backend/server-core';
+
 import { Connections, redact } from '../../src/connections/connections';
 import {
   dataSourcesOf, environmentTargetOf, identityOf, targetOf, withIdentityAliases,
@@ -12,6 +14,20 @@ import { SwitchableDriver } from '../../src/connections/switchable';
 import { modelSchema } from '../../src/config';
 import { CredentialKeys, generateCredentialKey, sealSecretV1, secretAadV1 } from '../../src/credentials/credentials';
 import { open } from '../../src/credentials/hpke';
+
+/**
+ * Puts the environment back as `saved` holds it, in place: Cube's `getEnv`
+ * reads the `process.env` object it was loaded with, which a new object
+ * assigned to `process.env` would leave holding a test's values, out of sight.
+ */
+function restoreEnv(saved: NodeJS.ProcessEnv) {
+  for (const key of Object.keys(process.env)) {
+    if (!(key in saved)) {
+      delete process.env[key];
+    }
+  }
+  Object.assign(process.env, saved);
+}
 
 class FakeDriver {
   public released = 0;
@@ -220,7 +236,7 @@ describe('read-only drivers: DuckDB, ClickHouse, Trino and Athena', () => {
       await expect(driver.getSchemas()).rejects.toThrow(/^Code: 81\. DB::Exception: Database sales does not exist\. \(UNKNOWN_DATABASE\)$/);
       await driver.release();
     } finally {
-      process.env = saved;
+      restoreEnv(saved);
     }
   });
 
@@ -284,6 +300,66 @@ describe('read-only drivers: DuckDB, ClickHouse, Trino and Athena', () => {
     expect(aad('trino', { host: 'h', sslRejectUnauthorized: false })).not.toBe(aad('trino', { host: 'h' }));
     expect(aad('duckdb', { kind: 's3', s3Location: 's3://a/' })).not.toBe(aad('duckdb', { kind: 's3', s3Location: 's3://b/' }));
     expect(aad('athena', { region: 'eu-west-1', workGroup: 'w' })).not.toBe(aad('athena', { region: 'us-east-1', workGroup: 'w' }));
+  });
+});
+
+describe('Postgres and MySQL: Cube\'s TLS settings out of sight', () => {
+  // Redshift's driver is Postgres's (`super(config)`); it isn't installed here, so drivers-env.js checks it in the image.
+  const TLS_ENV = {
+    CUBEJS_DB_SSL: 'true',
+    CUBEJS_DB_SSL_REJECT_UNAUTHORIZED: 'false',
+    CUBEJS_DB_SSL_CA: '/poison-ca',
+    CUBEJS_DB_SSL_CERT: '/poison-cert',
+    CUBEJS_DB_SSL_KEY: '/poison-key',
+    CUBEJS_DB_SSL_CIPHERS: 'poison-ciphers',
+    CUBEJS_DB_SSL_PASSPHRASE: 'poison-passphrase',
+    CUBEJS_DB_SSL_SERVERNAME: 'poison-servername',
+  };
+  const keyed = (dataSource: string, preAggregations: boolean) => Object.fromEntries(Object.entries(TLS_ENV)
+    .map(([key, value]) => [key.replace('CUBEJS_', `CUBEJS_DS_${dataSource.toUpperCase()}_${preAggregations ? 'PRE_AGGREGATIONS_' : ''}`), value]));
+
+  test.each([
+    ['postgres', 'Cube\'s own names', {}, false],
+    ['mysql', 'Cube\'s own names', {}, false],
+    ['postgres', 'the data source\'s names', { CUBEJS_DATASOURCES: 'default,conn_x', ...keyed('conn_x', false) }, false],
+    // For pre-aggregations Cube reads CUBEJS_DB_SSL under its pre-aggregations name, and the files under the data source's.
+    ['mysql', 'the data source\'s names, for pre-aggregations', { CUBEJS_DATASOURCES: 'default,conn_x', ...keyed('conn_x', false), ...keyed('conn_x', true) }, true],
+  ] as const)('%s, under %s: the connection\'s own TLS, and the environment put back', async (driverType, _names, env, preAggregations) => {
+    const saved = { ...process.env };
+    Object.assign(process.env, TLS_ENV, env);
+    const before = { ...process.env };
+    try {
+      const fields = { host: 'db.example.com', database: 'sales', user: 'reader', ssl: true, sslCa: 'own-ca', sslCert: 'own-cert' };
+      const spec = DRIVERS[driverType];
+      const config = { ...spec.config(fields, 'client-certificate', { sslKey: 'own-key', sslPassphrase: 'own-passphrase' }), dataSource: 'conn_x', preAggregations, maxPoolSize: 1 };
+      // Cube's driver, as Cube builds it, does read them.
+      expect(() => CubejsServerCore.createDriver(driverType, config as any)).toThrow('Unable to find ca from path: "/poison-ca"');
+      const driver = spec.make!(config);
+      expect(driver.config.ssl).toEqual({
+        rejectUnauthorized: true, ca: 'own-ca', cert: 'own-cert', key: 'own-key', passphrase: 'own-passphrase', servername: undefined, ciphers: undefined,
+      });
+      expect(JSON.stringify(driver.config)).not.toMatch(/poison/);
+      expect(process.env).toEqual(before);
+      await driver.release();
+    } finally {
+      restoreEnv(saved);
+    }
+  });
+
+  test('with TLS off, no TLS at all', async () => {
+    const saved = { ...process.env };
+    Object.assign(process.env, TLS_ENV);
+    try {
+      const fields = { host: 'db.example.com', database: 'sales', user: 'reader', ssl: false };
+      const pg = DRIVERS.postgres.make!({ ...DRIVERS.postgres.config(fields, 'password', { password: 'pw' }), maxPoolSize: 1 });
+      expect(pg.config.ssl).toBe(false);
+      await pg.release();
+      const my = DRIVERS.mysql.make!({ ...DRIVERS.mysql.config(fields, 'password', { password: 'pw' }), maxPoolSize: 1 });
+      expect(my.config.ssl).toBeUndefined();
+      await my.release();
+    } finally {
+      restoreEnv(saved);
+    }
   });
 });
 
