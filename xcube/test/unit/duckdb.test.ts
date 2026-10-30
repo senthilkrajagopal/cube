@@ -46,6 +46,7 @@ describe('DuckDB settings', () => {
   test('the defaults, and a value that isn\'t one refused', () => {
     expect(duckdbSettingsFromEnv({})).toEqual({
       memoryLimit: '2GiB', threads: 2, maxTempDirectorySize: '10GiB', tempRoot: '/tmp/xcube-duckdb', maxOpen: 4, volumes: [],
+      extensionDirectory: null,
     });
     expect(duckdbSettingsFromEnv({ XCUBE_DUCKDB_MEMORY_LIMIT: '512 MB', XCUBE_DUCKDB_VOLUMES: '/data/a, /data/b/' }))
       .toMatchObject({ memoryLimit: '512MB', volumes: ['/data/a', '/data/b'] });
@@ -58,6 +59,7 @@ describe('DuckDB settings', () => {
       [{ XCUBE_DUCKDB_TEMP_ROOT: 'tmp' }, 'XCUBE_DUCKDB_TEMP_ROOT must hold absolute directories, not "tmp"'],
       [{ XCUBE_DUCKDB_VOLUMES: '/a,b' }, 'XCUBE_DUCKDB_VOLUMES must hold absolute directories, not "b"'],
       [{ XCUBE_DUCKDB_VOLUMES: '/a\'b' }, 'XCUBE_DUCKDB_VOLUMES must hold absolute directories'],
+      [{ XCUBE_DUCKDB_EXTENSION_DIRECTORY: 'ext' }, 'XCUBE_DUCKDB_EXTENSION_DIRECTORY must hold absolute directories, not "ext"'],
     ];
     for (const [env, message] of refused) {
       expect(() => duckdbSettingsFromEnv(env)).toThrow(message);
@@ -67,7 +69,7 @@ describe('DuckDB settings', () => {
   test('the readback: sizes as DuckDB shows them, cut to one decimal; directories among those allowed', () => {
     const actual = new Map([
       ['memory_limit', '2.0 GiB'], ['max_temp_directory_size', '1.8 GiB'], ['threads', '2'], ['temp_directory', '/t/i-1'],
-      ['allowed_directories', '[/t/i-1/, s3://lake/sales/]'], ['lock_configuration', 'true'],
+      ['allowed_directories', '["/t/i-1/","s3://lake/sales/"]'], ['lock_configuration', 'true'],
     ]);
     expect(readbackProblem(actual, {
       memory_limit: { bytes: 2 ** 31 },

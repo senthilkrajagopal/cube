@@ -187,6 +187,7 @@ In both modes:
 | `XCUBE_DUCKDB_MAX_TEMP_DIRECTORY_SIZE` | `10GiB` | How much each DuckDB instance may spill to its temp directory (a spill only: not what a `COPY … TO` writes there) |
 | `XCUBE_DUCKDB_TEMP_ROOT` | `/tmp/xcube-duckdb` | Where each DuckDB instance's own temp directory is made, and wiped when it closes |
 | `XCUBE_DUCKDB_MAX_OPEN` | `4` | The most DuckDB instances open in a pod at once (1 to 1,000) |
+| `XCUBE_DUCKDB_EXTENSION_DIRECTORY` | `/cube/duckdb-extensions` in the image | Where DuckDB loads its extensions from: the image's httpfs, aws, iceberg (and avro) and motherduck, for its own platform. Unset, DuckDB's own (`~/.duckdb/extensions`) |
 | `XCUBE_DUCKDB_VOLUMES` | unset | Comma-separated absolute directories a `volume` connection's file may be in. Unset, none may |
 | `XCUBE_CONNECTION_HEARTBEAT_MS` | `600000` | How often an instance re-writes its report of each connection it holds a driver for (10 s to 30 min), so a report within the hour means an instance running |
 | `CUBEJS_TRANSPILATION_WORKER_THREADS_COUNT` | `2` | Cube's; the image sets it when unset, as unset a compile can take gigabytes |
@@ -543,9 +544,11 @@ DuckDB, ClickHouse, Trino and Athena connections are read-only:
   its step (`DuckDB set-up failed at <step>: …`, secrets taken out): `volume`,
   `open`, `limits`, `source`, `extensions`, `allowed_directories`,
   `external_access`, `lock`, `readback`.
-  - Extensions are neither installed nor loaded once it is open; the image
-    carries the ones it needs.
-  - Persistent and unredacted secrets are off.
+  - Extensions are neither installed nor loaded once it is open, and never
+    downloaded: the image carries the ones it needs, for its own platform
+    (`XCUBE_DUCKDB_EXTENSION_DIRECTORY`).
+  - Persistent and unredacted secrets are off from its opening (DuckDB
+    refuses to change them once a secret is made).
   - `allowed_directories` is the S3 prefix, or nothing; then
     `enable_external_access` is off and the configuration locked.
   - `readback` reads every setting back, and a value not as set fails it.

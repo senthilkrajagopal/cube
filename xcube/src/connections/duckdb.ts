@@ -10,12 +10,13 @@
  * 1. `volume`: a volume's path, realpath'd, must be a regular file under a
  *    directory of `XCUBE_DUCKDB_VOLUMES`;
  * 2. `open`: the instance, read-only on a volume's file, with nothing
- *    installed from the network;
+ *    installed from the network, no persistent secrets and none shown
+ *    unredacted (set as it is made: DuckDB refuses to change its secret
+ *    manager's settings once a secret is made);
  * 3. `limits`: memory, threads, and a temp directory of its own (wiped when
  *    it closes) capped in size;
  * 4. `source`: httpfs and an S3 secret scoped to the location, or MotherDuck;
- * 5. `extensions`: no extension installed or loaded from here on, no
- *    persistent secrets, none shown unredacted;
+ * 5. `extensions`: no extension installed or loaded from here on;
  * 6. `allowed_directories`: the S3 location alone (and the temp directory,
  *    which DuckDB adds itself);
  * 7. `external_access`: off, so no other file or URL is read or written;
@@ -49,6 +50,8 @@ export interface DuckdbSettings {
   maxOpen: number;
   /** The directories a volume's file may be under; none: no volume is read. */
   volumes: string[];
+  /** Where the extensions are loaded from: the image's, made for its platform; `null`: DuckDB's own (`~/.duckdb/extensions`). */
+  extensionDirectory: string | null;
 }
 
 const UNITS: Record<string, number> = {
@@ -96,6 +99,8 @@ export function duckdbSettingsFromEnv(env: NodeJS.ProcessEnv = process.env): Duc
     maxOpen: whole(env, 'XCUBE_DUCKDB_MAX_OPEN', 4, 1000),
     volumes: (env.XCUBE_DUCKDB_VOLUMES || '').split(',').map((d) => d.trim()).filter(Boolean)
       .map((d) => absolute('XCUBE_DUCKDB_VOLUMES', d)),
+    extensionDirectory: env.XCUBE_DUCKDB_EXTENSION_DIRECTORY
+      ? absolute('XCUBE_DUCKDB_EXTENSION_DIRECTORY', env.XCUBE_DUCKDB_EXTENSION_DIRECTORY) : null,
   };
 }
 
@@ -325,7 +330,7 @@ export class DuckdbSetupError extends Error {
   }
 }
 
-/** What a setting must read back as: a value, a size near it, or directories among these. */
+/** What a setting must read back as: a value, a size near it, or directories among these (read as a JSON list). */
 type Expected = { is: string } | { bytes: number } | { within: string[] };
 
 /** Checks `duckdb_settings()` against what set-up set; the first that differs, or nothing. */
@@ -350,7 +355,7 @@ export function readbackProblem(actual: Map<string, string>, expected: Record<st
       }
     }
     if ('within' in want) {
-      const dirs = value.replace(/^\[|\]$/g, '').split(/,\s*/).map((d) => d.trim()).filter(Boolean);
+      const dirs: string[] = JSON.parse(value);
       const extra = dirs.find((d) => !want.within.includes(asPrefix(d)));
       if (extra) {
         return `${name} holds ${extra}, which set-up didn't allow`;
@@ -428,6 +433,9 @@ function duckdbDriverClass() {
             autoinstall_known_extensions: 'false',
             // MotherDuck's extension loads as `md:` opens; nothing else does.
             autoload_known_extensions: source.kind === 'motherduck' ? 'true' : 'false',
+            ...(own.extensionDirectory ? { extension_directory: own.extensionDirectory } : {}),
+            allow_persistent_secrets: 'false',
+            allow_unredacted_secrets: 'false',
           };
           if (file) {
             options.access_mode = 'READ_ONLY';
@@ -476,8 +484,6 @@ function duckdbDriverClass() {
           await run('SET autoinstall_known_extensions = false');
           await run('SET autoload_known_extensions = false');
           await run('SET allow_community_extensions = false');
-          await run('SET allow_persistent_secrets = false');
-          await run('SET allow_unredacted_secrets = false');
 
           step = 'allowed_directories';
           await run(`SET allowed_directories = [${allowed.map(literal).join(', ')}]`);
@@ -491,6 +497,9 @@ function duckdbDriverClass() {
           step = 'readback';
           const read = await connection.runAndReadAll('SELECT name, value FROM duckdb_settings()');
           const actual = new Map(read.getRowsJson().map(([name, value]) => [String(name), String(value)]));
+          // As a list: DuckDB's text of it quotes some entries (`s3://…`) and not others.
+          const dirs = await connection.runAndReadAll('SELECT unnest(current_setting(\'allowed_directories\')) AS d');
+          actual.set('allowed_directories', JSON.stringify(dirs.getRowsJson().map(([d]) => String(d))));
           const problem = readbackProblem(actual, {
             memory_limit: { bytes: sizeInBytes(own.memoryLimit)! },
             threads: { is: String(own.threads) },
@@ -499,6 +508,7 @@ function duckdbDriverClass() {
             autoinstall_known_extensions: { is: 'false' },
             autoload_known_extensions: { is: 'false' },
             allow_community_extensions: { is: 'false' },
+            ...(own.extensionDirectory ? { extension_directory: { is: own.extensionDirectory } } : {}),
             allow_persistent_secrets: { is: 'false' },
             allow_unredacted_secrets: { is: 'false' },
             allowed_directories: { within: [...allowed, asPrefix(this.tempDir)] },
