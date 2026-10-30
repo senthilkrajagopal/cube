@@ -14,7 +14,8 @@
  * refused.
  */
 
-export type SqlDialect = 'postgres' | 'redshift' | 'mysql' | 'snowflake' | 'bigquery' | 'mssql' | 'oracle' | 'dremio' | 'cubestore';
+export type SqlDialect = 'postgres' | 'redshift' | 'mysql' | 'snowflake' | 'bigquery' | 'mssql' | 'oracle' | 'dremio'
+  | 'duckdb' | 'clickhouse' | 'trino' | 'athena' | 'cubestore';
 
 export type StatementKind = 'select' | 'explain';
 
@@ -213,6 +214,11 @@ const RULES: Record<SqlDialect, Rules> = {
     readings: readings([false], [false]),
     deniedWords: new Set(WRITES),
   },
+  // Until each has rules of its own, read every way and refused at the session (the runner doesn't run on them yet).
+  duckdb: { ...base, readings: readings(BOTH, BOTH), deniedWords: new Set(WRITES) },
+  clickhouse: { ...base, readings: readings(BOTH, BOTH), deniedWords: new Set(WRITES) },
+  trino: { ...base, readings: readings(BOTH, BOTH), deniedWords: new Set(WRITES) },
+  athena: { ...base, readings: readings(BOTH, BOTH), deniedWords: new Set(WRITES) },
   cubestore: {
     ...base,
     hashComment: true,

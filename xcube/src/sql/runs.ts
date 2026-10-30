@@ -3,7 +3,7 @@ import {
   classifySql, ParameterError, redactSql, SqlRefusal, withRowCap, type SqlDialect,
 } from './classify';
 import {
-  bindParameters, UNBOUND_DIALECTS, type SqlBind, type SqlParameter,
+  bindParameters, DIALECT_NAMES, UNBOUND_DIALECTS, type SqlBind, type SqlParameter,
 } from './parameters';
 import {
   isTimeout, openSession, RowCollector, SqlRunError, type SessionDialect, type SqlAnswer, type SqlCaps, type SqlRows, type SqlSession,
@@ -121,7 +121,7 @@ export class SqlRuns {
         if (UNBOUND_DIALECTS.has(dialect as SqlDialect) && Object.keys(request.parameters).length) {
           throw new SqlRunError(
             'parameters_unsupported',
-            `${dialect === 'dremio' ? 'Dremio' : 'Cube Store'} takes no bound values: run the statement without parameters`,
+            `${DIALECT_NAMES[dialect as SqlDialect]} takes no bound values: run the statement without parameters`,
             redactSql(request.sql, dialect as SqlDialect),
             null, null, null, null, dialect,
           );

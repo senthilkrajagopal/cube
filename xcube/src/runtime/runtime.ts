@@ -27,7 +27,7 @@ import {
   type ItemError,
   type PublishedItem,
 } from '../names/items';
-import { filesOf, itemsHash, outOfRange, publish } from '../names/publish';
+import { filesOf, itemsHash, outOfRange, publish, type DataSourceRef } from '../names/publish';
 import { parentOf, rollupsToStrip, withoutRollups } from '../overlays/rollups';
 import {
   boundDataSource, effectiveDataSource, MAX_OVERLAY_ORCHESTRATORS, overlayOfAppId, withDataSourceMark,
@@ -1533,7 +1533,7 @@ export class XcubeRuntime {
     current: PublishedItem[],
     overlay: { upserts: AuthoredItem[]; deletes: { folderId: string; name: string }[]; connections?: OverlayConnection[] },
     previous: StoredModule[],
-    dataSources?: { folderId: string; name: string }[],
+    dataSources?: DataSourceRef[],
   ): { items: PublishedItem[]; changed: string[]; files: SnapshotFile[]; modules: StoredModule[] } | { errors: ItemError[] } {
     const { published, own } = XcubeRuntime.publishOverlay(tree, current, overlay, dataSources);
     if (published.errors.length) {
@@ -1568,7 +1568,7 @@ export class XcubeRuntime {
     tree: FolderTree,
     current: PublishedItem[],
     overlay: { upserts: AuthoredItem[]; deletes: { folderId: string; name: string }[]; connections?: OverlayConnection[] },
-    dataSources?: { folderId: string; name: string }[],
+    dataSources?: DataSourceRef[],
   ) {
     const brought = overlay.connections ?? [];
     const own = new Map(brought.map((c) => [c.name, DRIVERS[c.driver as keyof typeof DRIVERS].cubeType]));
@@ -1576,7 +1576,7 @@ export class XcubeRuntime {
     const shadowed = new Set(brought.map((c) => nameKey(c.name)));
     const sources = [
       ...(dataSources ?? []).filter((d) => !shadowed.has(nameKey(d.name))),
-      ...brought.map(({ folderId, name }) => ({ folderId, name })),
+      ...brought.map(({ folderId, name, driver }) => ({ folderId, name, driver })),
     ];
     const published = publish({
       tree,
@@ -1990,9 +1990,9 @@ export class XcubeRuntime {
   }
 
   /** A model's connections as publishes bind to them (none: `data_source` is left as written). */
-  protected async dataSourcesOf(model: string): Promise<{ folderId: string; name: string }[] | undefined> {
+  protected async dataSourcesOf(model: string): Promise<DataSourceRef[] | undefined> {
     const connections = await this.requireStore().connections(model);
-    return connections.length ? connections.map((c) => ({ folderId: c.folderId, name: c.name })) : undefined;
+    return connections.length ? connections.map((c) => ({ folderId: c.folderId, name: c.name, driver: c.driver })) : undefined;
   }
 
   /** The published cubes using a data source at `head`: bound to it, or, for the root's `default`, naming none. */

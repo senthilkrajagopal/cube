@@ -228,12 +228,18 @@ describe('a run with parameters', () => {
   const target = (dialect: SqlTarget['dialect'], driver: any = {}): SqlTarget => ({ dialect, label: dialect, build: async () => ({ driver, secrets: [] }) });
   const runs = () => new SqlRuns('here', () => null, () => undefined);
 
-  test('Dremio and Cube Store take no bound values: refused before anything connects', async () => {
-    for (const dialect of ['dremio', 'cubestore'] as const) {
+  test('Dremio, Trino, Athena and Cube Store take no bound values: refused before anything connects', async () => {
+    const names = { dremio: 'Dremio', trino: 'Trino', athena: 'Athena', cubestore: 'Cube Store' };
+    for (const dialect of ['dremio', 'trino', 'athena', 'cubestore'] as const) {
       const build = jest.fn();
       await expect(runs().run('m', { ...target(dialect), build }, {
         runId: 'r1', sql: 'SELECT {{a}}', parameters: { a: text('x') }, ...caps,
-      })).rejects.toMatchObject({ code: 'parameters_unsupported', reason: dialect, redactedSql: 'SELECT {{a}}' });
+      })).rejects.toMatchObject({
+        code: 'parameters_unsupported',
+        reason: dialect,
+        redactedSql: 'SELECT {{a}}',
+        message: `${names[dialect]} takes no bound values: run the statement without parameters`,
+      });
       expect(build).not.toHaveBeenCalled();
     }
   });

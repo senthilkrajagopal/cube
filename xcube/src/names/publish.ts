@@ -85,8 +85,18 @@ export interface PublishInput {
    * the data source each cube uses, its own or its parent's through
    * `extends`, must be one of them, in its folder or an ancestor (R71 4).
    */
-  dataSources?: { folderId: string; name: string }[];
+  dataSources?: DataSourceRef[];
 }
+
+/** A data source of the model: a connection's folder and name, and its driver when known. */
+export interface DataSourceRef {
+  folderId: string;
+  name: string;
+  driver?: string;
+}
+
+/** The drivers whose rollups xcube builds only in Cube Store: their sources are read, never written (AC-1048). */
+const READ_ONLY_DRIVERS = new Set(['duckdb', 'clickhouse', 'trino', 'athena']);
 
 export interface PublishResult {
   items: PublishedItem[];
@@ -390,7 +400,7 @@ function checkNames(defs: ItemDefinition[], resolved: Set<string>): ItemError[] 
 function checkRanges(
   entries: Entry[],
   tree: FolderTree,
-  dataSources: { folderId: string; name: string }[],
+  dataSources: DataSourceRef[],
   checked: (entry: Entry) => boolean = () => true,
 ): ItemError[] {
   const folderOf = new Map(dataSources.map((d) => [d.name, d.folderId]));
@@ -445,7 +455,7 @@ function checkReferences(
 }
 
 /** Checks a cube's own `data_source`: a data source of the model, by its name (the root's `default` is always one). */
-function checkDataSource(def: ItemDefinition, doc: Record<string, any>, dataSources: { folderId: string; name: string }[]): ItemError | undefined {
+function checkDataSource(def: ItemDefinition, doc: Record<string, any>, dataSources: DataSourceRef[]): ItemError | undefined {
   const key = ['data_source', 'dataSource'].find((k) => doc[k] !== undefined);
   if (!key) {
     return undefined;
@@ -459,6 +469,57 @@ function checkDataSource(def: ItemDefinition, doc: Record<string, any>, dataSour
     return { ...at, kind: 'reference', message: `It uses the data source "${named}", which the model doesn't hold` };
   }
   return undefined;
+}
+
+/**
+ * The cubes whose rollups their data source can't take (AC-1042, AC-1048),
+ * inherited ones included: on a read-only driver, a pre-aggregation built in
+ * the source; on ClickHouse, one with no index, as Cube builds even a Cube
+ * Store rollup's table there with its first index as the sort key
+ * (`ClickHouseQuery.preAggregationLoadSql`). A lambda has no table.
+ */
+function checkRollups(
+  entries: Entry[],
+  dataSources: DataSourceRef[],
+  checked: (entry: Entry) => boolean = () => true,
+): ItemError[] {
+  const driverOf = new Map(dataSources.map((d) => [d.name, d.driver]));
+  const byName = new Map(entries.map((entry) => [entry.def.name, entry]));
+  const errors: ItemError[] = [];
+  for (const entry of entries.filter((e) => e.def.kind === 'cube' && checked(e))) {
+    const { name: source } = usedDataSource(entry, byName);
+    const driver = driverOf.get(source);
+    if (!driver || !READ_ONLY_DRIVERS.has(driver)) {
+      continue;
+    }
+    const at = { folderId: entry.def.folderId, name: entry.def.name, kind: 'compile' as const };
+    for (const { pa, from } of rollupsOf(entry, byName)) {
+      const through = from === entry ? '' : ` (from ${from.def.name}, which it extends)`;
+      const type = inflection.camelize(String(pa.type ?? 'rollup'), true);
+      if (inSource(pa)) {
+        errors.push({ ...at, message: `Pre-aggregation ${pa.name}${through} would be built in "${source}": rollups on ${source} are built in Cube Store only` });
+      } else if (driver === 'clickhouse' && type !== 'rollupLambda' && !indexNamesOf(pa).length) {
+        errors.push({ ...at, message: `Pre-aggregation ${pa.name}${through} names no index: a ClickHouse rollup must name an index` });
+      }
+    }
+  }
+  return errors;
+}
+
+/** A cube's pre-aggregations with the cube each is named on: its own, then those it inherits through `extends` and doesn't redefine. */
+function rollupsOf(entry: Entry, byName: Map<string, Entry>): { pa: any; from: Entry }[] {
+  const seen = new Set<string>();
+  const named = new Set<string>();
+  const found: { pa: any; from: Entry }[] = [];
+  for (let at: Entry | undefined = entry; at && !seen.has(at.def.name);) {
+    seen.add(at.def.name);
+    for (const pa of preAggregationsOf(at.doc).filter((p) => !named.has(p.name))) {
+      named.add(pa.name);
+      found.push({ pa, from: at });
+    }
+    at = typeof at.doc.extends === 'string' ? byName.get(at.doc.extends.trim()) : undefined;
+  }
+  return found;
 }
 
 /**
@@ -588,6 +649,7 @@ export function publish({
     errors.push(...checkReferences(entries, tree, bindingsOf, checked));
     if (dataSources) {
       errors.push(...checkRanges(entries, tree, dataSources, checked));
+      errors.push(...checkRollups(entries, dataSources, checked));
     }
   }
   const realiased = assignAliases(entries);
@@ -624,7 +686,7 @@ export function publish({
 export function outOfRange(
   items: PublishedItem[],
   tree: FolderTree,
-  dataSources: { folderId: string; name: string }[],
+  dataSources: DataSourceRef[],
 ): { cubes: string[]; items: string[] } {
   const bindings = new Map(items.map((item) => [item.name, item.bindings]));
   const entries: Entry[] = items.map((item) => ({

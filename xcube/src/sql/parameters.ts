@@ -27,8 +27,29 @@ export interface SqlBind {
   value: string | boolean;
 }
 
-/** Where binding isn't proven: their drivers take no binds (Dremio's job API, Cube Store's). */
-export const UNBOUND_DIALECTS = new Set<SqlDialect>(['dremio', 'cubestore']);
+/**
+ * Where binding isn't proven: their drivers take no binds (Dremio's job API,
+ * Cube Store's, Trino's), or a value isn't yet shown to be taken as one
+ * literal (Athena's execution parameters); DuckDB and ClickHouse until theirs land.
+ */
+export const UNBOUND_DIALECTS = new Set<SqlDialect>(['dremio', 'trino', 'athena', 'duckdb', 'clickhouse', 'cubestore']);
+
+/** A dialect's name as a refusal says it. */
+export const DIALECT_NAMES: Record<SqlDialect, string> = {
+  postgres: 'PostgreSQL',
+  redshift: 'Redshift',
+  mysql: 'MySQL',
+  snowflake: 'Snowflake',
+  bigquery: 'BigQuery',
+  mssql: 'SQL Server',
+  oracle: 'Oracle',
+  dremio: 'Dremio',
+  duckdb: 'DuckDB',
+  clickhouse: 'ClickHouse',
+  trino: 'Trino',
+  athena: 'Athena',
+  cubestore: 'Cube Store',
+};
 
 /** A number's decimal string: at most 38 digits, at most 30 after the point (every dialect's exact decimal holds it). */
 const DECIMAL = /^-?(\d+)(?:\.(\d+))?$/;

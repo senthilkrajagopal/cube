@@ -9,7 +9,9 @@
  * of them reaches a connection.
  */
 
-export const DRIVER_TYPES = ['postgres', 'redshift', 'mysql', 'snowflake', 'bigquery', 'mssql', 'oracle', 'dremio'] as const;
+export const DRIVER_TYPES = [
+  'postgres', 'redshift', 'mysql', 'snowflake', 'bigquery', 'mssql', 'oracle', 'dremio', 'duckdb', 'clickhouse', 'trino', 'athena',
+] as const;
 
 export type DriverType = (typeof DRIVER_TYPES)[number];
 
@@ -33,6 +35,10 @@ export interface DriverSpec {
   target: string[];
   /** Cube's driver config from the connection's fields and opened secrets. */
   config(fields: Fields, authMethod: string, secrets: Record<string, string>): Record<string, unknown>;
+  /** What is wrong with the fields beyond a required one missing: each problem, worded for the form. */
+  check?(fields: Fields, authMethod: string): string[];
+  /** Builds the driver from its config, where it isn't Cube's own as `createDriver` makes it. */
+  make?(config: Record<string, unknown>): any;
 }
 
 export type Fields = Record<string, string | number | boolean | null | undefined>;
@@ -85,6 +91,126 @@ const clientCertificate = [
   secret('sslKey', { kind: 'multiline' }),
   secret('sslPassphrase', { required: false }),
 ];
+
+/**
+ * What the DuckDB, ClickHouse, Trino and Athena drivers write unescaped into
+ * the SQL that reads their catalogs: a name holding a quote, `;`, a backslash,
+ * whitespace, or the start of a comment is refused.
+ */
+const UNSAFE_NAME = /['"`;\\\s]|--|\/\*/;
+
+const unsafeNames = (fields: Fields, keys: string[]) => keys
+  .filter((key) => typeof fields[key] === 'string' && UNSAFE_NAME.test(fields[key] as string))
+  .map((key) => `${key} can't hold a quote, a semicolon, a backslash, whitespace, -- or /*`);
+
+/**
+ * A host alone, a name or an address: the ClickHouse and Trino clients make a
+ * URL of it, and read settings, credentials and paths out of one.
+ */
+function hostProblems(fields: Fields): string[] {
+  const host = str(fields.host);
+  return host === undefined || /^\[[0-9A-Fa-f:.]+\]$/.test(host) || !/[/@?#:%\\\s]/.test(host)
+    ? []
+    : ['host must be a host name or address alone, with no scheme, port, path, user or query'];
+}
+
+const AWS_REGION = /^[a-z]{2}(-[a-z]+)+-\d{1,2}$/;
+const S3_URI = /^s3:\/\/[a-z0-9][a-z0-9.-]{1,61}[a-z0-9](\/[^\s'"\\*?[\]{}]*)?$/;
+const DOT_SEGMENT = /\/\.\.?(\/|$)/;
+
+const s3Problems = (fields: Fields, key: string, what: string) => {
+  const value = str(fields[key]);
+  return value === undefined || (S3_URI.test(value) && !DOT_SEGMENT.test(value.slice(5)))
+    ? []
+    : [`${key} must be ${what}`];
+};
+
+/** Whether this deployment lets a data source sign in as the Cube pods' own AWS role (`XCUBE_ALLOW_POD_ROLE`). */
+export const podRoleAllowed = () => process.env.XCUBE_ALLOW_POD_ROLE === 'true';
+
+const podRoleProblems = (auth: string) => (auth === 'pod-role' && !podRoleAllowed()
+  ? ['Signing in as the Cube pods\' role isn\'t allowed in this deployment (XCUBE_ALLOW_POD_ROLE)']
+  : []);
+
+/**
+ * The config, once its fields pass the driver's own check: a stored
+ * connection is checked again when it is built, as the deployment may have
+ * turned off what it allowed.
+ */
+function checked(spec: Pick<DriverSpec, 'check'>, fields: Fields, authMethod: string) {
+  const problems = spec.check?.(fields, authMethod) ?? [];
+  if (problems.length) {
+    throw new Error(problems.join('; '));
+  }
+}
+
+/** A driver xcube lists but doesn't connect yet. */
+const notYet = (name: string) => () => {
+  throw new Error(`xcube doesn't connect ${name} data sources yet`);
+};
+
+/** Where a DuckDB data source reads from: its fields, and the sign-ins each takes. */
+const DUCKDB_KINDS: Record<string, { fields: string[]; required: string[]; auth: string[] }> = {
+  s3: { fields: ['s3Location', 'region', 'endpoint', 'urlStyle', 'ssl'], required: ['s3Location', 'region'], auth: ['access-key', 'pod-role'] },
+  motherduck: { fields: ['database'], required: ['database'], auth: ['token'] },
+  volume: { fields: ['path'], required: ['path'], auth: ['none'] },
+};
+
+const awsAccessKey = [text('accessKeyId', { required: true }), secret('secretAccessKey')];
+
+const clickhouseCheck = (f: Fields) => [...hostProblems(f), ...unsafeNames(f, ['database'])];
+
+const trinoCheck = (f: Fields) => [...hostProblems(f), ...unsafeNames(f, ['catalog', 'schema'])];
+
+function athenaCheck(f: Fields, auth: string): string[] {
+  const problems = [...podRoleProblems(auth), ...unsafeNames(f, ['catalog', 'database', 'workGroup'])];
+  if (str(f.region) !== undefined && !AWS_REGION.test(String(f.region))) {
+    problems.push('region must be an AWS region, such as eu-west-1');
+  }
+  if (str(f.workGroup) !== undefined && !/^[A-Za-z0-9._-]{1,128}$/.test(String(f.workGroup))) {
+    problems.push('workGroup must be a workgroup\'s name: letters, digits, ., _ and -');
+  }
+  if (auth === 'access-key' && str(f.accessKeyId) !== undefined && !/^[A-Z0-9]{16,128}$/.test(String(f.accessKeyId))) {
+    problems.push('accessKeyId must be an AWS access key ID');
+  }
+  return [...problems, ...s3Problems(f, 's3OutputLocation', 'an s3:// URI, such as s3://bucket/results/')];
+}
+
+function duckdbCheck(f: Fields, auth: string): string[] {
+  const kind = DUCKDB_KINDS[String(f.kind)];
+  if (!kind) {
+    return [`kind must be one of ${Object.keys(DUCKDB_KINDS).join(', ')}`];
+  }
+  const problems: string[] = [];
+  for (const key of Object.keys(f).filter((k) => k !== 'kind' && k !== 'accessKeyId' && f[k] !== undefined && f[k] !== null)) {
+    if (!kind.fields.includes(key)) {
+      problems.push(`${key} is not a field of DuckDB reading from ${f.kind}`);
+    }
+  }
+  for (const key of kind.required) {
+    if (str(f[key]) === undefined) {
+      problems.push(`${key} is required`);
+    }
+  }
+  if (!kind.auth.includes(auth)) {
+    problems.push(`authMethod for DuckDB reading from ${f.kind} is one of ${kind.auth.join(', ')}`);
+  }
+  problems.push(...podRoleProblems(auth));
+  problems.push(...unsafeNames(f, ['database']), ...s3Problems(f, 's3Location', 'an s3:// URI of a bucket and an optional prefix, such as s3://bucket/sales/'));
+  if (str(f.region) !== undefined && !/^[a-z0-9][a-z0-9-]{0,31}$/.test(String(f.region))) {
+    problems.push('region must be a region\'s name, such as eu-west-1');
+  }
+  if (str(f.endpoint) !== undefined && !/^([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(:\d{1,5})?$/.test(String(f.endpoint))) {
+    problems.push('endpoint must be a host and an optional port, with no scheme or path');
+  }
+  if (str(f.urlStyle) !== undefined && !['vhost', 'path'].includes(String(f.urlStyle))) {
+    problems.push('urlStyle must be vhost or path');
+  }
+  if (str(f.path) !== undefined && (!String(f.path).startsWith('/') || /[\0\n\r]/.test(String(f.path)))) {
+    problems.push('path must be an absolute path');
+  }
+  return problems;
+}
 
 export const DRIVERS: Record<DriverType, DriverSpec> = {
   postgres: {
@@ -287,6 +413,137 @@ export const DRIVERS: Record<DriverType, DriverSpec> = {
         password: auth === 'password' ? s.password : undefined,
       };
     },
+  },
+  /** DuckDB in the Cube pods, reading one place: an S3 location, a MotherDuck database, or a file on an allowed volume. */
+  duckdb: {
+    cubeType: 'duckdb',
+    connection: [
+      text('kind', { required: true }), text('s3Location'), text('region'), text('endpoint'), text('urlStyle'),
+      text('ssl', { kind: 'boolean' }), text('database'), text('path'),
+    ],
+    auth: {
+      'access-key': awsAccessKey,
+      'pod-role': [],
+      token: [secret('token')],
+      none: [],
+    },
+    target: ['kind', 's3Location', 'region', 'endpoint', 'ssl', 'database', 'path'],
+    check: duckdbCheck,
+    config(f, auth, s) {
+      checked(this, f, auth);
+      const kind = String(f.kind);
+      return {
+        kind,
+        s3: kind === 's3' ? {
+          location: str(f.s3Location),
+          region: str(f.region),
+          endpoint: str(f.endpoint),
+          urlStyle: str(f.urlStyle) ?? 'vhost',
+          useSsl: bool(f.ssl, true),
+          accessKeyId: auth === 'access-key' ? str(f.accessKeyId) : undefined,
+          secretAccessKey: auth === 'access-key' ? s.secretAccessKey : undefined,
+          podRole: auth === 'pod-role',
+        } : undefined,
+        motherDuck: kind === 'motherduck' ? { database: str(f.database), token: s.token } : undefined,
+        volume: kind === 'volume' ? { path: str(f.path) } : undefined,
+        // Cube's driver reads these from its environment otherwise.
+        databasePath: undefined,
+        motherDuckToken: undefined,
+        initSql: undefined,
+        schema: undefined,
+      };
+    },
+    make: notYet('DuckDB'),
+  },
+  /** Self-hosted ClickHouse or ClickHouse Cloud, over HTTP(S). */
+  clickhouse: {
+    cubeType: 'clickhouse',
+    connection: [text('host', { required: true }), text('port', { kind: 'number' }), text('ssl', { kind: 'boolean' }), text('database', { required: true })],
+    auth: { password: [text('user', { required: true }), secret('password')] },
+    target: ['host', 'port', 'ssl'],
+    check: clickhouseCheck,
+    config(f, auth, s) {
+      checked(this, f, auth);
+      const ssl = bool(f.ssl, true);
+      return {
+        host: str(f.host),
+        port: String(num(f.port, ssl ? 8443 : 8123)),
+        protocol: ssl ? 'https:' : 'http:',
+        database: str(f.database),
+        username: str(f.user),
+        password: s.password,
+        readOnly: true,
+      };
+    },
+    make: notYet('ClickHouse'),
+  },
+  /** Trino over HTTPS, always: a user, with a password or a JWT. */
+  trino: {
+    cubeType: 'trino',
+    connection: [
+      text('host', { required: true }), text('port', { kind: 'number' }), text('sslRejectUnauthorized', { kind: 'boolean' }),
+      text('sslCa', { kind: 'multiline' }), text('catalog', { required: true }), text('schema'),
+    ],
+    auth: {
+      password: [text('user', { required: true }), secret('password')],
+      jwt: [text('user', { required: true }), secret('token')],
+    },
+    target: ['host', 'port', 'sslRejectUnauthorized', 'sslCa'],
+    check: trinoCheck,
+    config(f, auth, s) {
+      checked(this, f, auth);
+      if (auth === 'jwt' && !/^[A-Za-z0-9_.-]+$/.test(s.token ?? '')) {
+        throw new Error('token must be a JWT');
+      }
+      return {
+        host: str(f.host),
+        port: String(num(f.port, 443)),
+        catalog: str(f.catalog),
+        schema: str(f.schema),
+        user: str(f.user),
+        basic_auth: auth === 'password' ? { user: str(f.user), password: s.password } : undefined,
+        custom_auth: auth === 'jwt' ? `Bearer ${s.token}` : undefined,
+        ssl: { rejectUnauthorized: bool(f.sslRejectUnauthorized, true), ca: str(f.sslCa) },
+        useSelectTestConnection: true,
+        queryTimeout: undefined,
+        bucketType: undefined,
+        exportBucket: undefined,
+        accessKeyId: undefined,
+        secretAccessKey: undefined,
+        exportBucketRegion: undefined,
+        credentials: undefined,
+      };
+    },
+    make: notYet('Trino'),
+  },
+  /** Amazon Athena: an access key of the data source's own, or the Cube pods' role where the deployment allows it. */
+  athena: {
+    cubeType: 'athena',
+    connection: [
+      text('region', { required: true }), text('workGroup', { required: true }), text('s3OutputLocation', { required: true }),
+      text('catalog', { required: true }), text('database'),
+    ],
+    auth: { 'access-key': awsAccessKey, 'pod-role': [] },
+    target: ['region', 'workGroup'],
+    check: athenaCheck,
+    config(f, auth, s) {
+      checked(this, f, auth);
+      return {
+        region: str(f.region),
+        workGroup: str(f.workGroup),
+        S3OutputLocation: str(f.s3OutputLocation),
+        catalog: str(f.catalog),
+        database: str(f.database),
+        accessKeyId: auth === 'access-key' ? str(f.accessKeyId) : undefined,
+        secretAccessKey: auth === 'access-key' ? s.secretAccessKey : undefined,
+        podRole: auth === 'pod-role',
+        athenaAwsAssumeRoleArn: undefined,
+        athenaAwsAssumeRoleExternalId: undefined,
+        exportBucket: undefined,
+        readOnly: true,
+      };
+    },
+    make: notYet('Athena'),
   },
 };
 

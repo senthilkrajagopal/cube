@@ -607,6 +607,35 @@ describe('data sources', () => {
     expect(outOfRange(items, moved, sources).cubes).toEqual(['a', 'child']);
   });
 
+  test('rollups on a read-only driver are built in Cube Store only, and a ClickHouse one names an index (AC-1042, AC-1048)', () => {
+    const drivers = [
+      { folderId: 'froot', name: 'default' },
+      { folderId: 'froot', name: 'ch', driver: 'clickhouse' },
+      { folderId: 'froot', name: 'tr', driver: 'trino' },
+      { folderId: 'froot', name: 'pg', driver: 'postgres' },
+    ];
+    const rollups = (...lines: string[]) => `    pre_aggregations:\n${lines.map((l) => `      ${l}\n`).join('')}`;
+    const indexed = '  indexes: [{ name: by_id, columns: [id] }]';
+    const run = (upserts: AuthoredItem[], overlay = false) => publish({ tree, current: [], deletes: [], dataSources: drivers, upserts, overlay });
+    const messages = (upserts: AuthoredItem[]) => run(upserts).errors.map((e) => [e.name, e.kind, e.message]);
+
+    expect(messages([cubeWith('froot', 'a', `    data_source: tr\n${rollups('- name: r', '  external: false', '- name: o', '  type: original_sql', '- name: ok')}`)])).toEqual([
+      ['a', 'compile', 'Pre-aggregation r would be built in "tr": rollups on tr are built in Cube Store only'],
+      ['a', 'compile', 'Pre-aggregation o would be built in "tr": rollups on tr are built in Cube Store only'],
+    ]);
+    expect(messages([cubeWith('froot', 'a', `    data_source: ch\n${rollups('- name: plain', '- name: lam', '  type: rollup_lambda', '- name: good', indexed)}`)])).toEqual([
+      ['a', 'compile', 'Pre-aggregation plain names no index: a ClickHouse rollup must name an index'],
+    ]);
+    // Inherited through extends, and redefined by the child.
+    expect(messages([
+      cubeWith('froot', 'base', rollups('- name: one', '- name: two')),
+      cube('froot', 'kid', `    extends: base\n    data_source: ch\n${rollups('- name: two', indexed)}`),
+    ])).toEqual([['kid', 'compile', 'Pre-aggregation one (from base, which it extends) names no index: a ClickHouse rollup must name an index']]);
+    // Other drivers, and Cube's default, build where they did.
+    expect(run([cubeWith('froot', 'a', `    data_source: pg\n${rollups('- name: r', '  external: false')}`)]).errors).toEqual([]);
+    expect(run([cubeWith('froot', 'a', rollups('- name: r', '  external: false'))]).errors).toEqual([]);
+  });
+
   test('without connections, data_source is left as written', () => {
     const { items } = publish({ tree, current: [], deletes: [], upserts: [cubeWith('feu', 'a', '    data_source: anything\n')] });
     expect(dataSourceOf(items, 'a')).toBe('anything');

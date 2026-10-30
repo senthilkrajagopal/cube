@@ -173,7 +173,13 @@ export interface SqlSession {
 /** Refuses a statement a database's own check found not to be one read (BigQuery's dry run, Cube Store's plan). */
 export type Refuse = (message: string, statement: string, reason?: string) => never;
 
-export type SessionDialect = 'postgres' | 'redshift' | 'mysql' | 'snowflake' | 'bigquery' | 'mssql' | 'oracle' | 'dremio' | 'cubestore';
+export type SessionDialect = 'postgres' | 'redshift' | 'mysql' | 'snowflake' | 'bigquery' | 'mssql' | 'oracle' | 'dremio'
+  | 'duckdb' | 'clickhouse' | 'trino' | 'athena' | 'cubestore';
+
+/** A dialect no case took: the compiler holds every switch over them to all of them. */
+function unknownDialect(dialect: never): never {
+  throw new Error(`xcube has no SQL runner session for ${String(dialect)}`);
+}
 
 const quietly = async (fn: () => unknown) => {
   try {
@@ -764,8 +770,15 @@ export function openSession(
       return oracleSession(driver, caps);
     case 'dremio':
       return dremioSession(driver);
-    default:
+    case 'duckdb':
+    case 'clickhouse':
+    case 'trino':
+    case 'athena':
+      return Promise.reject(new SqlRunError('connect_failed', `The SQL runner doesn't run on ${dialect} data sources yet`));
+    case 'cubestore':
       return cubeStoreSession(driver, refuse);
+    default:
+      return unknownDialect(dialect);
   }
 }
 
@@ -787,7 +800,14 @@ export function isTimeout(dialect: SessionDialect, e: any): boolean {
       return /NJS-123|DPI-1067|ORA-03156/.test(message);
     case 'bigquery':
       return /timed? ?out|jobTimeoutMs/i.test(message);
-    default:
+    case 'dremio':
+    case 'duckdb':
+    case 'clickhouse':
+    case 'trino':
+    case 'athena':
+    case 'cubestore':
       return false;
+    default:
+      return unknownDialect(dialect);
   }
 }

@@ -268,6 +268,7 @@ export class Connections {
         problems.push(`${f.key} is required`);
       }
     }
+    problems.push(...(spec.check?.(fields, input.authMethod) ?? []));
     for (const [key, envelope] of Object.entries(input.sealed ?? {})) {
       if (!secret.some((f) => f.key === key)) {
         problems.push(`${key} is not a secret field of ${input.driver} with ${input.authMethod}`);
@@ -335,15 +336,16 @@ export class Connections {
     const secrets = this.secretsOf(driver, connection.authMethod, connection.fields, connection.sealed);
     const values = Object.values(secrets);
     try {
-      const config = DRIVERS[driver].config(connection.fields, connection.authMethod, secrets);
+      const spec = DRIVERS[driver];
+      const config = {
+        ...spec.config(connection.fields, connection.authMethod, secrets),
+        dataSource: connection.name,
+        preAggregations: options.preAggregations,
+        ...(options.maxPoolSize ? { maxPoolSize: options.maxPoolSize } : {}),
+        ...options.config,
+      };
       return {
-        driver: CubejsServerCore.createDriver(DRIVERS[driver].cubeType as any, {
-          ...config,
-          dataSource: connection.name,
-          preAggregations: options.preAggregations,
-          ...(options.maxPoolSize ? { maxPoolSize: options.maxPoolSize } : {}),
-          ...options.config,
-        } as any),
+        driver: spec.make ? spec.make(config) : CubejsServerCore.createDriver(spec.cubeType as any, config as any),
         secrets: values,
         cubeType: DRIVERS[driver].cubeType,
       };
@@ -654,10 +656,9 @@ export class Connections {
     const values = Object.values(secrets);
     let driver: any;
     const configured = await step('config', () => {
-      const config = DRIVERS[validated!.driver].config(validated!.fields, input.authMethod, secrets);
-      driver = CubejsServerCore.createDriver(DRIVERS[validated!.driver].cubeType as any, {
-        ...config, dataSource: 'xcube_connection_test', maxPoolSize: 1,
-      } as any);
+      const spec = DRIVERS[validated!.driver];
+      const config = { ...spec.config(validated!.fields, input.authMethod, secrets), dataSource: 'xcube_connection_test', maxPoolSize: 1 };
+      driver = spec.make ? spec.make(config) : CubejsServerCore.createDriver(spec.cubeType as any, config as any);
     }, values);
     try {
       if (!configured) {

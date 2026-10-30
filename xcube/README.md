@@ -181,6 +181,7 @@ In both modes:
 | `XCUBE_COMPILE_WAIT_MS` | `120000` | How long one may wait |
 | `XCUBE_CATCH_UP_MS` | `10000` | How long a request naming a newer revision waits for it |
 | `XCUBE_CUBESTORE_QUERY_TIMEOUT` | `120` | Cube Store's own query timeout in seconds, as set on it (`CUBESTORE_QUERY_TIMEOUT`): when a stopped SQL run that Cube Store runs on ends at the latest |
+| `XCUBE_ALLOW_POD_ROLE` | unset | `true` lets Athena and DuckDB S3 connections sign in as the Cube pods' own AWS role (`pod-role`). Unset, they must carry an access key |
 | `XCUBE_CONNECTION_HEARTBEAT_MS` | `600000` | How often an instance re-writes its report of each connection it holds a driver for (10 s to 30 min), so a report within the hour means an instance running |
 | `CUBEJS_TRANSPILATION_WORKER_THREADS_COUNT` | `2` | Cube's; the image sets it when unset, as unset a compile can take gigabytes |
 
@@ -497,7 +498,7 @@ Cube without a restart. Their secrets are sealed by the client's browser to
 xcube's credential key, so the client stores them and can't open them.
 
 **Drivers.** `postgres`, `redshift`, `mysql`, `snowflake`, `bigquery`, `mssql`,
-`oracle` and `dremio`, through Cube's own drivers:
+`oracle`, `dremio`, `duckdb`, `clickhouse`, `trino` and `athena`, through Cube's own drivers:
 
 | Driver | Auth methods | Target (what a secret is bound to) |
 | --- | --- | --- |
@@ -509,6 +510,19 @@ xcube's credential key, so the client stores them and can't open them.
 | `mssql` | `sql-login`, `ntlm`, `entra-service-principal` | host, port, encrypt, trustServerCertificate |
 | `oracle` | `password` | connectString, database, host, port |
 | `dremio` | `token`, `password` (Software only) | host, port, url, ssl |
+| `duckdb` | by `kind`: `s3` takes `access-key`, `pod-role`; `motherduck` takes `token`; `volume` takes `none` | kind, s3Location, region, endpoint, ssl, database, path |
+| `clickhouse` | `password` | host, port, ssl |
+| `trino` | `password`, `jwt` | host, port, sslRejectUnauthorized, sslCa |
+| `athena` | `access-key`, `pod-role` | region, workGroup |
+
+DuckDB, ClickHouse, Trino and Athena connections are read-only:
+- **Rollups are built in Cube Store only.** A publish refuses a cube on one
+  of them with a pre-aggregation built in the source (`external: false`, or
+  `original_sql`).
+- **A ClickHouse rollup must name an index.** Cube builds its table there
+  too, sorted by its first index.
+- **`pod-role` is off by default.** It signs in as the Cube pods' own AWS role,
+  and needs `XCUBE_ALLOW_POD_ROLE=true`.
 
 A target includes how the driver checks the server, so a secret must be
 entered again to turn verification off, as to change the host. Snowflake,
@@ -1342,7 +1356,7 @@ none were known yet):
 | 400 | `not_read_only` | The check refused it; `statement` is its kind (`insert`, `select` …). Cube Store's router joins carry `reason: "cubestore_router_join"` |
 | 400 | `several_statements` | |
 | 400 | `invalid_parameters` | `reason`: `missing_value`, `unused_value`, `malformed_placeholder`, `placeholder_written` (a `$1`, `?`, `@x` or `:x` written by hand), `invalid_value` |
-| 400 | `parameters_unsupported` | `reason`: `dremio`, `cubestore`, `oracle_boolean` |
+| 400 | `parameters_unsupported` | `reason`: `dremio`, `trino`, `athena`, `cubestore`, `oracle_boolean` |
 | 404 | `unknown_connection`, `unknown_overlay` | |
 | 409 | `run_in_progress` | A run of this `runId` runs |
 | 422 | `timeout`, `cancelled` | Stopped |

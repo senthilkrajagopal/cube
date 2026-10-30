@@ -7,10 +7,10 @@ import { Connections, redact } from '../../src/connections/connections';
 import {
   dataSourcesOf, environmentTargetOf, identityOf, targetOf, withIdentityAliases,
 } from '../../src/connections/aliases';
-import { DRIVERS } from '../../src/connections/drivers';
+import { DRIVERS, type DriverType } from '../../src/connections/drivers';
 import { SwitchableDriver } from '../../src/connections/switchable';
 import { modelSchema } from '../../src/config';
-import { CredentialKeys, generateCredentialKey, sealSecretV1 } from '../../src/credentials/credentials';
+import { CredentialKeys, generateCredentialKey, sealSecretV1, secretAadV1 } from '../../src/credentials/credentials';
 import { open } from '../../src/credentials/hpke';
 
 class FakeDriver {
@@ -165,6 +165,93 @@ describe('connection checks', () => {
     expect(typeof config.password).toBe('function');
     expect(config.password()).toBe('');
     expect((DRIVERS.redshift.config(fields, 'password', { password: 'x' }) as any)).toHaveProperty('exportBucket', undefined);
+  });
+});
+
+describe('read-only drivers: DuckDB, ClickHouse, Trino and Athena', () => {
+  const problems = (driver: string, authMethod: string, fields: Record<string, unknown>) => Connections.validate({ driver, authMethod, fields } as any).problems;
+  const podRole = process.env.XCUBE_ALLOW_POD_ROLE;
+  afterEach(() => {
+    if (podRole === undefined) {
+      delete process.env.XCUBE_ALLOW_POD_ROLE;
+    } else {
+      process.env.XCUBE_ALLOW_POD_ROLE = podRole;
+    }
+  });
+
+  test('ClickHouse: a host alone, a database that can\'t end its quotes, HTTPS on 8443 unless ssl is false, and read-only', () => {
+    const ch = { host: 'ch.example.com', database: 'sales', user: 'reader' };
+    expect(problems('clickhouse', 'password', ch)).toEqual(['password is required, sealed']);
+    expect(problems('clickhouse', 'password', { ...ch, host: 'evil.com/?user=default#' })).toContain('host must be a host name or address alone, with no scheme, port, path, user or query');
+    expect(problems('clickhouse', 'password', { ...ch, host: 'u:p@h' })).toHaveLength(2);
+    expect(problems('clickhouse', 'password', { ...ch, host: '[::1]' })).toEqual(['password is required, sealed']);
+    expect(problems('clickhouse', 'password', { ...ch, database: 'x\'; DROP' })[0]).toMatch(/database can't hold a quote/);
+    expect(DRIVERS.clickhouse.config(ch, 'password', { password: 'pw' })).toMatchObject({ port: '8443', protocol: 'https:', username: 'reader', password: 'pw', readOnly: true });
+    expect(DRIVERS.clickhouse.config({ ...ch, ssl: false }, 'password', { password: 'pw' })).toMatchObject({ port: '8123', protocol: 'http:' });
+    expect(() => DRIVERS.clickhouse.config({ ...ch, host: 'a/b' }, 'password', { password: 'pw' })).toThrow(/host must be/);
+  });
+
+  test('Trino: HTTPS on 443, a password or a JWT, and nothing of the environment\'s export bucket', () => {
+    const tr = { host: 'trino.example.com', catalog: 'hive', user: 'analyst' };
+    expect(problems('trino', 'password', { ...tr, catalog: 'a b' })[0]).toMatch(/catalog can't hold/);
+    const basic = DRIVERS.trino.config(tr, 'password', { password: 'pw' }) as any;
+    expect(basic).toMatchObject({ port: '443', basic_auth: { user: 'analyst', password: 'pw' }, custom_auth: undefined, ssl: { rejectUnauthorized: true } });
+    expect(basic).toHaveProperty('exportBucket', undefined);
+    expect(basic).toHaveProperty('credentials', undefined);
+    expect(DRIVERS.trino.config(tr, 'jwt', { token: 'aaa.bbb.ccc' })).toMatchObject({ basic_auth: undefined, custom_auth: 'Bearer aaa.bbb.ccc' });
+    expect(() => DRIVERS.trino.config(tr, 'jwt', { token: 'a\r\nX-Trino-User: admin' })).toThrow('token must be a JWT');
+  });
+
+  test('Athena: a region, a workgroup and an s3:// results location; the pod role only where the deployment allows it', () => {
+    const at = { region: 'eu-west-1', workGroup: 'primary', s3OutputLocation: 's3://results/athena/', catalog: 'AwsDataCatalog', accessKeyId: 'AKIAABCDEFGHIJKLMNOP' };
+    expect(problems('athena', 'access-key', at)).toEqual(['secretAccessKey is required, sealed']);
+    expect(problems('athena', 'access-key', { ...at, region: 'eu-west-1.evil.com', workGroup: 'a/b', s3OutputLocation: 's3://b/../x', accessKeyId: 'nope' })).toEqual([
+      'region must be an AWS region, such as eu-west-1',
+      'workGroup must be a workgroup\'s name: letters, digits, ., _ and -',
+      'accessKeyId must be an AWS access key ID',
+      's3OutputLocation must be an s3:// URI, such as s3://bucket/results/',
+      'secretAccessKey is required, sealed',
+    ]);
+    const { accessKeyId: _key, ...role } = at;
+    delete process.env.XCUBE_ALLOW_POD_ROLE;
+    expect(problems('athena', 'pod-role', role)).toEqual(['Signing in as the Cube pods\' role isn\'t allowed in this deployment (XCUBE_ALLOW_POD_ROLE)']);
+    expect(() => DRIVERS.athena.config(role, 'pod-role', {})).toThrow(/XCUBE_ALLOW_POD_ROLE/);
+    process.env.XCUBE_ALLOW_POD_ROLE = 'true';
+    expect(problems('athena', 'pod-role', role)).toEqual([]);
+    expect(DRIVERS.athena.config(role, 'pod-role', {})).toMatchObject({ podRole: true, accessKeyId: undefined, secretAccessKey: undefined, readOnly: true });
+    expect(DRIVERS.athena.config(at, 'access-key', { secretAccessKey: 's' })).toMatchObject({ podRole: false, accessKeyId: at.accessKeyId, secretAccessKey: 's', S3OutputLocation: at.s3OutputLocation });
+  });
+
+  test('DuckDB: each kind its own fields and sign-ins, and none of Cube\'s DuckDB environment', () => {
+    const s3 = { kind: 's3', s3Location: 's3://lake/sales/', region: 'eu-west-1', accessKeyId: 'minio' };
+    expect(problems('duckdb', 'access-key', s3)).toEqual(['secretAccessKey is required, sealed']);
+    expect(problems('duckdb', 'access-key', { ...s3, path: '/data' })).toContain('path is not a field of DuckDB reading from s3');
+    expect(problems('duckdb', 'token', { kind: 'motherduck', database: 'md' })).toEqual(['token is required, sealed']);
+    expect(problems('duckdb', 'access-key', { kind: 'motherduck', database: 'md', accessKeyId: 'k' })[0]).toMatch(/authMethod for DuckDB reading from motherduck is one of token/);
+    expect(problems('duckdb', 'none', { kind: 'volume', path: 'relative' })).toEqual(['path must be an absolute path']);
+    expect(problems('duckdb', 'none', { kind: 'disk', path: '/x' })).toEqual(['kind must be one of s3, motherduck, volume']);
+    expect(problems('duckdb', 'access-key', { ...s3, s3Location: "s3://lake/x'; ATTACH", endpoint: 'http://minio:9000', urlStyle: 'odd' })).toEqual([
+      's3Location must be an s3:// URI of a bucket and an optional prefix, such as s3://bucket/sales/',
+      'endpoint must be a host and an optional port, with no scheme or path',
+      'urlStyle must be vhost or path',
+      'secretAccessKey is required, sealed',
+    ]);
+    const config = DRIVERS.duckdb.config({ ...s3, endpoint: 'minio:9000', urlStyle: 'path', ssl: false }, 'access-key', { secretAccessKey: 's' }) as any;
+    expect(config.s3).toEqual({ location: 's3://lake/sales/', region: 'eu-west-1', endpoint: 'minio:9000', urlStyle: 'path', useSsl: false, accessKeyId: 'minio', secretAccessKey: 's', podRole: false });
+    for (const key of ['databasePath', 'motherDuckToken', 'initSql', 'schema']) {
+      expect(config).toHaveProperty(key, undefined);
+    }
+    expect(DRIVERS.duckdb.config({ kind: 'motherduck', database: 'md' }, 'token', { token: 't' })).toMatchObject({ motherDuck: { database: 'md', token: 't' }, s3: undefined });
+  });
+
+  test('none connects yet: each says so, and the target binds a secret to where it reaches', () => {
+    expect(() => DRIVERS.trino.make!({})).toThrow('xcube doesn\'t connect Trino data sources yet');
+    const aad = (driver: DriverType, fields: Record<string, string | boolean>) => secretAadV1(driver, 'password', fields).toString();
+    expect(aad('clickhouse', { host: 'h', database: 'd', user: 'u' })).toBe(aad('clickhouse', { host: 'h', database: 'other', user: 'v' }));
+    expect(aad('clickhouse', { host: 'h', ssl: false })).not.toBe(aad('clickhouse', { host: 'h' }));
+    expect(aad('trino', { host: 'h', sslRejectUnauthorized: false })).not.toBe(aad('trino', { host: 'h' }));
+    expect(aad('duckdb', { kind: 's3', s3Location: 's3://a/' })).not.toBe(aad('duckdb', { kind: 's3', s3Location: 's3://b/' }));
+    expect(aad('athena', { region: 'eu-west-1', workGroup: 'w' })).not.toBe(aad('athena', { region: 'us-east-1', workGroup: 'w' }));
   });
 });
 
