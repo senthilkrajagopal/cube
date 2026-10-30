@@ -10,6 +10,7 @@
  */
 import { makeAthenaDriver } from './athena';
 import { makeClickHouseDriver } from './clickhouse';
+import { makeDuckdbDriver } from './duckdb';
 import { makeTrinoDriver } from './trino';
 
 export const DRIVER_TYPES = [
@@ -146,11 +147,6 @@ function checked(spec: Pick<DriverSpec, 'check'>, fields: Fields, authMethod: st
     throw new Error(problems.join('; '));
   }
 }
-
-/** A driver xcube lists but doesn't connect yet. */
-const notYet = (name: string) => () => {
-  throw new Error(`xcube doesn't connect ${name} data sources yet`);
-};
 
 /** Where a DuckDB data source reads from: its fields, and the sign-ins each takes. */
 const DUCKDB_KINDS: Record<string, { fields: string[]; required: string[]; auth: string[] }> = {
@@ -456,7 +452,7 @@ export const DRIVERS: Record<DriverType, DriverSpec> = {
         schema: undefined,
       };
     },
-    make: notYet('DuckDB'),
+    make: makeDuckdbDriver,
   },
   /** Self-hosted ClickHouse or ClickHouse Cloud, over HTTP(S). */
   clickhouse: {

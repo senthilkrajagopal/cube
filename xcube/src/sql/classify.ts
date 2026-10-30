@@ -178,6 +178,14 @@ const CLICKHOUSE_AFTER_FROM = new Set([
 /** EXPLAIN's kinds on ClickHouse; its settings come after, as `name = value`, between commas. */
 const CLICKHOUSE_EXPLAIN_KINDS = new Set(['AST', 'SYNTAX', 'QUERY', 'TREE', 'PLAN', 'PIPELINE', 'ESTIMATE']);
 
+/**
+ * DuckDB's functions that act on the instance rather than read: run SQL from
+ * a string, turn its logging on (to a file, which then fails every query) or
+ * off, checkpoint, or show its secrets. Its configuration is locked, and its
+ * files and the network are out of reach, whatever runs.
+ */
+const DUCKDB_FUNCTIONS = /^(query|query_table|enable_logging|disable_logging|truncate_duckdb_logs|checkpoint|force_checkpoint|duckdb_secrets|which_secret)$/;
+
 /** Trino's, and Athena's (its engine is Trino's). */
 const TRINO_RULES: Rules = {
   ...base,
@@ -278,8 +286,15 @@ const RULES: Record<SqlDialect, Rules> = {
     deniedWords: new Set(WRITES.filter((w) => w !== 'MERGE')),
     deniedFunction: CLICKHOUSE_FUNCTIONS,
   },
-  // Until it has rules of its own, read every way and refused at the session (the runner doesn't run on it yet).
-  duckdb: { ...base, readings: readings(BOTH, BOTH), deniedWords: new Set(WRITES) },
+  duckdb: {
+    ...base,
+    dollar: 'tagged',
+    eStrings: true,
+    // A backslash is a character outside E'…', and its comments nest (DuckDB 1.5.5).
+    readings: readings([false], [true]),
+    deniedWords: new Set(WRITES),
+    deniedFunction: DUCKDB_FUNCTIONS,
+  },
   trino: TRINO_RULES,
   // Its engine (v3) is Trino's, with UNLOAD writing a query's result to S3: `UNLOAD (SELECT …) TO 's3://…'`.
   athena: { ...TRINO_RULES, deniedWords: new Set([...WRITES, 'UNLOAD']) },
@@ -877,6 +892,13 @@ function writtenPlaceholder(dialect: SqlDialect, tokens: Token[], k: number): st
         && !isOp(next, '@') ? `@${next.value.toLowerCase()}` : null;
     case 'oracle':
       return t.value === ':' && (next?.kind === 'word' || next?.kind === 'number') && touches(t, next) ? `:${next.value.toLowerCase()}` : null;
+    case 'duckdb':
+      if (t.value === '?') {
+        return '?';
+      }
+      // `$1` or `$name`, never a `$$` or `$tag$` string, which the lexer took whole.
+      return t.value === '$' && (next?.kind === 'number' || next?.kind === 'word') && touches(t, next)
+        ? `$${next.kind === 'word' ? next.value.toLowerCase() : next.value}` : null;
     case 'clickhouse':
       // A query parameter, `{name:Type}`.
       return t.value === '{' && (next?.kind === 'word' || next?.kind === 'quoted') && isOp(tokens[k + 2], ':')

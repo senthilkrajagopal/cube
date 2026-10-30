@@ -173,5 +173,7 @@ describe('settingsFromEnv', () => {
     // A report counts for an hour: the heartbeat must come well within it.
     expect(() => settingsFromEnv({ ...env, XCUBE_CONNECTION_HEARTBEAT_MS: '3600000' })).toThrow(/well within the hour/);
     expect(() => settingsFromEnv({ ...env, XCUBE_CONNECTION_HEARTBEAT_MS: '100' })).toThrow(/10000 to 1800000/);
+    // DuckDB's, as xcube starts rather than at a source's first query.
+    expect(() => settingsFromEnv({ ...env, XCUBE_DUCKDB_THREADS: '0' })).toThrow(/XCUBE_DUCKDB_THREADS must be a whole number from 1 to 256/);
   });
 });

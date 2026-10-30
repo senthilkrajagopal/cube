@@ -182,6 +182,12 @@ In both modes:
 | `XCUBE_CATCH_UP_MS` | `10000` | How long a request naming a newer revision waits for it |
 | `XCUBE_CUBESTORE_QUERY_TIMEOUT` | `120` | Cube Store's own query timeout in seconds, as set on it (`CUBESTORE_QUERY_TIMEOUT`): when a stopped SQL run that Cube Store runs on ends at the latest |
 | `XCUBE_ALLOW_POD_ROLE` | unset | `true` lets Athena and DuckDB S3 connections sign in as the Cube pods' own AWS role (`pod-role`). Unset, they must carry an access key |
+| `XCUBE_DUCKDB_MEMORY_LIMIT` | `2GiB` | Each DuckDB instance's `memory_limit` (`KB` to `TB`, `KiB` to `TiB`) |
+| `XCUBE_DUCKDB_THREADS` | `2` | Each DuckDB instance's `threads` (1 to 256) |
+| `XCUBE_DUCKDB_MAX_TEMP_DIRECTORY_SIZE` | `10GiB` | How much each DuckDB instance may spill to its temp directory |
+| `XCUBE_DUCKDB_TEMP_ROOT` | `/tmp/xcube-duckdb` | Where each DuckDB instance's own temp directory is made, and wiped when it closes |
+| `XCUBE_DUCKDB_MAX_OPEN` | `4` | The most DuckDB instances open in a pod at once (1 to 1,000) |
+| `XCUBE_DUCKDB_VOLUMES` | unset | Comma-separated absolute directories a `volume` connection's file may be in. Unset, none may |
 | `XCUBE_CONNECTION_HEARTBEAT_MS` | `600000` | How often an instance re-writes its report of each connection it holds a driver for (10 s to 30 min), so a report within the hour means an instance running |
 | `CUBEJS_TRANSPILATION_WORKER_THREADS_COUNT` | `2` | Cube's; the image sets it when unset, as unset a compile can take gigabytes |
 
@@ -524,6 +530,39 @@ DuckDB, ClickHouse, Trino and Athena connections are read-only:
 - **`pod-role` is off by default.** It signs in as the Cube pods' own AWS role,
   and needs `XCUBE_ALLOW_POD_ROLE=true`.
 
+**DuckDB** runs in Cube's own process, one instance per connection (`src/connections/duckdb.ts`).
+- **Kinds.**
+  - `s3`: Parquet and other files under one `s3Location`, read with a
+    temporary secret scoped to that prefix.
+  - `motherduck`: one database the token's owner owns, in SaaS mode
+    (`saas_mode`, `attach_mode=single`), so no local file or other database
+    is reachable. A shared database can't be attached this way.
+  - `volume`: one DuckDB file, opened read-only. It must be under one of
+    `XCUBE_DUCKDB_VOLUMES`, after links are followed.
+- **Set-up.** Each instance is opened in steps, and one that fails names
+  its step (`DuckDB set-up failed at <step>: …`, secrets taken out): `volume`,
+  `open`, `limits`, `source`, `extensions`, `allowed_directories`,
+  `external_access`, `lock`, `readback`.
+  - Extensions are neither installed nor loaded once it is open; the image
+    carries the ones it needs.
+  - Persistent and unredacted secrets are off.
+  - `allowed_directories` is the S3 prefix, or nothing; then
+    `enable_external_access` is off and the configuration locked.
+  - `readback` reads every setting back, and a value not as set fails it.
+  - The connection test's `connect` also checks that `glob('/*')` is refused
+    (`guard`), then reads the source: the S3 prefix, the MotherDuck database
+    by name, or the file's tables.
+- **Limits.** Each instance has the pod's `XCUBE_DUCKDB_*` limits. At most
+  `XCUBE_DUCKDB_MAX_OPEN` are open in a pod; past that, the least recently
+  used idle one is closed, and a query waits for one to come free (30 s, or a
+  SQL run's own time cap). `GET /v1/semantic/duckdb` answers `{ open, max,
+  busy, waiting }`.
+- **What the lock leaves.** A statement can still write to the instance's
+  own temp directory (`COPY … TO`), within its size cap. It is the
+  instance's alone, and wiped when it closes.
+- **`pod-role` credentials** are taken when an instance opens. One within
+  10 minutes of their expiry is closed when idle, and opened again.
+
 A target includes how the driver checks the server, so a secret must be
 entered again to turn verification off, as to change the host. Snowflake,
 BigQuery and Oracle have no such setting: the first two always verify, and
@@ -756,7 +795,9 @@ top of them:
      `EXTERNAL_QUERY`; SQL Server's `OPENROWSET`, `OPENQUERY` and lock hints;
      Oracle's `UTL_` and `DBMS_` packages but `DBMS_XPLAN`, `DBMS_LOB` and
      `DBMS_RANDOM`; ClickHouse's `url`, `s3`, `file`, `remote`, `mysql` and
-     the other functions that reach outside its tables).
+     the other functions that reach outside its tables; DuckDB's `query`
+     and `query_table`, which run SQL of their own, its logging,
+     `checkpoint` and secrets functions).
    - Trino's own statements are refused, by name: `CALL`, `SET SESSION`,
      `RESET`, `USE`, `PREPARE`, `EXECUTE`, `START TRANSACTION`, `COMMIT`,
      `GRANT`, `DENY`, `REFRESH`, `ANALYZE`, `TRUNCATE`, `COMMENT`, `EXPLAIN
@@ -784,8 +825,9 @@ top of them:
    function writes. On SQL Server it isn't read-only, but rolled back.
    BigQuery's dry run must call the statement a `SELECT` before it runs.
    ClickHouse runs it with `readonly=2`, so its login must not be at
-   `readonly=1` (Cube's own queries set settings too). Snowflake, Dremio,
-   Trino and Athena have the check alone.
+   `readonly=1` (Cube's own queries set settings too). DuckDB has its
+   instance's lock (see DuckDB above). Snowflake, Dremio, Trino and Athena
+   have the check alone.
 4. **A connection of the run's own**, a pool of one, never one Cube serves
    with, dropped afterwards: nothing it sets outlives the run.
 
@@ -799,7 +841,8 @@ connector does on a read.
   the cap, and no further. Oracle's are read from a result set 100 at a time,
   and Dremio's a page of 500 at a time, only to the cap. Trino's a page at
   a time, as Trino sends them, and the query is killed at the cap. Athena's a
-  page of at most 1,000 at a time, only to the cap, once the query has finished. ClickHouse's
+  page of at most 1,000 at a time, only to the cap, once the query has finished.
+  DuckDB's a chunk of 2,048 rows at a time, only to the cap. ClickHouse's
   `max_result_rows` stops it in whole blocks past the cap. Cube Store answers every row at
   once, so a SELECT there is asked for one past the cap by its own top-level
   `LIMIT`, added or lowered (a subquery would lose its order).
@@ -810,7 +853,7 @@ connector does on a read.
   `callTimeout`, BigQuery's `jobTimeoutMs`, ClickHouse's
   `max_execution_time` and Trino's `query_max_run_time` (in whole seconds). Then a clock of xcube's, 2 s
   later, cancels it on the database: Dremio's job through its API, Athena's
-  query by its id (`StopQueryExecution`). Cube Store
+  query by its id (`StopQueryExecution`), DuckDB's by an interrupt. Cube Store
   can't stop a query (below).
 - **Bytes** (`maxBytes`, 10 MB; at most 100 MB) of the answer's rows as JSON.
 - BigQuery takes `maxBytesBilled` too: its job fails, without charge, past it.
@@ -825,7 +868,7 @@ depends on when the database sends them:
   Trino's in whole pages;
 - SQL Server's in whole 4 KB network packets: a result smaller than one
   arrives only at its end;
-- Oracle's in whole fetches of 100 rows;
+- Oracle's in whole fetches of 100 rows, and DuckDB's in whole chunks of 2,048;
 - none on Snowflake, BigQuery, Dremio and Athena while the query runs, since their
   results come only once it has finished, nor on Cube Store. A stop while
   their results are being read keeps those read.
@@ -835,7 +878,8 @@ noted in xcube's database while it runs (`sql_runs`), and a cancel for another
 instance's reaches it through the notification channel. The statement is
 cancelled on the database (`pg_cancel_backend`, `KILL QUERY`, Snowflake's and
 BigQuery's cancels, SQL Server's attention, Oracle's break, Dremio's job
-cancel, Trino's kill by query id, Athena's `StopQueryExecution`). On ClickHouse the run lets go of its request, which ends the query
+cancel, Trino's kill by query id, Athena's `StopQueryExecution`, DuckDB's
+interrupt). On ClickHouse the run lets go of its request, which ends the query
 there (`cancel_http_readonly_queries_on_client_close`), and tries `KILL QUERY`,
 which a SELECT-only login may not. One run per `runId` at a time.
 
@@ -899,8 +943,10 @@ which a SELECT-only login may not. One run per `runId` at a time.
 - dates as ISO 8601;
 - numbers as Cube's driver gives them: PostgreSQL's `int8` and `numeric`,
   MySQL's `BIGINT` and `DECIMAL`, Snowflake's numbers, every number of SQL
-  Server's, ClickHouse's 64-bit integers and decimals, and Trino's integers
-  past 2^53, as strings;
+  Server's, ClickHouse's 64-bit integers and decimals, Trino's integers
+  past 2^53, and DuckDB's `BIGINT`, `HUGEINT` and `DECIMAL`, as strings;
+- DuckDB's dates as `YYYY-MM-DD`, and its `BLOB` as DuckDB's text of it
+  (`\x01` for a byte that isn't printable);
 - a ClickHouse join's unmatched cells as `null` (`join_use_nulls`);
 - Cube Store's values as strings.
 
@@ -1317,7 +1363,7 @@ Tests a connection without storing it: `{ driver, authMethod, fields, sealed }`
 | --- | --- |
 | `secrets` | Opens each secret for this target |
 | `config` | Builds the driver's config |
-| `connect` | Cube's `testConnection()`; Athena's checks the workgroup is enabled |
+| `connect` | Cube's `testConnection()`; Athena's checks the workgroup is enabled; DuckDB's sets the instance up and reads its source (see DuckDB) |
 | `schemas` | Reads the catalog, where the driver can; Athena's lists the catalog's databases (no query, nothing scanned), the named one among them |
 
 Every error has the connection's secrets taken out.
@@ -1345,6 +1391,7 @@ never written into the SQL.
   - SQL Server: `@p1`, `CAST(@p1 AS DECIMAL(38, 2))`;
   - Oracle: `:p1`, `TO_NUMBER`/`TO_DATE` where typed;
   - BigQuery: `@p1`, with its `types` on the dry run and the job;
+  - DuckDB: `$1`, `$1::DECIMAL(38, 2)`, `$1::DATE`, `$1::BOOLEAN`;
   - ClickHouse: `{p1:String}`, `{p1:Decimal(38, 2)}`, `{p1:Date32}`,
     `{p1:Bool}`, as its query parameters. A date outside Date32's
     1900-01-01 to 2299-12-31 is refused (`invalid_value`): ClickHouse would
@@ -1425,6 +1472,12 @@ Not per model, so a service token naming a model can't use them:
   (up to 1,000) and seals each to the active key with the same binding. It
   answers `{ items: [{ ref, envelope } | { ref, error }] }`, never anything
   opened.
+
+#### `GET /v1/semantic/duckdb`
+
+Not per model: this pod's DuckDB instances, `{ open, max, busy, waiting }`.
+`open` counts those opening and closing too; `busy` the queries and runs
+holding one; `waiting` those waiting for one.
 
 #### `GET …/meta`
 

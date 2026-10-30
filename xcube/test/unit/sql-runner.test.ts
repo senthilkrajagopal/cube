@@ -354,15 +354,6 @@ describe('the SQL runner: ClickHouse', () => {
   });
 });
 
-describe('the SQL runner: drivers it doesn\'t run on yet', () => {
-  test('DuckDB refuses to open a session, touching nothing of the driver', async () => {
-    await expect(openSession('duckdb', {}, caps, noRefusal)).rejects.toMatchObject({
-      code: 'connect_failed',
-      message: 'The SQL runner doesn\'t run on duckdb data sources yet',
-    });
-  });
-});
-
 describe('the SQL runner: runs', () => {
   /** A plan Cube Store runs on a select worker, and one its router runs. */
   const WORKER_PLAN = 'Projection, [n]\n  Aggregate\n    ClusterSend, indices: [[1]]\n      Scan s.t, source: CubeTable';

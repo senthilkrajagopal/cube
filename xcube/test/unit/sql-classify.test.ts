@@ -460,6 +460,49 @@ describe('the SQL runner\'s check: one read', () => {
   });
 });
 
+describe('the SQL runner\'s check: DuckDB', () => {
+  test('reads as DuckDB 1.5.5 lexes: a backslash plain outside E\'…\', comments nested, dollar quotes', () => {
+    reads('duckdb', [
+      'SELECT \'C:\\\' AS path',
+      'SELECT E\'it\\\'s; DELETE FROM t\'',
+      'SELECT $$ DELETE FROM t; $$, $tag$ query(1) $tag$',
+      'SELECT /* nested /* comment */ DELETE */ 1',
+      'SELECT 1 /* a /* b */ ; DELETE FROM t */',
+      'SELECT * FROM read_parquet(\'s3://lake/sales/*.parquet\') WHERE day > DATE \'2024-01-01\'',
+      'SELECT t.query, "into" FROM t',
+      'SELECT * FROM duckdb_settings()',
+      'WITH a AS (SELECT 1) SELECT * FROM a',
+    ]);
+    expect(verdict('EXPLAIN SELECT 1', 'duckdb')).toBe('ok:explain');
+    // Read as DuckDB does, the backslash ends the string: a second statement follows.
+    expect(verdict('SELECT \'x\\\' ; DELETE FROM t --\'', 'duckdb')).toBe('several_statements:-');
+  });
+
+  test('its statements but SELECT, and the functions that act on the instance, refused', () => {
+    refuses('duckdb', [
+      ['SELECT * FROM query(\'DELETE FROM t\')', 'not_read_only:select'],
+      ['SELECT * FROM QUERY_TABLE(\'t\')', 'not_read_only:select'],
+      ['SELECT "query"(1)', 'not_read_only:select'],
+      ['SELECT * FROM enable_logging()', 'not_read_only:select'],
+      ['SELECT * FROM checkpoint()', 'not_read_only:select'],
+      ['SELECT * FROM duckdb_secrets()', 'not_read_only:select'],
+      ['SELECT which_secret(\'s3://x/\', \'s3\')', 'not_read_only:select'],
+      ['EXPLAIN ANALYZE SELECT 1', 'not_read_only:explain'],
+      ['COPY t TO \'/tmp/x.csv\'', 'not_read_only:copy'],
+      ['ATTACH \'/tmp/x.db\'', 'not_read_only:attach'],
+      ['INSTALL httpfs', 'not_read_only:install'],
+      ['LOAD httpfs', 'not_read_only:load'],
+      ['SET enable_external_access = true', 'not_read_only:set'],
+      ['PRAGMA version', 'not_read_only:pragma'],
+      ['CALL checkpoint()', 'not_read_only:call'],
+      ['FROM t', 'not_read_only:from'],
+      ['SUMMARIZE t', 'not_read_only:summarize'],
+      ['CREATE TABLE x AS SELECT 1', 'not_read_only:create'],
+    ]);
+    expect(() => classifySql('SELECT * FROM query(\'x\')', 'duckdb')).toThrow('The function query is refused: it acts outside a read-only transaction');
+  });
+});
+
 describe('the SQL runner\'s redaction', () => {
   test('strings and numbers become ?, comments go; names and keywords stay', () => {
     expect(redactSql('SELECT * FROM t WHERE a = \'secret\' AND b = 42 -- note \'x\'', 'postgres'))

@@ -17,6 +17,7 @@
  *   for one row more than the cap.
  */
 import { randomUUID } from 'crypto';
+import { duckdbApi } from '../connections/duckdb';
 import { trinoError } from '../connections/trino';
 import type { StatementKind } from './classify';
 import type { SqlBind } from './parameters';
@@ -963,6 +964,49 @@ async function athenaSession(driver: any, caps: SqlCaps): Promise<SqlSession> {
 }
 
 /**
+ * DuckDB: a connection of the run's own on its instance, held in the pod's
+ * pool (`DuckdbPool`) for as long as the run is: it waits for a place as long
+ * as the run may take. The statement streams, with its binds as `$n`, and is
+ * read a chunk (2,048 rows) at a time, only to the cap; at the time cap or on
+ * a cancel it is interrupted. DuckDB has no read-only transaction for a
+ * source it reads: its instance is (`duckdb.ts`), with the pod's files and
+ * the network out of reach and its configuration locked, beside the check
+ * (`classify.ts`). Values come as DuckDB's JSON: big numbers and decimals as
+ * strings, times as text.
+ */
+async function duckdbSession(driver: any, caps: SqlCaps): Promise<SqlSession> {
+  const { JsonDuckDBValueConverter } = duckdbApi();
+  const lease = await driver.lease(caps.timeoutMs);
+  const { connection } = lease;
+  let stopping = false;
+  return {
+    async run(sql, rows, binds = []) {
+      const result = await connection.stream(sql, binds.map((b) => b.value));
+      const types = result.columnTypes();
+      rows.setColumns(result.columnNames().map((name: string, i: number) => ({ name, type: String(types[i]) })));
+      while (!stopping) {
+        const chunk = await result.fetchChunk();
+        if (!chunk || chunk.rowCount === 0) {
+          return;
+        }
+        for (const row of chunk.convertRows(JsonDuckDBValueConverter)) {
+          if (stopping || !rows.add(row)) {
+            return;
+          }
+        }
+      }
+    },
+    async cancel() {
+      stopping = true;
+      await quietly(() => connection.interrupt());
+    },
+    async close() {
+      await quietly(() => lease.done());
+    },
+  };
+}
+
+/**
  * Whether a Cube Store plan joins on its router: a join not under a
  * `ClusterSend`. Its router runs it, and nothing stops that once it starts
  * (`endsAtCubeStoreTimeout`); a join multiplies what it reads.
@@ -1086,7 +1130,7 @@ export function openSession(
     case 'athena':
       return athenaSession(driver, caps);
     case 'duckdb':
-      return Promise.reject(new SqlRunError('connect_failed', `The SQL runner doesn't run on ${dialect} data sources yet`));
+      return duckdbSession(driver, caps);
     case 'cubestore':
       return cubeStoreSession(driver, refuse);
     default:
@@ -1119,6 +1163,7 @@ export function isTimeout(dialect: SessionDialect, e: any): boolean {
       // EXCEEDED_TIME_LIMIT: its query_max_run_time; or the client's own clock.
       return code === 'EXCEEDED_TIME_LIMIT' || /query timed out/.test(message);
     case 'dremio':
+    // It has no statement timeout: the run's clock interrupts it.
     case 'duckdb':
     // Its own timeout is the workgroup's, minutes at the least: the run's clock stops a query first.
     case 'athena':

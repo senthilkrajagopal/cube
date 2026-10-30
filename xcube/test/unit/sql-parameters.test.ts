@@ -53,6 +53,7 @@ describe('{{name}} parameters: found in code only, as the database reads it', ()
       ['mysql', 'SELECT ?'], ['snowflake', 'SELECT ?'], ['snowflake', 'SELECT :1'],
       ['bigquery', 'SELECT @x'], ['bigquery', 'SELECT ?'], ['mssql', 'SELECT @x'], ['oracle', 'SELECT :x FROM dual'], ['oracle', 'SELECT :1 FROM dual'],
       ['clickhouse', 'SELECT {x:String}'], ['clickhouse', 'SELECT { `x` : UInt8 }'],
+      ['duckdb', 'SELECT ?'], ['duckdb', 'SELECT $1'], ['duckdb', 'SELECT * FROM t WHERE a = $name'],
     ];
     for (const [dialect, sql] of written) {
       expect([dialect, sql, reasonOf(() => placeholdersOf(sql, dialect))?.[0]]).toEqual([dialect, sql, 'placeholder_written']);
@@ -61,6 +62,7 @@ describe('{{name}} parameters: found in code only, as the database reads it', ()
       ['postgres', 'SELECT a::int, b ? \'k\' FROM t'], ['snowflake', 'SELECT v:field, a::int FROM t'],
       ['mssql', 'SELECT @@VERSION'], ['bigquery', 'SELECT @@project_id'], ['postgres', 'SELECT \'$1\', "?"'],
       ['clickhouse', 'SELECT {\'k\': 1}, \'{x:String}\', $$ {x:String} $$'],
+      ['duckdb', 'SELECT $$ $1 ? $$, $q$ $name $q$, \'$1\', "?", a::INT FROM t'],
     ];
     for (const [dialect, sql] of fine) {
       expect([dialect, sql, reasonOf(() => placeholdersOf(sql, dialect))]).toEqual([dialect, sql, null]);
@@ -93,6 +95,7 @@ describe('binding: xcube\'s placeholders in the {{name}}s\' places, typed, the v
         ['p1', 'p2', 'p3', 'p4'],
       ],
       clickhouse: ['SELECT  {p1:String} ,  {p2:Decimal(38, 2)} ,  {p3:Date32} ,  {p4:Bool} , x {p1:String} ', ['p1', 'p2', 'p3', 'p4']],
+      duckdb: ['SELECT  $1 ,  $2::DECIMAL(38, 2) ,  $3::DATE ,  $4::BOOLEAN , x $1 ', ['1', '2', '3', '4']],
     };
     for (const [dialect, [rewritten, ids]] of Object.entries(expected)) {
       const bound = bindParameters(sql, dialect as SqlDialect, parameters);

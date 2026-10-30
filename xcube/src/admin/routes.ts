@@ -27,6 +27,7 @@ import {
   SecurityModeError,
 } from '../store/revisions';
 import { ConnectionError } from '../connections/connections';
+import { duckdbPool } from '../connections/duckdb';
 import { CredentialError } from '../credentials/credentials';
 import { MODEL_ID, SnapshotError } from '../model/snapshot';
 import { checkDataSourceName } from '../names/items';
@@ -671,6 +672,11 @@ export function initAdminRoutes(
     const items = runtime.rewrap(body.items);
     logger('xcube: secrets re-wrapped', { items: items.length, failed: items.filter((i: any) => i.error).length });
     res.json({ items });
+  }));
+
+  // Not per model: the pod's DuckDB instances, open (closing ones too) against their cap, in use, and waited for.
+  app.get(`${basePath}/v1/semantic/duckdb`, auth, handle('duckdb', async (_req, res) => {
+    res.json(duckdbPool().stats());
   }));
 
   const connectionNameOf = (req: Request) => {

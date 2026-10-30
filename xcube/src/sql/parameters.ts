@@ -30,9 +30,9 @@ export interface SqlBind {
 /**
  * Where binding isn't proven: their drivers take no binds (Dremio's job API,
  * Cube Store's, Trino's), or a value isn't yet shown to be taken as one
- * literal (Athena's execution parameters); DuckDB until its land.
+ * literal (Athena's execution parameters).
  */
-export const UNBOUND_DIALECTS = new Set<SqlDialect>(['dremio', 'trino', 'athena', 'duckdb', 'cubestore']);
+export const UNBOUND_DIALECTS = new Set<SqlDialect>(['dremio', 'trino', 'athena', 'cubestore']);
 
 /** A dialect's name as a refusal says it. */
 export const DIALECT_NAMES: Record<SqlDialect, string> = {
@@ -130,6 +130,12 @@ function placeholder(dialect: SqlDialect, slot: string, parameter: SqlParameter)
         return `CAST(${slot} AS DECIMAL(38, ${scale}))`;
       }
       return type === 'date' ? `CAST(${slot} AS DATE)` : slot;
+    case 'duckdb':
+      // Its NUMERIC is DECIMAL(18, 3): the value's own scale, in the widest decimal.
+      if (type === 'number') {
+        return `${slot}::DECIMAL(38, ${scale})`;
+      }
+      return type === 'date' ? `${slot}::DATE` : `${slot}::BOOLEAN`;
     case 'oracle':
       if (type === 'number') {
         return `TO_NUMBER(${slot}, '${oracleNumberFormat(String(value))}', 'NLS_NUMERIC_CHARACTERS=''.,''')`;
@@ -192,8 +198,8 @@ export function bindParameters(sql: string, dialect: SqlDialect, parameters: Rec
     let slot = slots.get(name);
     if (!slot) {
       const n = slots.size + 1;
-      slot = { postgres: `$${n}`, redshift: `$${n}`, bigquery: `@p${n}`, mssql: `@p${n}`, oracle: `:p${n}`, clickhouse: `p${n}` }[dialect as string]!;
-      binds.push({ id: dialect === 'postgres' || dialect === 'redshift' ? String(n) : `p${n}`, ...parameter });
+      slot = { postgres: `$${n}`, redshift: `$${n}`, duckdb: `$${n}`, bigquery: `@p${n}`, mssql: `@p${n}`, oracle: `:p${n}`, clickhouse: `p${n}` }[dialect as string]!;
+      binds.push({ id: dialect === 'postgres' || dialect === 'redshift' || dialect === 'duckdb' ? String(n) : `p${n}`, ...parameter });
       slots.set(name, slot);
     }
     return slot;
