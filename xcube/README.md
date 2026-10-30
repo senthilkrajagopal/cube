@@ -184,7 +184,7 @@ In both modes:
 | `XCUBE_ALLOW_POD_ROLE` | unset | `true` lets Athena and DuckDB S3 connections sign in as the Cube pods' own AWS role (`pod-role`). Unset, they must carry an access key |
 | `XCUBE_DUCKDB_MEMORY_LIMIT` | `2GiB` | Each DuckDB instance's `memory_limit` (`KB` to `TB`, `KiB` to `TiB`) |
 | `XCUBE_DUCKDB_THREADS` | `2` | Each DuckDB instance's `threads` (1 to 256) |
-| `XCUBE_DUCKDB_MAX_TEMP_DIRECTORY_SIZE` | `10GiB` | How much each DuckDB instance may spill to its temp directory |
+| `XCUBE_DUCKDB_MAX_TEMP_DIRECTORY_SIZE` | `10GiB` | How much each DuckDB instance may spill to its temp directory (a spill only: not what a `COPY … TO` writes there) |
 | `XCUBE_DUCKDB_TEMP_ROOT` | `/tmp/xcube-duckdb` | Where each DuckDB instance's own temp directory is made, and wiped when it closes |
 | `XCUBE_DUCKDB_MAX_OPEN` | `4` | The most DuckDB instances open in a pod at once (1 to 1,000) |
 | `XCUBE_DUCKDB_VOLUMES` | unset | Comma-separated absolute directories a `volume` connection's file may be in. Unset, none may |
@@ -558,8 +558,12 @@ DuckDB, ClickHouse, Trino and Athena connections are read-only:
   SQL run's own time cap). `GET /v1/semantic/duckdb` answers `{ open, max,
   busy, waiting }`.
 - **What the lock leaves.** A statement can still write to the instance's
-  own temp directory (`COPY … TO`), within its size cap. It is the
-  instance's alone, and wiped when it closes.
+  own temp directory (`COPY … TO`): DuckDB allows its temp directory to spill
+  to, and to `COPY` into alike. It is the instance's alone, and wiped when it
+  closes. **It isn't capped:** `max_temp_directory_size` bounds DuckDB's
+  spills, not the files a `COPY` writes, so until the instance closes a
+  model's `COPY` can fill the disk under `XCUBE_DUCKDB_TEMP_ROOT`. A known,
+  accepted gap.
 - **`pod-role` credentials** are taken when an instance opens. One within
   10 minutes of their expiry is closed when idle, and opened again.
 
@@ -1431,7 +1435,7 @@ none were known yet):
 
 | Status | `code` | |
 | --- | --- | --- |
-| 400 | `not_read_only` | The check refused it; `statement` is its kind (`insert`, `select` …). Cube Store's router joins carry `reason: "cubestore_router_join"` |
+| 400 | `not_read_only` | The check refused it; `statement` is its kind (`insert`, `select` …). Refused for a name, it carries `refused: { kind, name }`: `function` (lowercased, `url`), `table_function` (ClickHouse's, `mergetreeindex`) or `clause` (ClickHouse's `SETTINGS`, `FORMAT`). Cube Store's router joins carry `reason: "cubestore_router_join"` |
 | 400 | `several_statements` | |
 | 400 | `invalid_parameters` | `reason`: `missing_value`, `unused_value`, `malformed_placeholder`, `placeholder_written` (a `$1`, `?`, `@x` or `:x` written by hand), `invalid_value` |
 | 400 | `parameters_unsupported` | `reason`: `dremio`, `trino`, `athena`, `cubestore`, `oracle_boolean` |
@@ -1439,7 +1443,7 @@ none were known yet):
 | 404 | `unknown_connection`, `unknown_overlay` | |
 | 409 | `run_in_progress` | A run of this `runId` runs |
 | 422 | `timeout`, `cancelled` | Stopped |
-| 422 | `query_failed` | The database's message |
+| 422 | `query_failed` | The database's message. DuckDB refusing a file or URL outside the source adds `reason: "outside_source"` |
 | 502 | `connect_failed` | |
 | 503 | `busy` | `Retry-After` |
 

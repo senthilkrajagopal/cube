@@ -19,7 +19,7 @@
 import { randomUUID } from 'crypto';
 import { duckdbApi } from '../connections/duckdb';
 import { trinoError } from '../connections/trino';
-import type { StatementKind } from './classify';
+import type { Refused, StatementKind } from './classify';
 import type { SqlBind } from './parameters';
 
 export interface SqlColumn {
@@ -66,8 +66,10 @@ export class SqlRunError extends Error {
     public readonly partial: SqlRows | null = null,
     /** A stopped run the database runs on (Cube Store): when it ends at the latest, `endsBy: null` when nothing bounds it. */
     public readonly runsOn: { endsBy: Date | null } | null = null,
-    /** Why a refusal refused, for the client to word: `cubestore_router_join`, `athena_workgroup_cutoff`. */
+    /** Why a refusal refused, for the client to word: `cubestore_router_join`, `athena_workgroup_cutoff`, `outside_source`. */
     public readonly reason: string | null = null,
+    /** The function, table function or clause a statement was refused for. */
+    public readonly refused: Refused | null = null,
   ) {
     super(message);
   }
@@ -1136,6 +1138,17 @@ export function openSession(
     default:
       return unknownDialect(dialect);
   }
+}
+
+/**
+ * Why a statement failed on the database, where the client can word it:
+ * `outside_source`, DuckDB refusing a file or URL beyond its source.
+ */
+export function queryFailedReason(dialect: SessionDialect, e: any): string | null {
+  if (dialect === 'duckdb' && /^Permission Error: Cannot access file .* file system operations are disabled by configuration/s.test(String(e?.message ?? ''))) {
+    return 'outside_source';
+  }
+  return null;
 }
 
 /** Whether a database's error is its own statement timeout firing. */

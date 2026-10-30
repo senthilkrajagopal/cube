@@ -21,6 +21,13 @@ export type StatementKind = 'select' | 'explain';
 
 export type RefusalCode = 'not_read_only' | 'several_statements';
 
+/** The named thing a statement was refused for, for the client to show: a function, a ClickHouse table function, or a clause. */
+export interface Refused {
+  kind: 'function' | 'table_function' | 'clause';
+  /** A function's lowercased; a clause's in capitals (`SETTINGS`). */
+  name: string;
+}
+
 /** A statement the runner won't run, with its kind as far as it was read, and the SQL with its literals taken out. */
 export class SqlRefusal extends Error {
   public constructor(
@@ -28,6 +35,7 @@ export class SqlRefusal extends Error {
     message: string,
     public readonly statement: string | null,
     public readonly redactedSql: string,
+    public readonly refused: Refused | null = null,
   ) {
     super(message);
   }
@@ -554,8 +562,14 @@ function check(sql: string, rules: Rules, reading: Reading, redacted: () => stri
     throw e;
   }
   let { tokens } = lexed;
-  const refuse: (message: string, statement: string | null, code?: RefusalCode) => never = (message, statement, code = 'not_read_only') => {
-    throw new SqlRefusal(code, message, statement, redacted());
+  // Typed on its name, so the compiler takes a call to it as the end of a path.
+  const refuse: (message: string, statement: string | null, code?: RefusalCode, refused?: Refused) => never = (
+    message,
+    statement,
+    code = 'not_read_only',
+    refused,
+  ) => {
+    throw new SqlRefusal(code, message, statement, redacted(), refused ?? null);
   };
 
   // One statement: a `;` only at its end.
@@ -663,7 +677,7 @@ function check(sql: string, rules: Rules, reading: Reading, redacted: () => stri
       }
       if (rules.deniedFunction?.test(name) && isOp(tokens[k + 1], '(')) {
         const { what, why } = rules.deniedFunctionIs ?? { what: 'function', why: 'it acts outside a read-only transaction' };
-        refuse(`The ${what} ${name} is refused: ${why}`, statement);
+        refuse(`The ${what} ${name} is refused: ${why}`, statement, 'not_read_only', { kind: 'function', name });
       }
       if (rules.cubeStore && name === 'system' && isOp(tokens[k + 1], '.')
         && (tokens[k + 2]?.kind === 'word' || tokens[k + 2]?.kind === 'quoted')
@@ -674,7 +688,7 @@ function check(sql: string, rules: Rules, reading: Reading, redacted: () => stri
   }
 
   if (rules.clickhouse) {
-    checkClickHouse(tokens, (message) => refuse(message, statement));
+    checkClickHouse(tokens, (message, refused) => refuse(message, statement, 'not_read_only', refused));
   }
   // `WITH SESSION query_max_run_time = '1h' SELECT …`; a query named session is `WITH session AS (…)`.
   if (rules.trino && isWord(tokens[query], 'WITH') && isWord(tokens[query + 1], 'SESSION')
@@ -707,7 +721,7 @@ function check(sql: string, rules: Rules, reading: Reading, redacted: () => stri
  * and no SETTINGS or FORMAT clause, which would change the run's caps or the
  * result's format.
  */
-function checkClickHouse(tokens: Token[], refuse: (message: string) => never) {
+function checkClickHouse(tokens: Token[], refuse: (message: string, refused: Refused) => never) {
   // Per depth: the function each parenthesis calls, and whether a FROM clause's list of tables (or ARRAY JOIN's) is open.
   const calls: string[] = [''];
   const clause: ('from' | 'arrayJoin' | null)[] = [null];
@@ -737,17 +751,18 @@ function checkClickHouse(tokens: Token[], refuse: (message: string) => never) {
     }
     if ((t.kind === 'word' || t.kind === 'quoted') && isOp(after, '(') && tablePlace(k)
       && !CLICKHOUSE_TABLE_FUNCTIONS.has(t.value.toLowerCase())) {
-      refuse(`The table function ${t.value.toLowerCase()} is refused: only numbers, zeros, generate_series, generateRandom, values, null, view, merge, format and dictionary are read here`);
+      const name = t.value.toLowerCase();
+      refuse(`The table function ${name} is refused: only numbers, zeros, generate_series, generateRandom, values, null, view, merge, format and dictionary are read here`, { kind: 'table_function', name });
     }
     if (t.kind !== 'word') {
       continue;
     }
     const dotted = isOp(tokens[k - 1], '.');
     if (t.value === 'SETTINGS' && !dotted) {
-      refuse('The statement carries its own SETTINGS clause: the runner sets its limits (a name spelled so must be quoted)');
+      refuse('The statement carries its own SETTINGS clause: the runner sets its limits (a name spelled so must be quoted)', { kind: 'clause', name: 'SETTINGS' });
     }
     if (t.value === 'FORMAT' && !dotted && !isOp(after, '(')) {
-      refuse('The statement carries its own FORMAT clause: the runner reads its result in a format of its own (a name spelled so must be quoted)');
+      refuse('The statement carries its own FORMAT clause: the runner reads its result in a format of its own (a name spelled so must be quoted)', { kind: 'clause', name: 'FORMAT' });
     }
     if (t.value === 'FROM' && tablePlace(k + 1)) {
       clause[t.depth] = 'from';

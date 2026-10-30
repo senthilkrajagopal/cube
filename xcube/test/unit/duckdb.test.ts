@@ -1,4 +1,4 @@
-import { mkdir, readdir, realpath, rm, stat, symlink, writeFile } from 'fs/promises';
+import { mkdir, mkdtemp, readdir, realpath, rm, stat, symlink, writeFile } from 'fs/promises';
 import os from 'os';
 import path from 'path';
 
@@ -9,6 +9,7 @@ import {
 } from '../../src/connections/duckdb';
 import { bindParameters } from '../../src/sql/parameters';
 import { openSession, RowCollector, type SqlCaps } from '../../src/sql/runner';
+import { SqlRuns, type SqlTarget } from '../../src/sql/runs';
 
 // Read once, at an instance's first set-up: before any here.
 const root = path.join(os.tmpdir(), `xcube-duckdb-${process.pid}`);
@@ -272,5 +273,52 @@ describe('xcube\'s DuckDB driver, in process', () => {
     expect(Date.now() - started).toBeLessThan(5000);
     await session.close();
     expect(duckdbPool().stats()).toMatchObject({ busy: 0 });
+  });
+
+  test('the SQL runner: a file outside the source refused by DuckDB, as a query_failed with reason outside_source', async () => {
+    const target: SqlTarget = {
+      dialect: 'duckdb',
+      label: 'shop',
+      build: async () => ({ driver: makeDuckdbDriver(DRIVERS.duckdb.config({ kind: 'volume', path: file }, 'none', {})), secrets: [] }),
+    };
+    const runs = new SqlRuns('here', () => null, () => undefined);
+    const request = (sql: string) => ({ sql, runId: 'r1', maxRows: 10, timeoutMs: 30000, maxBytes: 1024 * 1024 });
+    for (const sql of ['SELECT * FROM read_csv(\'/etc/hosts\')', 'SELECT * FROM glob(\'/*\')', 'SELECT * FROM read_parquet(\'s3://lake/a.parquet\')']) {
+      await expect(runs.run('m', target, request(sql))).rejects.toMatchObject({
+        code: 'query_failed', reason: 'outside_source', refused: null, message: expect.stringMatching(/^Permission Error: Cannot access file .*disabled by configuration/),
+      });
+    }
+    await expect(runs.run('m', target, request('SELECT * FROM missing'))).rejects.toMatchObject({ code: 'query_failed', reason: null });
+    // The classifier's, before DuckDB: named.
+    await expect(runs.run('m', target, request('SELECT * FROM enable_logging()'))).rejects.toMatchObject({
+      code: 'not_read_only', refused: { kind: 'function', name: 'enable_logging' },
+    });
+    expect(duckdbPool().stats()).toMatchObject({ busy: 0 });
+  });
+});
+
+describe('DuckDB\'s max_temp_directory_size, under xcube\'s lock (a known, accepted gap)', () => {
+  test('bounds a spill, but not a COPY into the temp directory', async () => {
+    const dir = await realpath(await mkdtemp(path.join(os.tmpdir(), 'xcube-cap-')));
+    const { DuckDBInstance } = duckdbApi();
+    const db = await DuckDBInstance.create(':memory:');
+    const c = await db.connect();
+    try {
+      // As xcube sets an instance up, but with a cap of 1MiB.
+      for (const sql of [
+        'SET memory_limit = \'64MiB\'', 'SET threads = 1', `SET temp_directory = '${dir}'`, 'SET max_temp_directory_size = \'1MiB\'',
+        'SET preserve_insertion_order = false', 'SET allowed_directories = []', 'SET enable_external_access = false', 'SET lock_configuration = true',
+      ]) {
+        await c.run(sql);
+      }
+      await c.run(`COPY (SELECT range AS a, md5(range::VARCHAR) AS b FROM range(100000)) TO '${dir}/big.csv'`);
+      expect((await stat(path.join(dir, 'big.csv'))).size).toBeGreaterThan(2 * 2 ** 20);
+      await expect(c.run('SELECT count(*) FROM (SELECT md5(range::VARCHAR) AS b FROM range(3000000) ORDER BY b)'))
+        .rejects.toThrow(/^Out of Memory Error: .*max_temp_directory_size/s);
+    } finally {
+      c.closeSync();
+      db.closeSync();
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

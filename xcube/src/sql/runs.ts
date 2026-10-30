@@ -6,7 +6,7 @@ import {
   bindParameters, DIALECT_NAMES, UNBOUND_DIALECTS, type SqlBind, type SqlParameter,
 } from './parameters';
 import {
-  isTimeout, openSession, RowCollector, SqlRunError, type SessionDialect, type SqlAnswer, type SqlCaps, type SqlRows, type SqlSession,
+  isTimeout, openSession, queryFailedReason, RowCollector, SqlRunError, type SessionDialect, type SqlAnswer, type SqlCaps, type SqlRows, type SqlSession,
 } from './runner';
 
 /** What a run runs on: its dialect, and its own driver, built for it. */
@@ -146,7 +146,7 @@ export class SqlRuns {
         : classified.sql;
     } catch (e) {
       if (e instanceof SqlRefusal) {
-        throw new SqlRunError(e.code, e.message, e.redactedSql, e.statement);
+        throw new SqlRunError(e.code, e.message, e.redactedSql, e.statement, null, null, null, null, e.refused);
       }
       if (e instanceof ParameterError) {
         throw new SqlRunError('invalid_parameters', e.message, e.redactedSql, null, null, null, null, e.reason);
@@ -250,7 +250,16 @@ export class SqlRuns {
         if (isTimeout(dialect, e)) {
           throw fail('timeout', `The statement ran past ${elapsed(request.timeoutMs)} and was stopped`, Date.now() - ranAt, rows.stopped());
         }
-        throw fail('query_failed', redact(String(e?.message ?? e), built.secrets), Date.now() - ranAt);
+        throw new SqlRunError(
+          'query_failed',
+          redact(String(e?.message ?? e), built.secrets),
+          redactedSql,
+          statement,
+          Date.now() - ranAt,
+          null,
+          null,
+          queryFailedReason(dialect, e),
+        );
       } finally {
         clearTimeout(clock);
       }

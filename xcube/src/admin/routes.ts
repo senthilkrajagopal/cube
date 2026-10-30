@@ -771,6 +771,7 @@ export function initAdminRoutes(
         error: e.message,
         code: e.code,
         ...(e.reason ? { reason: e.reason } : {}),
+        ...(e.refused ? { refused: e.refused } : {}),
         statement: e.statement,
         redactedSql: e.redactedSql,
         ...(e.durationMs === null ? {} : { durationMs: e.durationMs }),

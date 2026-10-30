@@ -503,6 +503,40 @@ describe('the SQL runner\'s check: DuckDB', () => {
   });
 });
 
+describe('the SQL runner\'s check: what it refused, by name', () => {
+  const refusedFor = (sql: string, dialect: SqlDialect) => {
+    try {
+      classifySql(sql, dialect);
+    } catch (e) {
+      if (e instanceof SqlRefusal) {
+        return e.refused;
+      }
+      throw e;
+    }
+    throw new Error(`${sql} was taken`);
+  };
+
+  test('a function, a ClickHouse table function or clause; the first in the statement; nothing for a statement\'s kind', () => {
+    const cases: [SqlDialect, string, unknown][] = [
+      ['clickhouse', 'SELECT * FROM url(\'http://x\', CSV) JOIN S3(\'s3://b/k\') USING (a) SETTINGS a = 1', { kind: 'function', name: 'url' }],
+      ['clickhouse', 'SELECT * FROM t, mergeTreeIndex(\'db\', \'t\')', { kind: 'table_function', name: 'mergetreeindex' }],
+      ['clickhouse', 'SELECT count() FROM t SETTINGS max_result_rows = 1 FORMAT JSON', { kind: 'clause', name: 'SETTINGS' }],
+      ['clickhouse', 'SELECT 1 FORMAT CSV', { kind: 'clause', name: 'FORMAT' }],
+      ['duckdb', 'SELECT * FROM Enable_Logging(storage = \'file\')', { kind: 'function', name: 'enable_logging' }],
+      ['duckdb', 'SELECT * FROM query(\'SELECT 1\'), query_table(\'t\')', { kind: 'function', name: 'query' }],
+      ['trino', 'SELECT * FROM TABLE(pg.system.query(query => \'SELECT 1\'))', { kind: 'function', name: 'query' }],
+      ['athena', 'SELECT * FROM TABLE(system.raw_query(query => \'SELECT 1\'))', { kind: 'function', name: 'raw_query' }],
+      ['postgres', 'SELECT pg_read_file(\'/etc/passwd\')', { kind: 'function', name: 'pg_read_file' }],
+      ['duckdb', 'COPY (SELECT 1) TO \'/tmp/x.csv\'', null],
+      ['duckdb', 'ATTACH \'/tmp/x.duckdb\' AS x', null],
+      ['postgres', 'SELECT 1; SELECT 2', null],
+    ];
+    for (const [dialect, sql, refused] of cases) {
+      expect([dialect, sql, refusedFor(sql, dialect)]).toEqual([dialect, sql, refused]);
+    }
+  });
+});
+
 describe('the SQL runner\'s redaction', () => {
   test('strings and numbers become ?, comments go; names and keywords stay', () => {
     expect(redactSql('SELECT * FROM t WHERE a = \'secret\' AND b = 42 -- note \'x\'', 'postgres'))
