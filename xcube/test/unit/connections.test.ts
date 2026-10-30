@@ -191,6 +191,39 @@ describe('read-only drivers: DuckDB, ClickHouse, Trino and Athena', () => {
     expect(() => DRIVERS.clickhouse.config({ ...ch, host: 'a/b' }, 'password', { password: 'pw' })).toThrow(/host must be/);
   });
 
+  test('ClickHouse\'s driver: read-only, uncompressed, no export bucket whatever the environment; its catalog read reads the database', async () => {
+    const saved = { ...process.env };
+    Object.assign(process.env, {
+      CUBEJS_DB_CLICKHOUSE_READONLY: 'false',
+      CUBEJS_DB_CLICKHOUSE_COMPRESSION: 'true',
+      CUBEJS_DB_EXPORT_BUCKET_TYPE: 's3',
+      CUBEJS_DB_EXPORT_BUCKET: 'poison-bucket',
+      CUBEJS_DB_EXPORT_BUCKET_AWS_KEY: 'poison-key',
+      CUBEJS_DB_EXPORT_BUCKET_AWS_SECRET: 'poison-secret',
+    });
+    try {
+      const fields = { host: 'ch.example.com', database: 'sales', user: 'reader' };
+      const driver = DRIVERS.clickhouse.make!({ ...DRIVERS.clickhouse.config(fields, 'password', { password: 'pw' }), maxPoolSize: 1 });
+      expect(driver.config).toMatchObject({
+        readOnly: true,
+        compression: { request: false, response: false },
+        exportBucket: null,
+        database: 'sales',
+        username: 'reader',
+        clickhouseSettings: { join_use_nulls: 1 },
+      });
+      expect(JSON.stringify(driver.config)).not.toMatch(/poison/);
+      const query = jest.spyOn(driver, 'query').mockResolvedValue([]);
+      await expect(driver.getSchemas()).resolves.toEqual([{ schema_name: 'sales' }]);
+      expect(query).toHaveBeenCalledWith('SHOW TABLES FROM "sales"', []);
+      query.mockRejectedValueOnce(new Error('Database sales does not exist'));
+      await expect(driver.getSchemas()).rejects.toThrow(/does not exist/);
+      await driver.release();
+    } finally {
+      process.env = saved;
+    }
+  });
+
   test('Trino: HTTPS on 443, a password or a JWT, and nothing of the environment\'s export bucket', () => {
     const tr = { host: 'trino.example.com', catalog: 'hive', user: 'analyst' };
     expect(problems('trino', 'password', { ...tr, catalog: 'a b' })[0]).toMatch(/catalog can't hold/);

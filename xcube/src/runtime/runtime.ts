@@ -2132,6 +2132,8 @@ export class XcubeRuntime {
     const config: Record<string, unknown> = {
       snowflake: { executionTimeout: Math.ceil(request.timeoutMs / 1000) },
       mssql: { requestTimeout: request.timeoutMs },
+      // ClickHouse's is a setting sent with the query; its HTTP request outlasts the run's own clock.
+      clickhouse: { requestTimeout: request.timeoutMs + 30000 },
     }[found.driver] ?? {};
     return {
       dialect: (isDriverType(found.driver) ? DRIVERS[found.driver].cubeType : found.driver) as SessionDialect,

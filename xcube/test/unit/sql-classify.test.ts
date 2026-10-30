@@ -302,6 +302,63 @@ describe('the SQL runner\'s check: one read', () => {
     ]);
   });
 
+  test('ClickHouse: its comments, heredocs and quotes; EXPLAIN\'s kinds and settings', () => {
+    reads('clickhouse', [
+      'SELECT 1 # a comment',
+      'SELECT 1 /* a /* nested */ url(\'x\') */',
+      'SELECT \'it\\\'s; url(\'\'x\'\')\'',
+      'SELECT $$ url(\'x\'); $$, $1$ file(\'y\') $1$, $a1$ s3() $a1$',
+      'SELECT `a\\`b`, "c" FROM t',
+      'SELECT \u2018it\'s url(\u2019, \u201Cx\u201D FROM t',
+      'SELECT x$a$y$a$ FROM t',
+      'SELECT number FROM numbers(10) n JOIN zeros(3) z ON 1 = 1, generate_series(1, 3) g, values(\'a UInt8\', 1) v',
+      'SELECT * FROM view(SELECT 1), merge(currentDatabase(), \'^t\'), null(\'a UInt8\'), dictionary(\'d\'), format(CSV, \'1\')',
+      'SELECT * FROM `numbers`(3) LEFT ARRAY JOIN [1, 2] AS x, range(2) AS y',
+      'SELECT trim(BOTH \' \' FROM lower(s)), extract(day FROM toDate(d)) FROM t',
+      'SELECT a, lower(b) FROM t WHERE c IN (SELECT 1) GROUP BY a, lower(b) ORDER BY a, lower(b) LIMIT 1 BY a, lower(b)',
+      'SELECT t.settings, t.format, format(\'{}\', 1) FROM t',
+      'SELECT a FROM t1 JOIN t2 USING (a) WHERE a IS NOT DISTINCT FROM lower(b)',
+    ]);
+    for (const sql of [
+      'EXPLAIN SELECT 1', 'EXPLAIN PLAN actions = 1, header = 1 SELECT 1', 'EXPLAIN QUERY TREE SELECT 1',
+      'EXPLAIN PIPELINE graph = 1 SELECT 1', 'EXPLAIN ESTIMATE SELECT * FROM t', 'EXPLAIN AST WITH a AS (SELECT 1) SELECT * FROM a',
+    ]) {
+      expect([sql, verdict(sql, 'clickhouse')]).toEqual([sql, 'ok:explain']);
+    }
+  });
+
+  test('ClickHouse: table functions that reach outside it, SETTINGS and FORMAT refused', () => {
+    refuses('clickhouse', [
+      ['SELECT * FROM url(\'http://x\', CSV)', 'not_read_only:select'],
+      ['SELECT * FROM URL(\'http://x\')', 'not_read_only:select'],
+      ['SELECT * FROM `s3`(\'http://x\')', 'not_read_only:select'],
+      ['SELECT * FROM t JOIN remote(\'h\', db.t) r ON 1', 'not_read_only:select'],
+      ['SELECT * FROM a JOIN b ON a.x = b.x, postgresql(\'h\', \'d\', \'t\', \'u\', \'p\') p', 'not_read_only:select'],
+      ['SELECT * FROM t, someNewTableFunction(1) f', 'not_read_only:select'],
+      ['SELECT * FROM (SELECT * FROM icebergS3(\'x\'))', 'not_read_only:select'],
+      ['SELECT * FROM t ARRAY JOIN a JOIN viewExplain(\'x\') v ON 1', 'not_read_only:select'],
+      ['SELECT file(\'/etc/passwd\')', 'not_read_only:select'],
+      ['SELECT \u2018\'\u2019, url(\'http://x\') -- \'', 'not_read_only:select'],
+      ['SELECT $a$\'$a$, url(\'x\') -- \'', 'not_read_only:select'],
+      ['SELECT 1 SETTINGS max_execution_time = 0', 'not_read_only:select'],
+      ['EXPLAIN SELECT 1 SETTINGS max_threads = 1', 'not_read_only:explain'],
+      ['SELECT 1 FORMAT JSON', 'not_read_only:select'],
+      ['SELECT 1 INTO OUTFILE \'x\'', 'not_read_only:select'],
+      ['INSERT INTO FUNCTION url(\'x\') SELECT 1', 'not_read_only:insert'],
+      ['EXPLAIN SYNTAX CREATE TABLE t AS SELECT 1', 'not_read_only:explain'],
+      ['EXPLAIN TABLE OVERRIDE mysql(\'h\', \'d\', \'t\', \'u\', \'p\') PARTITION BY x', 'not_read_only:explain'],
+      ['SYSTEM DROP DNS CACHE', 'not_read_only:system'],
+      ['KILL QUERY WHERE 1', 'not_read_only:kill'],
+      ['SELECT 1; SELECT 2', 'several_statements:-'],
+      ['SELECT \'a\\\'; DROP TABLE t; --\'', 'ok:select'],
+    ]);
+    expect(() => classifySql('SELECT * FROM t, generateRandom(\'a UInt8\') g, cluster(\'c\', db.t)', 'clickhouse'))
+      .toThrow('The function cluster is refused: it acts outside a read-only transaction');
+    expect(() => classifySql('SELECT * FROM t, viewIfPermitted(SELECT 1 ELSE null(\'a UInt8\'))', 'clickhouse'))
+      .toThrow(/^The table function viewifpermitted is refused/);
+    expect(() => classifySql('SELECT settings FROM t', 'clickhouse')).toThrow(/its own SETTINGS clause/);
+  });
+
   test('a refusal says why, with its code', () => {
     try {
       classifySql('WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d', 'postgres');

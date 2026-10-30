@@ -2,7 +2,7 @@
  * Bound parameters on the SQL runner (wechart's F42). A statement names each
  * parameter `{{name}}` in its code; xcube finds them with the dialect's own
  * lexer (`placeholdersOf`), so that what its check reads is what runs, and
- * writes in their place placeholders of its own (`$1`, `?`, `@p1`, `:p1`),
+ * writes in their place placeholders of its own (`$1`, `?`, `@p1`, `:p1`, `{p1:String}`),
  * typed, each between spaces. The values go to the driver as binds, never into
  * the statement's text, and are never logged.
  */
@@ -30,9 +30,9 @@ export interface SqlBind {
 /**
  * Where binding isn't proven: their drivers take no binds (Dremio's job API,
  * Cube Store's, Trino's), or a value isn't yet shown to be taken as one
- * literal (Athena's execution parameters); DuckDB and ClickHouse until theirs land.
+ * literal (Athena's execution parameters); DuckDB until its land.
  */
-export const UNBOUND_DIALECTS = new Set<SqlDialect>(['dremio', 'trino', 'athena', 'duckdb', 'clickhouse', 'cubestore']);
+export const UNBOUND_DIALECTS = new Set<SqlDialect>(['dremio', 'trino', 'athena', 'duckdb', 'cubestore']);
 
 /** A dialect's name as a refusal says it. */
 export const DIALECT_NAMES: Record<SqlDialect, string> = {
@@ -55,6 +55,9 @@ export const DIALECT_NAMES: Record<SqlDialect, string> = {
 const DECIMAL = /^-?(\d+)(?:\.(\d+))?$/;
 
 const DATE = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+/** ClickHouse's Date32 range: a day outside it is taken as its nearest end, not refused. */
+const CLICKHOUSE_DAYS = { first: '1900-01-01', last: '2299-12-31' };
 
 /** The value, checked against its type: the reason it isn't one, or nothing. */
 function invalid(name: string, parameter: SqlParameter): string | null {
@@ -102,6 +105,10 @@ function placeholder(dialect: SqlDialect, slot: string, parameter: SqlParameter)
   const scale = scaleOf(value);
   if (dialect === 'postgres' || dialect === 'redshift') {
     return `${slot}::${{ text: 'text', number: 'numeric', date: 'date', boolean: 'boolean' }[type]}`;
+  }
+  if (dialect === 'clickhouse') {
+    // A query parameter is typed where it is written.
+    return `{${slot}:${{ text: 'String', number: `Decimal(38, ${scale})`, date: 'Date32', boolean: 'Bool' }[type]}}`;
   }
   if (type === 'text' || dialect === 'bigquery') {
     // BigQuery's are typed by its query parameters' `types`.
@@ -164,6 +171,14 @@ export function bindParameters(sql: string, dialect: SqlDialect, parameters: Rec
     if (problem) {
       throw new ParameterError('invalid_value', problem, redacted());
     }
+    const { type, value } = parameters[name];
+    if (dialect === 'clickhouse' && type === 'date' && (value < CLICKHOUSE_DAYS.first || value > CLICKHOUSE_DAYS.last)) {
+      throw new ParameterError(
+        'invalid_value',
+        `"${name}" is a Date ClickHouse can't hold: its days run from ${CLICKHOUSE_DAYS.first} to ${CLICKHOUSE_DAYS.last}`,
+        redacted(),
+      );
+    }
   }
 
   const binds: SqlBind[] = [];
@@ -177,7 +192,7 @@ export function bindParameters(sql: string, dialect: SqlDialect, parameters: Rec
     let slot = slots.get(name);
     if (!slot) {
       const n = slots.size + 1;
-      slot = { postgres: `$${n}`, redshift: `$${n}`, bigquery: `@p${n}`, mssql: `@p${n}`, oracle: `:p${n}` }[dialect as string]!;
+      slot = { postgres: `$${n}`, redshift: `$${n}`, bigquery: `@p${n}`, mssql: `@p${n}`, oracle: `:p${n}`, clickhouse: `p${n}` }[dialect as string]!;
       binds.push({ id: dialect === 'postgres' || dialect === 'redshift' ? String(n) : `p${n}`, ...parameter });
       slots.set(name, slot);
     }

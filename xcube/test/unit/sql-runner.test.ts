@@ -2,7 +2,7 @@ import { EventEmitter } from 'events';
 import { Readable } from 'stream';
 
 import {
-  cellOf, endsAtCubeStoreTimeout, joinsOnRouter, openSession, RowCollector, SqlRunError, type SqlCaps,
+  cellOf, endsAtCubeStoreTimeout, isTimeout, joinsOnRouter, openSession, RowCollector, SqlRunError, type SqlCaps,
 } from '../../src/sql/runner';
 import { MAX_RUNS, SqlRuns, type SqlRunRegistry, type SqlTarget } from '../../src/sql/runs';
 
@@ -244,9 +244,119 @@ describe('the SQL runner: each database\'s session, on drivers shaped as Cube\'s
   });
 });
 
+describe('the SQL runner: ClickHouse', () => {
+  /** A ClickHouse client whose results are these lines, cut into chunks across their breaks. */
+  const clickhouse = (answers: (string[] | Error)[]) => {
+    const execs: any[] = [];
+    const streams: Readable[] = [];
+    const killer = { command: jest.fn(async () => undefined), close: jest.fn(async () => undefined) };
+    const driver = {
+      client: {
+        exec: jest.fn(async (o: any) => {
+          execs.push(o);
+          const answer = answers.shift()!;
+          if (answer instanceof Error) {
+            throw answer;
+          }
+          const text = answer.map((l) => `${l}\n`).join('');
+          const stream = Readable.from([text.slice(0, 7), text.slice(7, 40), text.slice(40)], { objectMode: false });
+          streams.push(stream);
+          return { stream, query_id: o.query_id };
+        }),
+      },
+      createClient: jest.fn(() => killer),
+    };
+    return { driver, execs, streams, killer };
+  };
+
+  test('the statement as it is, its binds as query parameters, the caps as settings; rows read only to one past the cap', async () => {
+    const { driver, execs, streams } = clickhouse([[
+      '{"progress":{"read_rows":"0"}}',
+      '{"meta":[{"name":"a","type":"UInt64"},{"name":"b","type":"Nullable(String)"}]}',
+      ...[1, 2, 3, 4, 5].map((n) => `{"row":["${n}",${n === 2 ? 'null' : `"r${n}"`}]}`),
+    ]]);
+    const session = await openSession('clickhouse', driver, { ...caps, timeoutMs: 2500 }, noRefusal);
+    const rows = new RowCollector(caps.maxRows, caps.maxBytes);
+    await session.run('SELECT a, b FROM t WHERE c = {p1:String}', rows, [{ id: 'p1', type: 'text', value: 'x\'y' }]);
+    await session.close();
+    expect(execs[0]).toMatchObject({
+      query: 'SELECT a, b FROM t WHERE c = {p1:String}',
+      query_params: { p1: 'x\'y' },
+      query_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      clickhouse_settings: {
+        readonly: 2,
+        default_format: 'JSONCompactEachRowWithProgress',
+        max_execution_time: 3,
+        max_result_rows: 4,
+        result_overflow_mode: 'break',
+        cancel_http_readonly_queries_on_client_close: 1,
+        join_use_nulls: 1,
+        output_format_json_quote_64bit_integers: 1,
+        output_format_json_quote_decimals: 1,
+      },
+    });
+    expect(Object.keys(execs[0].clickhouse_settings)[0]).toBe('readonly');
+    expect(rows).toMatchObject({
+      columns: [{ name: 'a', type: 'UInt64' }, { name: 'b', type: 'Nullable(String)' }],
+      rows: [['1', 'r1'], ['2', null], ['3', 'r3']],
+      truncated: 'rows',
+    });
+    expect(streams[0].destroyed).toBe(true);
+  });
+
+  test('an error ClickHouse writes into the result fails the run, with its code', async () => {
+    const { driver } = clickhouse([[
+      '{"meta":[{"name":"a","type":"UInt8"}]}',
+      '{"row":[1]}',
+      '{"exception":"Code: 159. DB::Exception: Timeout exceeded: elapsed 1.0 seconds, maximum: 1. (TIMEOUT_EXCEEDED) (version 25.8.33.6 (official build))"}',
+    ]]);
+    const session = await openSession('clickhouse', driver, caps, noRefusal);
+    const rows = new RowCollector(caps.maxRows, caps.maxBytes);
+    const failure = await session.run('SELECT 1', rows).catch((e) => e);
+    expect(failure).toMatchObject({ code: '159', type: 'TIMEOUT_EXCEEDED', message: expect.stringMatching(/^Code: 159\./) });
+    expect(isTimeout('clickhouse', failure)).toBe(true);
+    expect(isTimeout('clickhouse', Object.assign(new Error('Code: 60. Unknown table'), { code: '60' }))).toBe(false);
+    expect(rows.rows).toEqual([[1]]);
+  });
+
+  test('before ClickHouse 25.4: names and types first, and an error after the rows as a row of its text', async () => {
+    const { driver, execs } = clickhouse([
+      Object.assign(new Error('Unknown format JSONCompactEachRowWithProgress'), { code: '73', type: 'UNKNOWN_FORMAT' }),
+      ['["a","b"]', '["UInt8","String"]', '[1,"x"]', '["Code: 241. DB::Exception: Memory limit exceeded. (MEMORY_LIMIT_EXCEEDED) (version 24.8.1.1)"]'],
+      Object.assign(new Error('Unknown format'), { code: '73' }),
+      ['["a"]', '["String"]', '["Code: 1. not an error, a value"]', '["y"]'],
+    ]);
+    const session = await openSession('clickhouse', driver, caps, noRefusal);
+    const rows = new RowCollector(caps.maxRows, caps.maxBytes);
+    await expect(session.run('SELECT a, b FROM t', rows)).rejects.toMatchObject({ code: '241', type: 'MEMORY_LIMIT_EXCEEDED' });
+    expect(execs.map((e) => e.clickhouse_settings.default_format))
+      .toEqual(['JSONCompactEachRowWithProgress', 'JSONCompactEachRowWithNamesAndTypes']);
+    expect(rows).toMatchObject({ columns: [{ name: 'a', type: 'UInt8' }, { name: 'b', type: 'String' }], rows: [[1, 'x']] });
+    // A one-column row is ClickHouse's error only in its own text.
+    const single = new RowCollector(caps.maxRows, caps.maxBytes);
+    await (await openSession('clickhouse', driver, caps, noRefusal)).run('SELECT a FROM t', single);
+    expect(single.rows).toEqual([['Code: 1. not an error, a value'], ['y']]);
+  });
+
+  test('cancel: the request let go, which stops the query, and KILL QUERY tried on a client of its own', async () => {
+    const { driver, execs, killer } = clickhouse([['{"meta":[{"name":"a","type":"UInt8"}]}']]);
+    const session = await openSession('clickhouse', driver, caps, noRefusal);
+    await session.run('SELECT 1', new RowCollector(caps.maxRows, caps.maxBytes));
+    killer.command.mockRejectedValueOnce(Object.assign(new Error('Not enough privileges'), { code: '497' }));
+    await session.cancel();
+    expect(execs[0].abort_signal.aborted).toBe(true);
+    expect(driver.createClient).toHaveBeenCalledWith(1);
+    expect(killer.command).toHaveBeenCalledWith({
+      query: 'KILL QUERY WHERE query_id = {id:String} ASYNC',
+      query_params: { id: execs[0].query_id },
+    });
+    expect(killer.close).toHaveBeenCalled();
+  });
+});
+
 describe('the SQL runner: drivers it doesn\'t run on yet', () => {
-  test('DuckDB, ClickHouse, Trino and Athena refuse to open a session, touching nothing of the driver', async () => {
-    for (const dialect of ['duckdb', 'clickhouse', 'trino', 'athena'] as const) {
+  test('DuckDB, Trino and Athena refuse to open a session, touching nothing of the driver', async () => {
+    for (const dialect of ['duckdb', 'trino', 'athena'] as const) {
       await expect(openSession(dialect, {}, caps, noRefusal)).rejects.toMatchObject({
         code: 'connect_failed',
         message: `The SQL runner doesn't run on ${dialect} data sources yet`,

@@ -66,11 +66,13 @@ interface Rules {
   slashComment: boolean;
   /** `--` starts a comment only before a space or a control character (MySQL). */
   dashNeedsSpace: boolean;
-  /** `$tag$ … $tag$` strings, or only `$$ … $$`. */
-  dollar: 'tagged' | 'plain' | false;
+  /** `$tag$ … $tag$` strings, or only `$$ … $$`; ClickHouse's heredoc tags may start with a digit. */
+  dollar: 'tagged' | 'plain' | 'heredoc' | false;
   doubleQuote: 'identifier' | 'string';
   backtick: boolean;
   brackets: boolean;
+  /** `‘…’` strings and `“…”` names, closed by either quote of the pair, with no escapes (ClickHouse). */
+  curlyQuotes: boolean;
   /** `'''` and `"""` strings (BigQuery). */
   tripleQuotes: boolean;
   /** `E'…'` strings, whose backslashes escape whatever the setting (PostgreSQL). */
@@ -83,6 +85,8 @@ interface Rules {
   explain: 'read' | 'writes' | 'none';
   /** Cube Store: its private tables refused, and SHOW and DESCRIBE explained. */
   cubeStore: boolean;
+  /** ClickHouse: only the table functions that read nothing outside it, and no SETTINGS or FORMAT clause. */
+  clickhouse: boolean;
   /** Names refused anywhere, unquoted: statements that write or lock, and the words that start them. */
   deniedWords: Set<string>;
   /** A called function's name (its last part) that acts outside the transaction. */
@@ -132,12 +136,42 @@ const base = {
   doubleQuote: 'identifier',
   backtick: false,
   brackets: false,
+  curlyQuotes: false,
   tripleQuotes: false,
   eStrings: false,
   executableComments: false,
   explain: 'read',
   cubeStore: false,
+  clickhouse: false,
 } as const;
+
+/**
+ * ClickHouse's functions that reach outside the server's own tables: other
+ * servers and stores, files, programs, or the request's own input. Each is a
+ * table function (one, `file`, a scalar function too); `catboostEvaluate` reads
+ * a model file.
+ */
+const CLICKHOUSE_FUNCTIONS = new RegExp(`^(${[
+  'url', 'urlcluster', 's3', 's3cluster', 'gcs', 'cosn', 'oss', 'file', 'filecluster', 'remote', 'remotesecure', 'cluster',
+  'clusterallreplicas', 'mysql', 'postgresql', 'jdbc', 'odbc', 'hdfs', 'hdfscluster', 'executable', 'azureblobstorage',
+  'azureblobstoragecluster', 'sqlite', 'mongodb', 'redis', 'iceberg.*', 'deltalake.*', 'hudi.*', 'paimon.*', 'input',
+  'arrowflight', 'ytsaurus', 'loop', 'fuzzjson', 'fuzzquery', 'catboostevaluate',
+].join('|')})$`);
+
+/** The table functions a FROM clause may call on ClickHouse: generated rows, inline data, and its own tables and dictionaries. */
+const CLICKHOUSE_TABLE_FUNCTIONS = new Set([
+  'numbers', 'numbers_mt', 'zeros', 'zeros_mt', 'generate_series', 'generateseries', 'generaterandom', 'values', 'null', 'view',
+  'merge', 'format', 'dictionary',
+]);
+
+/** The words that end a FROM clause, its list of tables, on ClickHouse. */
+const CLICKHOUSE_AFTER_FROM = new Set([
+  'WHERE', 'PREWHERE', 'GROUP', 'ORDER', 'LIMIT', 'HAVING', 'SETTINGS', 'FORMAT', 'UNION', 'EXCEPT', 'INTERSECT', 'WINDOW',
+  'QUALIFY', 'SELECT', 'OFFSET', 'FETCH', 'INTO',
+]);
+
+/** EXPLAIN's kinds on ClickHouse; its settings come after, as `name = value`, between commas. */
+const CLICKHOUSE_EXPLAIN_KINDS = new Set(['AST', 'SYNTAX', 'QUERY', 'TREE', 'PLAN', 'PIPELINE', 'ESTIMATE']);
 
 const RULES: Record<SqlDialect, Rules> = {
   postgres: {
@@ -214,9 +248,21 @@ const RULES: Record<SqlDialect, Rules> = {
     readings: readings([false], [false]),
     deniedWords: new Set(WRITES),
   },
+  clickhouse: {
+    ...base,
+    hashComment: true,
+    dollar: 'heredoc',
+    backtick: true,
+    curlyQuotes: true,
+    clickhouse: true,
+    // A backslash escapes in its strings and quoted names, and its comments nest (ClickHouse 25.8).
+    readings: readings([true], [true]),
+    // It has no MERGE statement: merge() reads its tables.
+    deniedWords: new Set(WRITES.filter((w) => w !== 'MERGE')),
+    deniedFunction: CLICKHOUSE_FUNCTIONS,
+  },
   // Until each has rules of its own, read every way and refused at the session (the runner doesn't run on them yet).
   duckdb: { ...base, readings: readings(BOTH, BOTH), deniedWords: new Set(WRITES) },
-  clickhouse: { ...base, readings: readings(BOTH, BOTH), deniedWords: new Set(WRITES) },
   trino: { ...base, readings: readings(BOTH, BOTH), deniedWords: new Set(WRITES) },
   athena: { ...base, readings: readings(BOTH, BOTH), deniedWords: new Set(WRITES) },
   cubestore: {
@@ -243,6 +289,13 @@ const SET_OPERATORS = new Set(['UNION', 'INTERSECT', 'EXCEPT', 'MINUS']);
 
 /** What may come between a set operator and the query after it. */
 const SET_QUANTIFIERS = new Set(['ALL', 'DISTINCT', 'CORRESPONDING', 'BY', 'NAME', 'STRICT']);
+
+/** What opens a dollar-quoted string, by the dialect's kind: its tag. */
+const DOLLAR_TAGS = {
+  tagged: /^\$(?:[\p{L}_][\p{L}\p{N}_]*)?\$/u,
+  plain: /^\$\$/,
+  heredoc: /^\$[A-Za-z0-9_]*\$/,
+};
 
 const WORD_START = /[\p{L}_]/u;
 const WORD_PART = /[\p{L}\p{N}\p{M}_$]/u;
@@ -343,8 +396,22 @@ function lex(sql: string, rules: Rules, reading: Reading): Lexed {
       const end = quoted(i, ']', 1, false, 'a bracketed name');
       push('quoted', sql.slice(i + 1, end - 1).replace(/]]/g, ']'), i, end);
       i = end;
-    } else if (c === '$' && rules.dollar && (rules.dollar === 'tagged' ? /^\$(?:[\p{L}_][\p{L}\p{N}_]*)?\$/u : /^\$\$/).test(sql.slice(i, i + 130))) {
-      const tag = /^\$(?:[\p{L}_][\p{L}\p{N}_]*)?\$/u.exec(sql.slice(i, i + 130))![0];
+    } else if ((c === '\u2018' || c === '\u2019' || c === '\u201C' || c === '\u201D') && rules.curlyQuotes) {
+      // Closed by either quote of its pair, whichever comes first; nothing escapes in it.
+      const pair = c === '\u2018' || c === '\u2019' ? /[\u2018\u2019]/ : /[\u201C\u201D]/;
+      const close = sql.slice(i + 1).search(pair);
+      if (close === -1) {
+        throw new LexError(pair.test('\u2018') ? 'a string isn\'t closed' : 'a quoted name isn\'t closed', i);
+      }
+      const end = i + 1 + close + 1;
+      if (pair.test('\u2018')) {
+        push('string', sql.slice(i, end), i, end);
+      } else {
+        push('quoted', sql.slice(i + 1, end - 1), i, end);
+      }
+      i = end;
+    } else if (c === '$' && rules.dollar && DOLLAR_TAGS[rules.dollar].test(sql.slice(i, i + 130))) {
+      const tag = DOLLAR_TAGS[rules.dollar].exec(sql.slice(i, i + 130))![0];
       const close = sql.indexOf(tag, i + tag.length);
       if (close === -1) {
         throw new LexError('a dollar-quoted string isn\'t closed', i);
@@ -491,23 +558,33 @@ function check(sql: string, rules: Rules, reading: Reading, redacted: () => stri
       refuse('Oracle\'s EXPLAIN PLAN writes the plan into PLAN_TABLE: only a SELECT runs here', 'explain');
     }
     let at = 1;
-    if (isOp(tokens[at], '(')) {
-      const close = tokens.findIndex((t, k) => k > at && isOp(t, ')') && t.depth === 0);
-      if (tokens.slice(at, close).some((t) => isWord(t, 'ANALYZE', 'ANALYSE'))) {
-        refuse('EXPLAIN ANALYZE runs the statement: only EXPLAIN without ANALYZE runs here', 'explain');
-      }
-      at = close + 1;
-    }
-    for (;;) {
-      const t = tokens[at];
-      if (isWord(t, 'ANALYZE', 'ANALYSE')) {
-        refuse('EXPLAIN ANALYZE runs the statement: only EXPLAIN without ANALYZE runs here', 'explain');
-      } else if (isWord(t, 'WITH') && isWord(tokens[at + 1], 'IMPLEMENTATION')) {
-        at += 2;
-      } else if ((t?.kind === 'word' && EXPLAIN_OPTIONS.has(t.value)) || isOp(t, '=')) {
+    if (rules.clickhouse) {
+      // `EXPLAIN PLAN actions = 1, header = 1 SELECT …`: a kind, then settings.
+      while (isWord(tokens[at]) && CLICKHOUSE_EXPLAIN_KINDS.has(tokens[at].value)) {
         at += 1;
-      } else {
-        break;
+      }
+      while (isWord(tokens[at]) && isOp(tokens[at + 1], '=') && ['word', 'number', 'string'].includes(tokens[at + 2]?.kind)) {
+        at += isOp(tokens[at + 3], ',') ? 4 : 3;
+      }
+    } else {
+      if (isOp(tokens[at], '(')) {
+        const close = tokens.findIndex((t, k) => k > at && isOp(t, ')') && t.depth === 0);
+        if (tokens.slice(at, close).some((t) => isWord(t, 'ANALYZE', 'ANALYSE'))) {
+          refuse('EXPLAIN ANALYZE runs the statement: only EXPLAIN without ANALYZE runs here', 'explain');
+        }
+        at = close + 1;
+      }
+      for (;;) {
+        const t = tokens[at];
+        if (isWord(t, 'ANALYZE', 'ANALYSE')) {
+          refuse('EXPLAIN ANALYZE runs the statement: only EXPLAIN without ANALYZE runs here', 'explain');
+        } else if (isWord(t, 'WITH') && isWord(tokens[at + 1], 'IMPLEMENTATION')) {
+          at += 2;
+        } else if ((t?.kind === 'word' && EXPLAIN_OPTIONS.has(t.value)) || isOp(t, '=')) {
+          at += 1;
+        } else {
+          break;
+        }
       }
     }
     query = at;
@@ -558,6 +635,10 @@ function check(sql: string, rules: Rules, reading: Reading, redacted: () => stri
     }
   }
 
+  if (rules.clickhouse) {
+    checkClickHouse(tokens, (message) => refuse(message, statement));
+  }
+
   // One statement: every query at the top level after its first follows a set operator.
   // A query in parentheses counts as the first; WITH's comes after its CTEs.
   let seen = isWord(tokens[query], 'WITH') && !isOp(tokens[query - 1], '(') ? 0 : 1;
@@ -575,6 +656,64 @@ function check(sql: string, rules: Rules, reading: Reading, redacted: () => stri
     }
   }
   return { statement, cut };
+}
+
+/**
+ * ClickHouse's own: a table function in a FROM clause (after FROM, a JOIN, or
+ * a comma in its list of tables) only if it reads nothing outside the server,
+ * and no SETTINGS or FORMAT clause, which would change the run's caps or the
+ * result's format.
+ */
+function checkClickHouse(tokens: Token[], refuse: (message: string) => never) {
+  // Per depth: the function each parenthesis calls, and whether a FROM clause's list of tables (or ARRAY JOIN's) is open.
+  const calls: string[] = [''];
+  const clause: ('from' | 'arrayJoin' | null)[] = [null];
+  // Whether a table may be named at token k: what comes before it opens a FROM clause's item.
+  const tablePlace = (k: number): boolean => {
+    const before = tokens[k - 1];
+    if (!before) {
+      return false;
+    }
+    if (isWord(before, 'FROM')) {
+      return !['EXTRACT', 'SUBSTRING', 'TRIM', 'OVERLAY'].includes(calls[before.depth]) && !isWord(tokens[k - 2], 'DISTINCT');
+    }
+    if (isWord(before, 'JOIN')) {
+      return !isWord(tokens[k - 2], 'ARRAY');
+    }
+    if (isOp(before, ',')) {
+      return clause[before.depth] === 'from';
+    }
+    return isOp(before, '(') && tablePlace(k - 1);
+  };
+  for (let k = 0; k < tokens.length; k++) {
+    const t = tokens[k];
+    const after = tokens[k + 1];
+    if (isOp(t, '(')) {
+      calls[t.depth + 1] = isWord(tokens[k - 1]) ? tokens[k - 1].value : '';
+      clause[t.depth + 1] = null;
+    }
+    if ((t.kind === 'word' || t.kind === 'quoted') && isOp(after, '(') && tablePlace(k)
+      && !CLICKHOUSE_TABLE_FUNCTIONS.has(t.value.toLowerCase())) {
+      refuse(`The table function ${t.value.toLowerCase()} is refused: only numbers, zeros, generate_series, generateRandom, values, null, view, merge, format and dictionary are read here`);
+    }
+    if (t.kind !== 'word') {
+      continue;
+    }
+    const dotted = isOp(tokens[k - 1], '.');
+    if (t.value === 'SETTINGS' && !dotted) {
+      refuse('The statement carries its own SETTINGS clause: the runner sets its limits (a name spelled so must be quoted)');
+    }
+    if (t.value === 'FORMAT' && !dotted && !isOp(after, '(')) {
+      refuse('The statement carries its own FORMAT clause: the runner reads its result in a format of its own (a name spelled so must be quoted)');
+    }
+    if (t.value === 'FROM' && tablePlace(k + 1)) {
+      clause[t.depth] = 'from';
+    } else if (t.value === 'JOIN') {
+      clause[t.depth] = isWord(tokens[k - 1], 'ARRAY') ? 'arrayJoin' : 'from';
+    } else if (CLICKHOUSE_AFTER_FROM.has(t.value) && !dotted) {
+      clause[t.depth] = null;
+    }
+  }
 }
 
 /**
@@ -710,6 +849,10 @@ function writtenPlaceholder(dialect: SqlDialect, tokens: Token[], k: number): st
         && !isOp(next, '@') ? `@${next.value.toLowerCase()}` : null;
     case 'oracle':
       return t.value === ':' && (next?.kind === 'word' || next?.kind === 'number') && touches(t, next) ? `:${next.value.toLowerCase()}` : null;
+    case 'clickhouse':
+      // A query parameter, `{name:Type}`.
+      return t.value === '{' && (next?.kind === 'word' || next?.kind === 'quoted') && isOp(tokens[k + 2], ':')
+        ? `{${next.kind === 'word' ? next.value.toLowerCase() : next.value}:…}` : null;
     default:
       return null;
   }

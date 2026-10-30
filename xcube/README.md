@@ -755,7 +755,12 @@ top of them:
      `LOAD_FILE`; Snowflake's `SYSTEM$` functions; BigQuery's
      `EXTERNAL_QUERY`; SQL Server's `OPENROWSET`, `OPENQUERY` and lock hints;
      Oracle's `UTL_` and `DBMS_` packages but `DBMS_XPLAN`, `DBMS_LOB` and
-     `DBMS_RANDOM`).
+     `DBMS_RANDOM`; ClickHouse's `url`, `s3`, `file`, `remote`, `mysql` and
+     the other functions that reach outside its tables).
+   - ClickHouse's FROM clause calls only `numbers`, `zeros`,
+     `generate_series`, `generateRandom`, `values`, `null`, `view`, `merge`,
+     `format` and `dictionary`, and a statement's own `SETTINGS` or `FORMAT`
+     clause is refused: the runner sets those.
    - It isn't a grammar. It reads the statement as the database's lexer does,
      with its strings, quoted names, comments and dollar quotes, so it checks
      the code the database runs, never text in a string. Where the lexing
@@ -771,7 +776,9 @@ top of them:
    Oracle (`SET TRANSACTION READ ONLY`). There it also stops a SELECT whose
    function writes. On SQL Server it isn't read-only, but rolled back.
    BigQuery's dry run must call the statement a `SELECT` before it runs.
-   Snowflake and Dremio have the check alone.
+   ClickHouse runs it with `readonly=2`, so its login must not be at
+   `readonly=1` (Cube's own queries set settings too). Snowflake and Dremio
+   have the check alone.
 4. **A connection of the run's own**, a pool of one, never one Cube serves
    with, dropped afterwards: nothing it sets outlives the run.
 
@@ -782,14 +789,16 @@ function with an autonomous transaction.
 **Caps per run**, sent with each run (R50's by default):
 - **Rows** (`maxRows`, 10,000; at most 100,000): read as they come, one past
   the cap, and no further. Oracle's are read from a result set 100 at a time,
-  and Dremio's a page of 500 at a time, only to the cap. Cube Store answers every row at
+  and Dremio's a page of 500 at a time, only to the cap. ClickHouse's
+  `max_result_rows` stops it in whole blocks past the cap. Cube Store answers every row at
   once, so a SELECT there is asked for one past the cap by its own top-level
   `LIMIT`, added or lowered (a subquery would lose its order).
 - **Time** (`timeoutMs`, 30 s; at most 10 minutes), stopped on the database:
   PostgreSQL's and Redshift's `statement_timeout`, MySQL's
   `MAX_EXECUTION_TIME` (MariaDB's `max_statement_time`), Snowflake's
   `STATEMENT_TIMEOUT_IN_SECONDS`, SQL Server's `requestTimeout`, Oracle's
-  `callTimeout`, BigQuery's `jobTimeoutMs`. Then a clock of xcube's, 2 s
+  `callTimeout`, BigQuery's `jobTimeoutMs`, ClickHouse's
+  `max_execution_time` (in whole seconds). Then a clock of xcube's, 2 s
   later, cancels it on the database: Dremio's job through its API. Cube Store
   can't stop a query (below).
 - **Bytes** (`maxBytes`, 10 MB; at most 100 MB) of the answer's rows as JSON.
@@ -799,7 +808,7 @@ function with an autonomous transaction.
 **A run stopped at its time cap, or cancelled, answers the rows it read
 before**, marked `truncated: "stopped"`, beside its `422` and `code`. How many
 depends on when the database sends them:
-- every row that arrived on PostgreSQL, Redshift and MySQL;
+- every row that arrived on PostgreSQL, Redshift, MySQL and ClickHouse;
 - SQL Server's in whole 4 KB network packets: a result smaller than one
   arrives only at its end;
 - Oracle's in whole fetches of 100 rows;
@@ -812,7 +821,9 @@ noted in xcube's database while it runs (`sql_runs`), and a cancel for another
 instance's reaches it through the notification channel. The statement is
 cancelled on the database (`pg_cancel_backend`, `KILL QUERY`, Snowflake's and
 BigQuery's cancels, SQL Server's attention, Oracle's break, Dremio's job
-cancel). One run per `runId` at a time.
+cancel). On ClickHouse the run lets go of its request, which ends the query
+there (`cancel_http_readonly_queries_on_client_close`), and tries `KILL QUERY`,
+which a SELECT-only login may not. One run per `runId` at a time.
 
 **Cube Store**: SELECT and EXPLAIN. It holds every model's rollups.
 - Its `system.cache`, `system.queue` and `system.queue_results` are refused:
@@ -873,8 +884,9 @@ cancel). One run per `runId` at a time.
 - binary as `\x` and hex;
 - dates as ISO 8601;
 - numbers as Cube's driver gives them: PostgreSQL's `int8` and `numeric`,
-  MySQL's `BIGINT` and `DECIMAL`, Snowflake's numbers, and every number of SQL
-  Server's, as strings;
+  MySQL's `BIGINT` and `DECIMAL`, Snowflake's numbers, every number of SQL
+  Server's, and ClickHouse's 64-bit integers and decimals, as strings;
+- a ClickHouse join's unmatched cells as `null` (`join_use_nulls`);
 - Cube Store's values as strings.
 
 A column's `type` is the database's name for it, as its driver reports it
@@ -1317,7 +1329,11 @@ never written into the SQL.
   - MySQL and Snowflake: `?`, cast where typed;
   - SQL Server: `@p1`, `CAST(@p1 AS DECIMAL(38, 2))`;
   - Oracle: `:p1`, `TO_NUMBER`/`TO_DATE` where typed;
-  - BigQuery: `@p1`, with its `types` on the dry run and the job.
+  - BigQuery: `@p1`, with its `types` on the dry run and the job;
+  - ClickHouse: `{p1:String}`, `{p1:Decimal(38, 2)}`, `{p1:Date32}`,
+    `{p1:Bool}`, as its query parameters. A date outside Date32's
+    1900-01-01 to 2299-12-31 is refused (`invalid_value`): ClickHouse would
+    take the nearest end.
 
   The read-only check reads the statement as it runs, so `redactedSql` is
   that, values left out. The values are never logged.

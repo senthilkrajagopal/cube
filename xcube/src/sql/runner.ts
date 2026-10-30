@@ -16,6 +16,7 @@
  *   further: a database that answers every row at once (Cube Store) is asked
  *   for one row more than the cap.
  */
+import { randomUUID } from 'crypto';
 import type { StatementKind } from './classify';
 import type { SqlBind } from './parameters';
 
@@ -653,6 +654,142 @@ async function dremioSession(driver: any): Promise<SqlSession> {
   };
 }
 
+/** One JSON object a line, each marked: the columns (`meta`), a row, progress, or the error that ended the query (ClickHouse 25.4 on). */
+const CLICKHOUSE_FORMAT = 'JSONCompactEachRowWithProgress';
+
+/** Before ClickHouse 25.4: the names, the types, then the rows; an error after them comes as text, or as a row of its text. */
+const CLICKHOUSE_OLDER_FORMAT = 'JSONCompactEachRowWithNamesAndTypes';
+
+/** ClickHouse's text of an error, as it writes one into a result. */
+const CLICKHOUSE_ERROR = /^Code: \d+\. DB::Exception: [\s\S]*\(version [^)]*\)\s*$/;
+
+/** An error ClickHouse wrote into the result: its code and name kept, as its client's errors have them. */
+function clickhouseError(text: string): Error {
+  return Object.assign(new Error(text.trim()), {
+    code: /^Code: (\d+)\./.exec(text)?.[1],
+    type: /\(([A-Z][A-Z0-9_]+)\)(?: \(version .*\))?\s*$/.exec(text.trim())?.[1],
+  });
+}
+
+/** A run's settings, sent with its query: read-only, the caps (AC-1039), unmatched join cells as null (AC-1041), and values JSON carries whole. */
+export function clickhouseRunSettings(caps: SqlCaps, format: string): Record<string, string | number> {
+  return {
+    // First: a read-only query, whose settings may still be set (a login at readonly=1 can't run Cube's queries either).
+    readonly: 2,
+    default_format: format,
+    max_execution_time: Math.max(1, Math.ceil(caps.timeoutMs / 1000)),
+    max_result_rows: caps.maxRows + 1,
+    result_overflow_mode: 'break',
+    // The query stops on ClickHouse when its request is let go, which needs no grant (KILL QUERY reads system.processes).
+    cancel_http_readonly_queries_on_client_close: 1,
+    join_use_nulls: 1,
+    date_time_output_format: 'iso',
+    output_format_json_quote_decimals: 1,
+    output_format_json_quote_64bit_integers: 1,
+    http_write_exception_in_output_format: 1,
+  };
+}
+
+/**
+ * ClickHouse: its HTTP interface, on the run's own client. The statement
+ * goes as it is, its parameters as ClickHouse's query parameters, with the
+ * caps as settings; its result is read a line at a time, only to the cap, and
+ * let go of there, which stops the query on ClickHouse.
+ */
+async function clickhouseSession(driver: any, caps: SqlCaps): Promise<SqlSession> {
+  const queryId = randomUUID();
+  const abort = new AbortController();
+  let response: any = null;
+  return {
+    async run(sql, rows, binds = []) {
+      const exec = (format: string) => driver.client.exec({
+        query: sql,
+        query_id: queryId,
+        query_params: Object.fromEntries(binds.map((b) => [b.id, b.value])),
+        clickhouse_settings: clickhouseRunSettings(caps, format),
+        abort_signal: abort.signal,
+      });
+      let format = CLICKHOUSE_FORMAT;
+      let result: any;
+      try {
+        result = await exec(format);
+      } catch (e: any) {
+        if (String(e?.code) !== '73' && e?.type !== 'UNKNOWN_FORMAT') {
+          throw e;
+        }
+        format = CLICKHOUSE_OLDER_FORMAT;
+        result = await exec(format);
+      }
+      response = result.stream;
+      response.setEncoding('utf8');
+
+      let names: string[] | null = null;
+      const take = (text: string): boolean => {
+        let message: any;
+        try {
+          message = JSON.parse(text);
+        } catch {
+          throw clickhouseError(text);
+        }
+        if (format === CLICKHOUSE_FORMAT) {
+          if (message?.exception !== undefined) {
+            throw clickhouseError(String(message.exception));
+          }
+          if (Array.isArray(message?.meta)) {
+            rows.setColumns(message.meta.map((c: any) => ({ name: String(c.name), type: c.type == null ? null : String(c.type) })));
+          }
+          return Array.isArray(message?.row) ? rows.add(message.row) : true;
+        }
+        if (!Array.isArray(message)) {
+          throw clickhouseError(text);
+        }
+        if (!names) {
+          names = message.map(String);
+        } else if (!rows.columns.length) {
+          rows.setColumns(names.map((name, i) => ({ name, type: String(message[i]) })));
+        } else if (message.length !== names.length || (message.length === 1 && typeof message[0] === 'string' && CLICKHOUSE_ERROR.test(message[0]))) {
+          throw clickhouseError(message.length === 1 ? String(message[0]) : text);
+        } else {
+          return rows.add(message);
+        }
+        return true;
+      };
+
+      let pending = '';
+      // Leaving the loop early destroys the response: ClickHouse cancels the query as it next writes.
+      for await (const chunk of response) {
+        pending += chunk;
+        for (let nl = pending.indexOf('\n'); nl !== -1; nl = pending.indexOf('\n')) {
+          const text = pending.slice(0, nl);
+          pending = pending.slice(nl + 1);
+          if (text.trim() && !take(text)) {
+            return;
+          }
+        }
+      }
+      if (pending.trim()) {
+        take(pending);
+      }
+    },
+    async cancel() {
+      abort.abort();
+      response?.destroy();
+      // Where the user may, on ClickHouse too: a query that writes nothing yet notices its request gone only as it checks.
+      await quietly(async () => {
+        const killer = driver.createClient(1);
+        try {
+          await killer.command({ query: 'KILL QUERY WHERE query_id = {id:String} ASYNC', query_params: { id: queryId } });
+        } finally {
+          await killer.close();
+        }
+      });
+    },
+    async close() {
+      response?.destroy();
+    },
+  };
+}
+
 /**
  * Whether a Cube Store plan joins on its router: a join not under a
  * `ClusterSend`. Its router runs it, and nothing stops that once it starts
@@ -770,8 +907,9 @@ export function openSession(
       return oracleSession(driver, caps);
     case 'dremio':
       return dremioSession(driver);
-    case 'duckdb':
     case 'clickhouse':
+      return clickhouseSession(driver, caps);
+    case 'duckdb':
     case 'trino':
     case 'athena':
       return Promise.reject(new SqlRunError('connect_failed', `The SQL runner doesn't run on ${dialect} data sources yet`));
@@ -800,9 +938,11 @@ export function isTimeout(dialect: SessionDialect, e: any): boolean {
       return /NJS-123|DPI-1067|ORA-03156/.test(message);
     case 'bigquery':
       return /timed? ?out|jobTimeoutMs/i.test(message);
+    case 'clickhouse':
+      // TIMEOUT_EXCEEDED: its max_execution_time.
+      return code === '159' || e?.type === 'TIMEOUT_EXCEEDED' || /\(TIMEOUT_EXCEEDED\)/.test(message);
     case 'dremio':
     case 'duckdb':
-    case 'clickhouse':
     case 'trino':
     case 'athena':
     case 'cubestore':

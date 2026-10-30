@@ -32,6 +32,9 @@ const POISON = {
   CUBEJS_DB_DREMIO_AUTH_TOKEN: 'poison-dremio-token',
   CUBEJS_DB_REDSHIFT_CLUSTER_IDENTIFIER: 'poison-cluster',
   CUBEJS_DB_REDSHIFT_AWS_REGION: 'us-east-1',
+  CUBEJS_DB_CLICKHOUSE_READONLY: 'false',
+  CUBEJS_DB_CLICKHOUSE_COMPRESSION: 'true',
+  CUBEJS_DB_EXPORT_BUCKET_S3_ENDPOINT: 'https://poison-s3-endpoint',
   PGPASSWORD: 'poison-pgpassword',
   PGHOST: 'poison-pghost',
 };
@@ -58,6 +61,7 @@ const cases = {
   oracle: [{ host: 'xc-host', port: 1521, database: 'xc-db', user: 'xc-user' }, 'password', { password: 'xc-password' }],
   dremio: [{ host: 'xc-host', port: 9047, user: 'xc-user' }, 'password', { password: 'xc-password' }],
   'dremio (cloud)': [{ url: 'https://xc-dremio.example/v0/projects/p' }, 'token', { token: 'xc-token' }, 'dremio'],
+  clickhouse: [{ host: 'xc-host', port: 8443, database: 'xc-db', user: 'xc-user', ssl: true }, 'password', { password: 'xc-password' }],
 };
 
 // Each value the connection gives, as the driver would hold it: a JSON secret by its values.
@@ -98,7 +102,8 @@ const POISONED = Object.values(POISON).filter((p) => p.length > 3);
     // BigQuery's constructor refuses an export bucket type it can't use: poison it with one it can.
     process.env.CUBEJS_DB_EXPORT_BUCKET_TYPE = driverType === 'bigquery' ? 'gcp' : POISON.CUBEJS_DB_EXPORT_BUCKET_TYPE;
     try {
-      const driver = CubejsServerCore.createDriver(spec.cubeType, { ...spec.config(fields, auth, secrets), dataSource: 'conn_x', maxPoolSize: 1 });
+      const config = { ...spec.config(fields, auth, secrets), dataSource: 'conn_x', maxPoolSize: 1 };
+      const driver = spec.make ? spec.make(config) : CubejsServerCore.createDriver(spec.cubeType, config);
       const parts = [driver.config, driver.options, driver.poolConfig];
       if (driver.credentials && typeof driver.credentials.getCredentials === 'function') {
         parts.push(await driver.credentials.getCredentials());
@@ -107,6 +112,9 @@ const POISONED = Object.values(POISON).filter((p) => p.length > 3);
       const leaked = seen(parts, POISONED);
       if (driverType === 'redshift' && driver.credentials?.constructor.name !== 'RedshiftPlainCredentialsProvider') {
         leaked.push(`credentials from ${driver.credentials?.constructor.name}`);
+      }
+      if (driverType === 'clickhouse' && (driver.config.readOnly !== true || driver.config.compression?.request !== false || driver.config.exportBucket)) {
+        leaked.push('ClickHouse\'s read-only, compression or export bucket from the environment');
       }
       const expected = given(fields, secrets);
       const reached = seen(parts, expected);

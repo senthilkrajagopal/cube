@@ -52,6 +52,7 @@ describe('{{name}} parameters: found in code only, as the database reads it', ()
       ['postgres', 'SELECT $1'], ['redshift', 'SELECT * FROM t WHERE a = $2'],
       ['mysql', 'SELECT ?'], ['snowflake', 'SELECT ?'], ['snowflake', 'SELECT :1'],
       ['bigquery', 'SELECT @x'], ['bigquery', 'SELECT ?'], ['mssql', 'SELECT @x'], ['oracle', 'SELECT :x FROM dual'], ['oracle', 'SELECT :1 FROM dual'],
+      ['clickhouse', 'SELECT {x:String}'], ['clickhouse', 'SELECT { `x` : UInt8 }'],
     ];
     for (const [dialect, sql] of written) {
       expect([dialect, sql, reasonOf(() => placeholdersOf(sql, dialect))?.[0]]).toEqual([dialect, sql, 'placeholder_written']);
@@ -59,6 +60,7 @@ describe('{{name}} parameters: found in code only, as the database reads it', ()
     const fine: [SqlDialect, string][] = [
       ['postgres', 'SELECT a::int, b ? \'k\' FROM t'], ['snowflake', 'SELECT v:field, a::int FROM t'],
       ['mssql', 'SELECT @@VERSION'], ['bigquery', 'SELECT @@project_id'], ['postgres', 'SELECT \'$1\', "?"'],
+      ['clickhouse', 'SELECT {\'k\': 1}, \'{x:String}\', $$ {x:String} $$'],
     ];
     for (const [dialect, sql] of fine) {
       expect([dialect, sql, reasonOf(() => placeholdersOf(sql, dialect))]).toEqual([dialect, sql, null]);
@@ -90,6 +92,7 @@ describe('binding: xcube\'s placeholders in the {{name}}s\' places, typed, the v
         'SELECT  :p1 ,  TO_NUMBER(:p2, \'99D99\', \'NLS_NUMERIC_CHARACTERS=\'\'.,\'\'\') ,  TO_DATE(:p3, \'YYYY-MM-DD\') ,  :p4 , x :p1 ',
         ['p1', 'p2', 'p3', 'p4'],
       ],
+      clickhouse: ['SELECT  {p1:String} ,  {p2:Decimal(38, 2)} ,  {p3:Date32} ,  {p4:Bool} , x {p1:String} ', ['p1', 'p2', 'p3', 'p4']],
     };
     for (const [dialect, [rewritten, ids]] of Object.entries(expected)) {
       const bound = bindParameters(sql, dialect as SqlDialect, parameters);
@@ -121,6 +124,16 @@ describe('binding: xcube\'s placeholders in the {{name}}s\' places, typed, the v
       expect([parameter, reason]).toEqual([parameter, 'invalid_value']);
       expect(said).toMatch(message);
     }
+  });
+
+  test('ClickHouse: a day outside Date32\'s range is refused, since ClickHouse would take its nearest end', () => {
+    const day = (value: string) => reasonOf(() => bindParameters('SELECT {{a}}', 'clickhouse', { a: { type: 'date', value } }));
+    expect(day('1899-12-31')).toEqual(['invalid_value', '"a" is a Date ClickHouse can\'t hold: its days run from 1900-01-01 to 2299-12-31']);
+    expect(day('2300-01-01')?.[0]).toBe('invalid_value');
+    expect(day('1900-01-01')).toBeNull();
+    expect(day('2299-12-31')).toBeNull();
+    // Elsewhere the day is the database's to take.
+    expect(reasonOf(() => bindParameters('SELECT {{a}}', 'postgres', { a: { type: 'date', value: '1899-12-31' } }))).toBeNull();
   });
 });
 

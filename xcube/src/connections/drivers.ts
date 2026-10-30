@@ -8,6 +8,7 @@
  * leaves it empty. A driver spreads its config over those defaults, so none
  * of them reaches a connection.
  */
+import { makeClickHouseDriver } from './clickhouse';
 
 export const DRIVER_TYPES = [
   'postgres', 'redshift', 'mysql', 'snowflake', 'bigquery', 'mssql', 'oracle', 'dremio', 'duckdb', 'clickhouse', 'trino', 'athena',
@@ -475,7 +476,7 @@ export const DRIVERS: Record<DriverType, DriverSpec> = {
         readOnly: true,
       };
     },
-    make: notYet('ClickHouse'),
+    make: makeClickHouseDriver,
   },
   /** Trino over HTTPS, always: a user, with a password or a JWT. */
   trino: {
