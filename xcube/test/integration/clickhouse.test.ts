@@ -6,13 +6,18 @@
  *   XCUBE_TEST_CLICKHOUSE          a ClickHouse's HTTP port as host:port, with a database `shop`
  *                                  (orders: id UInt64, customer String, amount Decimal(18, 2), at DateTime;
  *                                  customers: name String, tier String, c1 and c2 only) and a user
- *                                  wechart/pw with readonly=2 and SELECT on shop.* alone, as wechart's compose's
+ *                                  wechart/pw with readonly=2 CONST and SELECT on shop.* alone, as wechart's compose's (ClickHouse 26.8)
  *   XCUBE_TEST_CLICKHOUSE_ADMIN    user:password of a login that reads system.processes and system.query_log
  */
 import crypto from 'crypto';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { createClient } from '@clickhouse/client';
 
+import { Connections } from '../../src/connections/connections';
 import { DRIVERS } from '../../src/connections/drivers';
+import { CredentialKeys, generateCredentialKey, sealSecretV1 } from '../../src/credentials/credentials';
 import { SqlRunError } from '../../src/sql/runner';
 import { SqlRuns, type SqlRunRequest, type SqlTarget } from '../../src/sql/runs';
 
@@ -31,6 +36,7 @@ jest.setTimeout(120 * 1000);
     password: ADMIN.slice(ADMIN.indexOf(':') + 1),
   }) : null;
   const mark = crypto.randomBytes(4).toString('hex');
+  const PASSWORD_MARK = `wrong-${mark}-password`;
 
   afterAll(async () => {
     await admin?.close();
@@ -156,16 +162,34 @@ jest.setTimeout(120 * 1000);
     }
   });
 
-  test('the connection test: a database that isn\'t there fails it', async () => {
-    const good = DRIVERS.clickhouse.make!(DRIVERS.clickhouse.config(fields, 'password', { password: 'pw' }));
-    await good.testConnection();
-    await expect(good.getSchemas()).resolves.toEqual([{ schema_name: 'shop' }]);
-    await good.release();
-    const missing = DRIVERS.clickhouse.make!(DRIVERS.clickhouse.config({ ...fields, database: `none_${mark}` }, 'password', { password: 'pw' }));
-    await expect((async () => {
-      await missing.testConnection();
-      await missing.getSchemas();
-    })()).rejects.toThrow(/UNKNOWN_DATABASE|does not exist/);
-    await missing.release();
+  test('the connection test: a login connects on any database; one that isn\'t there fails reading the catalog, with ClickHouse\'s own words', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xcube-keys-'));
+    const key = generateCredentialKey();
+    fs.writeFileSync(path.join(dir, `${key.kid}.pem`), key.pem);
+    fs.writeFileSync(path.join(dir, `${key.kid}.check`), key.check);
+    const connections = new Connections(() => { throw new Error('no store'); }, new CredentialKeys(dir, [key.kid], key.kid), 'i', () => undefined);
+    const check = (over: Record<string, unknown>, password = 'pw') => {
+      const input = { ...fields, ...over };
+      return connections.test({
+        driver: 'clickhouse', authMethod: 'password', fields: input, sealed: { password: sealSecretV1(key.jwk.x, key.kid, 'clickhouse', 'password', input, password) },
+      });
+    };
+    const steps = (result: { checks: { id: string; status: string }[] }) => result.checks.map((c) => `${c.id} ${c.status}`);
+
+    const good = await check({});
+    expect(good.ok).toBe(true);
+    expect(steps(good)).toEqual(['secrets passed', 'config passed', 'connect passed', 'schemas passed']);
+
+    const nowhere = await check({ database: 'nowhere' });
+    expect(nowhere.ok).toBe(false);
+    expect(steps(nowhere)).toEqual(['secrets passed', 'config passed', 'connect passed', 'schemas failed']);
+    expect(nowhere.checks[3].error).toMatch(/^Code: 81\. DB::Exception: Database nowhere does not exist\. \(UNKNOWN_DATABASE\)/);
+    expect(nowhere.checks[3].error).not.toContain('pw');
+
+    const wrong = await check({}, PASSWORD_MARK);
+    expect(steps(wrong)).toEqual(['secrets passed', 'config passed', 'connect failed', 'schemas skipped']);
+    expect(wrong.checks[2].error).toMatch(/AUTHENTICATION_FAILED|REQUIRED_PASSWORD|Authentication failed/);
+    expect(wrong.checks[2].error).not.toContain(PASSWORD_MARK);
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });

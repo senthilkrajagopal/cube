@@ -213,11 +213,11 @@ describe('read-only drivers: DuckDB, ClickHouse, Trino and Athena', () => {
         clickhouseSettings: { join_use_nulls: 1 },
       });
       expect(JSON.stringify(driver.config)).not.toMatch(/poison/);
-      const query = jest.spyOn(driver, 'query').mockResolvedValue([]);
+      const command = jest.spyOn(driver.client, 'command').mockResolvedValue({ query_id: 'q' } as any);
       await expect(driver.getSchemas()).resolves.toEqual([{ schema_name: 'sales' }]);
-      expect(query).toHaveBeenCalledWith('SHOW TABLES FROM "sales"', []);
-      query.mockRejectedValueOnce(new Error('Database sales does not exist'));
-      await expect(driver.getSchemas()).rejects.toThrow(/does not exist/);
+      expect(command).toHaveBeenCalledWith({ query: 'SHOW TABLES FROM "sales"' });
+      command.mockRejectedValueOnce(Object.assign(new Error('Database sales does not exist. '), { code: '81', type: 'UNKNOWN_DATABASE' }));
+      await expect(driver.getSchemas()).rejects.toThrow(/^Code: 81\. DB::Exception: Database sales does not exist\. \(UNKNOWN_DATABASE\)$/);
       await driver.release();
     } finally {
       process.env = saved;

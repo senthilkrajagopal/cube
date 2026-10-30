@@ -42,11 +42,39 @@ function clickHouseDriverClass() {
       }
 
       /**
+       * The connection test's connect step: the login alone, on `system`,
+       * which any login may name. Cube's runs on the named database, where a
+       * database that isn't there would fail it, not the catalog read.
+       */
+      public override async testConnection() {
+        const { database } = this.config;
+        this.config.database = 'system';
+        let client: ReturnType<CubeClickHouseDriver['createClient']>;
+        try {
+          client = this.createClient(1);
+        } finally {
+          this.config.database = database;
+        }
+        try {
+          await client.command({ query: 'SELECT 1' });
+        } finally {
+          await client.close();
+        }
+      }
+
+      /**
        * The connection test's catalog read (AC-1031): the named database's
        * tables, so a database that isn't there, or can't be read, fails.
        */
       public override async getSchemas() {
-        await this.query(`SHOW TABLES FROM ${this.quoteIdentifier(this.config.database)}`, []);
+        try {
+          // On the client itself: Cube's query() keeps only the message, not ClickHouse's code and name for it.
+          await this.client.command({ query: `SHOW TABLES FROM ${this.quoteIdentifier(this.config.database)}` });
+        } catch (e: any) {
+          throw e?.code && e?.type
+            ? new Error(`Code: ${e.code}. DB::Exception: ${String(e.message).trim()} (${e.type})`)
+            : e;
+        }
         return super.getSchemas();
       }
     }
