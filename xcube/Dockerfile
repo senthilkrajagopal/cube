@@ -2,6 +2,8 @@
 # Cube's published image with the xcube package added. Cube itself is
 # unchanged: the package is laid beside Cube's own packages, so it uses the very
 # modules the image runs, and the image starts it instead of `cubejs server`.
+# DuckDB alone is swapped: @duckdb/node-api is the package's (its lock's, set
+# by its `overrides`), in place of the one Cube's image ships.
 #
 # Build from this directory:
 #
@@ -30,7 +32,7 @@ RUN npm run build
 # builder's: fetched on the builder, they are only files. The pods never
 # download one (`autoinstall_known_extensions` is off), and DuckDB checks each
 # one's signature as it loads it. The version is the DuckDB of the package's
-# @duckdb/node-api, Cube's own.
+# @duckdb/node-api, the image's (`duckdb-node`).
 FROM --platform=$BUILDPLATFORM node:24.21.0-trixie-slim AS duckdb-extensions
 
 ARG TARGETARCH
@@ -67,6 +69,50 @@ fs.mkdirSync(dir, { recursive: true });
 JS
 SH
 
+# The package's @duckdb/node-api and its bindings, for the platform the image
+# is built for, as the lock has them: fetched from its URLs and checked
+# against its integrity, as `npm ci` would.
+FROM --platform=$BUILDPLATFORM node:24.21.0-trixie-slim AS duckdb-node
+
+ARG TARGETARCH
+COPY package-lock.json /package/
+RUN <<'SH'
+set -eu
+case "$TARGETARCH" in
+  amd64|arm64) ;;
+  *) echo "No DuckDB bindings for $TARGETARCH" >&2; exit 1 ;;
+esac
+node - <<'JS'
+const crypto = require('crypto');
+const fs = require('fs');
+const { execFileSync } = require('child_process');
+const lock = require('/package/package-lock.json');
+const arch = process.env.TARGETARCH === 'amd64' ? 'x64' : 'arm64';
+(async () => {
+  for (const name of ['node-api', 'node-bindings', `node-bindings-linux-${arch}`]) {
+    const { version, resolved, integrity } = lock.packages[`node_modules/@duckdb/${name}`];
+    const res = await fetch(resolved);
+    if (!res.ok) {
+      throw new Error(`${resolved}: ${res.status}`);
+    }
+    const tgz = Buffer.from(await res.arrayBuffer());
+    const [algorithm, digest] = integrity.split(/-(.*)/s);
+    if (crypto.createHash(algorithm).update(tgz).digest('base64') !== digest) {
+      throw new Error(`${resolved}: not the lock's ${integrity}`);
+    }
+    const dir = `/duckdb-node/@duckdb/${name}`;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync('/tmp/package.tgz', tgz);
+    execFileSync('tar', ['-xzf', '/tmp/package.tgz', '--strip-components=1', '--no-same-owner', '-C', dir]);
+    console.log(`${dir} ${version}`);
+  }
+})().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
+JS
+SH
+
 FROM cubejs/cube:${CUBE_VERSION}
 
 # The fork's commit the package was built from, the image's version (its tag's, `v<cube>-<commit>`)
@@ -86,6 +132,8 @@ LABEL org.opencontainers.image.title="xcube" \
 
 COPY --from=build /package/dist/src /cube/node_modules/xcube/dist/src
 COPY package.json NOTICE README.md /cube/node_modules/xcube/
+RUN rm -rf /cube/node_modules/@duckdb
+COPY --from=duckdb-node /duckdb-node/@duckdb /cube/node_modules/@duckdb
 COPY --from=duckdb-extensions /duckdb-extensions /cube/duckdb-extensions
 ENV XCUBE_DUCKDB_EXTENSION_DIRECTORY=/cube/duckdb-extensions
 

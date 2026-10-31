@@ -15,7 +15,8 @@
  *    manager's settings once a secret is made);
  * 3. `limits`: memory, threads, and a temp directory of its own (wiped when
  *    it closes) capped in size;
- * 4. `source`: httpfs and an S3 secret scoped to the location, or MotherDuck;
+ * 4. `source`: httpfs, an S3 secret scoped to the location and no external
+ *    file cache, or MotherDuck;
  * 5. `extensions`: no extension installed or loaded from here on;
  * 6. `allowed_directories`: the S3 location alone (and the temp directory,
  *    which DuckDB adds itself);
@@ -477,6 +478,9 @@ function duckdbDriverClass() {
               `URL_STYLE ${literal(s3.urlStyle)}`, `USE_SSL ${s3.useSsl}`, `SCOPE ${literal(location)}`,
             ];
             await run(`CREATE TEMPORARY SECRET xcube_s3 (${fields.join(', ')})`);
+            // An object overwritten as it is read can leave an entry of the new ETag but the old
+            // length, and every later read fails until the instance closes (duckdb-httpfs#338).
+            await run('SET enable_external_file_cache = false');
             allowed.push(location);
           }
 
@@ -511,6 +515,7 @@ function duckdbDriverClass() {
             ...(own.extensionDirectory ? { extension_directory: { is: own.extensionDirectory } } : {}),
             allow_persistent_secrets: { is: 'false' },
             allow_unredacted_secrets: { is: 'false' },
+            ...(source.s3 ? { enable_external_file_cache: { is: 'false' } } : {}),
             allowed_directories: { within: [...allowed, asPrefix(this.tempDir)] },
             enable_external_access: { is: 'false' },
             lock_configuration: { is: 'true' },

@@ -4,6 +4,7 @@
 //   could be downloaded;
 // - an S3 connection on s3://lake/sales/ doesn't read its own files, or reads
 //   anything else: another prefix or bucket, a local file, a URL;
+// - an object overwritten with another size isn't read as it now is;
 // - a run's refusal of a file outside the source isn't `outside_source`.
 
 const fs = require('fs');
@@ -110,15 +111,29 @@ const firstLine = (r) => (r.error ? r.error.split('\n')[0] : JSON.stringify(r.va
   }
   const settings = await attempt(() => driver.query(
     'SELECT current_setting(\'enable_external_access\') AS e, current_setting(\'autoinstall_known_extensions\') AS i, '
-    + 'current_setting(\'extension_directory\') AS d, current_setting(\'lock_configuration\') AS l',
+    + 'current_setting(\'extension_directory\') AS d, current_setting(\'lock_configuration\') AS l, '
+    + 'current_setting(\'enable_external_file_cache\') AS f',
     [],
   ));
   const [s] = settings.value ?? [{}];
   check(
-    'external access off, no autoinstall, the image\'s extensions, locked',
-    String(s.e) === 'false' && String(s.i) === 'false' && s.d === dir && String(s.l) === 'true',
+    'external access off, no autoinstall, the image\'s extensions, no external file cache, locked',
+    String(s.e) === 'false' && String(s.i) === 'false' && s.d === dir && String(s.f) === 'false' && String(s.l) === 'true',
     firstLine(settings),
   );
+
+  // duckdb-httpfs#338: an object overwritten with another size is read as it now is.
+  {
+    const db = await DuckDBInstance.create(':memory:', offline(dir));
+    const c = await db.connect();
+    await c.run('LOAD httpfs');
+    await c.run(`CREATE SECRET s (TYPE s3, KEY_ID '${KEY}', SECRET '${KEY}', REGION 'us-east-1', ENDPOINT '${ENDPOINT}', URL_STYLE 'path', USE_SSL false)`);
+    await c.run('COPY (SELECT range AS n FROM range(13)) TO \'s3://lake/sales/a.parquet\'');
+    c.closeSync();
+    db.closeSync();
+  }
+  const reread = await count('SELECT count(*) AS n FROM read_parquet(\'s3://lake/sales/a.parquet\')');
+  check('an overwritten object read as it now is', reread.value === 13, firstLine(reread));
   await driver.release();
 
   // A run's refusal of a file outside the source.

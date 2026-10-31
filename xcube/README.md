@@ -549,6 +549,10 @@ DuckDB, ClickHouse, Trino and Athena connections are read-only:
     (`XCUBE_DUCKDB_EXTENSION_DIRECTORY`).
   - Persistent and unredacted secrets are off from its opening (DuckDB
     refuses to change them once a secret is made).
+  - An S3 instance keeps no external file cache
+    (`enable_external_file_cache` off), so each query reads its objects as
+    they are: a cached entry left by an overwrite during a read can fail every
+    later read ([duckdb-httpfs#338](https://github.com/duckdb/duckdb-httpfs/issues/338)).
   - `allowed_directories` is the S3 prefix, or nothing; then
     `enable_external_access` is off and the configuration locked.
   - `readback` reads every setting back, and a value not as set fails it.
