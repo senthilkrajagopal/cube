@@ -1,5 +1,5 @@
 use super::SqlNode;
-use crate::physical_plan::sql_nodes::render_references::RenderReferences;
+use crate::physical_plan::sql_nodes::PreAggregationColumns;
 use crate::physical_plan::SqlEvaluatorVisitor;
 use crate::planner::query_tools::QueryTools;
 use crate::planner::sql_templates::PlanSqlTemplates;
@@ -15,12 +15,12 @@ use std::rc::Rc;
 /// `substituted` names the members rendered as a stored column. For a `sql`
 /// granularity that column already holds the value, and is its only form.
 pub struct TimeDimensionNode {
-    substituted: RenderReferences,
+    substituted: PreAggregationColumns,
     input: Rc<dyn SqlNode>,
 }
 
 impl TimeDimensionNode {
-    pub fn new(substituted: RenderReferences, input: Rc<dyn SqlNode>) -> Rc<Self> {
+    pub fn new(substituted: PreAggregationColumns, input: Rc<dyn SqlNode>) -> Rc<Self> {
         Rc::new(Self { substituted, input })
     }
 }
@@ -41,7 +41,12 @@ impl SqlNode for TimeDimensionNode {
                     // Propagate the outer visitor: the calendar SQL is the
                     // expression itself, not wrapped further here.
                     if let Some(calendar_sql) = granularity_obj.calendar_sql() {
-                        if self.substituted.contains_key(&ev.base_symbol().full_name()) {
+                        // Stored columns are keyed by the member a view member
+                        // references, not by the view member.
+                        if self
+                            .substituted
+                            .contains_key(&ev.base_symbol().peel_refs().full_name())
+                        {
                             return self.input.to_sql(
                                 visitor,
                                 node,
@@ -68,7 +73,17 @@ impl SqlNode for TimeDimensionNode {
                         templates,
                     )?;
                     let converted_tz = if ev.tz_converted_at_source() {
-                        input_sql
+                        // A mask stands in for the stored column untyped, and
+                        // the granularity function can't resolve an untyped
+                        // argument.
+                        let base = ev.base_symbol();
+                        if query_tools.is_member_masked(&base.full_name())
+                            || query_tools.is_member_masked(&base.peel_refs().full_name())
+                        {
+                            templates.time_stamp_cast(input_sql)?
+                        } else {
+                            input_sql
+                        }
                     } else {
                         templates.convert_tz(input_sql)?
                     };
@@ -114,13 +129,15 @@ impl SqlNode for TimeDimensionNode {
                     )
                 }
             }
-            _ => self.input.to_sql(
-                visitor,
-                node,
-                query_tools.clone(),
-                node_processor.clone(),
-                templates,
-            ),
+            MemberSymbol::Measure(_) | MemberSymbol::MemberExpression(_) | MemberSymbol::Ref(_) => {
+                self.input.to_sql(
+                    visitor,
+                    node,
+                    query_tools.clone(),
+                    node_processor.clone(),
+                    templates,
+                )
+            }
         }
     }
 

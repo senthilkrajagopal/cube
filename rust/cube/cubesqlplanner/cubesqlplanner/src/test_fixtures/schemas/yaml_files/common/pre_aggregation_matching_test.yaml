@@ -62,9 +62,23 @@ cubes:
       - name: multi_level_measure
         type: number
         sql: "{amount_per_count} / {max_amount}"
+      - name: total_amount_alias
+        type: number
+        sql: "{total_amount}"
     pre_aggregations:
       - name: main_rollup
         type: rollup
+        measures:
+          - count
+          - total_amount
+          - avg_amount
+        dimensions:
+          - status
+          - city
+
+      - name: main_internal_rollup
+        type: rollup
+        external: false
         measures:
           - count
           - total_amount
@@ -124,6 +138,14 @@ cubes:
           - status
           - city
 
+      # Stores the alias only, not the measure it references.
+      - name: alias_only_rollup
+        type: rollup
+        measures:
+          - total_amount_alias
+        dimensions:
+          - status
+          - city
       - name: calculated_measure_rollup
         type: rollup
         measures:

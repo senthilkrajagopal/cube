@@ -19,13 +19,15 @@ import {
   TableStructure,
   DriverInterface, QueryKey,
   QueuePriority,
+  addTraceComment,
 } from '@cubejs-backend/base-driver';
 
 import { QueryQueue, QueryQueueOptions } from './QueryQueue';
 import { ContinueWaitError } from './ContinueWaitError';
 import { LocalCacheDriver } from './LocalCacheDriver';
 import { DriverFactory, DriverFactoryByDataSource } from './DriverFactory';
-import { LoadPreAggregationResult, PreAggregationDescription } from './PreAggregations';
+import { LambdaQuery, LoadPreAggregationResult, PreAggregationDescription } from './PreAggregations';
+import type { PreAggregationLoadCache } from './PreAggregationLoadCache';
 import {
   getCacheHash,
   evaluateLocalRefreshKey,
@@ -33,7 +35,11 @@ import {
 } from './utils';
 import { CacheAndQueryDriverType, MetadataOperationType } from './QueryOrchestrator';
 
+export const REFRESH_KEY_CACHE_TTL_SECONDS = 60 * 60;
+
 export type CacheQueryResultOptions = {
+  /** Produces the result instead of executing the query. */
+  fetchResult?: () => Promise<unknown>,
   renewalThreshold?: number,
   renewalKey?: any,
   priority?: number,
@@ -93,10 +99,10 @@ export type LoadRefreshKeyOptions = {
 
 export type Query = {
   requestId?: string;
-  dataSource: string;
+  dataSource?: string;
   preAggregations?: PreAggregationDescription[];
   groupedPartitionPreAggregations?: PreAggregationDescription[][];
-  preAggregationsLoadCacheByDataSource?: any;
+  preAggregationsLoadCacheByDataSource?: Record<string, PreAggregationLoadCache>;
   cacheMode?: CacheMode;
   compilerCacheFn?: <T>(subKey: string[], cacheFn: () => T) => T;
 };
@@ -114,14 +120,26 @@ export type QueryBody = {
   isJob?: boolean;
   forceNoCache?: boolean;
   preAggregations?: PreAggregationDescription[];
-  groupedPartitionPreAggregations?: PreAggregationDescription[][];
+  /** `null` streams rows with the SQL aliases as keys. */
   aliasNameToMember?: {
     [alias: string]: string;
+  } | null;
+  preAggregationsLoadCacheByDataSource?: Record<string, PreAggregationLoadCache>;
+  queuePriority?: number;
+  cacheKeyQueries?: QueryWithParams[] | {
+    queries?: QueryWithParams[];
+    renewalThreshold?: number;
   };
-  preAggregationsLoadCacheByDataSource?: {
-    [key: string]: any;
-  };
-  [key: string]: any;
+  expireSecs?: number;
+  invalidate?: RefreshKeyIdentity | false;
+  useCsvQuery?: boolean;
+  lambdaTypes?: TableStructure;
+  lambdaQueries?: Record<string, LambdaQuery>;
+  forceBuildPreAggregations?: boolean;
+  orphanedTimeout?: number;
+  metadata?: unknown;
+  timezone?: string;
+  context?: unknown;
 };
 
 /**
@@ -140,7 +158,10 @@ export type PreAggTableToTempTable = [
 
 export type PreAggTableToTempTableNames = [string, { targetTableName: string; }];
 
-export type CacheKeyItem = string | string[] | boolean | QueryWithParams | QueryWithParams[] | undefined;
+export type RefreshKeyIdentity = [sql: string, params: string[], external: boolean, dataSource: string];
+
+export type CacheKeyItem =
+  string | string[] | boolean | QueryWithParams | QueryWithParams[] | RefreshKeyIdentity | undefined;
 
 export type CacheKey =
   [CacheKeyItem, CacheKeyItem] |
@@ -152,6 +173,10 @@ export type CacheEntry = {
   result: any;
   renewalKey?: string;
   requestId?: string;
+  // The cache key leaves out what picks the physical pre-aggregation tables (indexes, the matched
+  // time-dimension range), so `requestId` alone can't tell a continue-wait retry of this query
+  // from a different query in the same request flow. Absent on entries written before it existed.
+  queryHash?: string;
 };
 
 export enum CacheAction {
@@ -168,22 +193,23 @@ type CacheOperationContext = {
   expiration: number;
   spanId: string;
   options: CacheQueryResultOptions;
-  log: (message: string, extra?: Record<string, any>) => void;
+  log: (message: string, extra?: Record<string, unknown>) => void;
+};
+
+export type DataSourceQueueOptions = Pick<
+  QueryQueueOptions,
+  'continueWaitTimeout' | 'executionTimeout' | 'orphanedTimeout' | 'heartBeatInterval' | 'processUid' | 'sendProcessMessageFn' | 'sendCancelMessageFn'
+> & {
+  concurrency: number;
 };
 
 export interface QueryCacheOptions {
   refreshKeyRenewalThreshold?: number;
   localRefreshKey?: boolean;
-  externalQueueOptions?: any;
+  externalQueueOptions?: Partial<DataSourceQueueOptions>;
   externalDriverFactory?: DriverFactory;
   backgroundRenew?: Boolean;
-  queueOptions?: (dataSource: string) => Promise<{
-    concurrency: number;
-    continueWaitTimeout?: number;
-    executionTimeout?: number;
-    orphanedTimeout?: number;
-    heartBeatInterval?: number;
-  }>;
+  queueOptions?: (dataSource: string) => DataSourceQueueOptions | Promise<DataSourceQueueOptions>;
   cubeStoreDriverFactory?: () => Promise<CubeStoreDriver>,
   continueWaitTimeout?: number;
   cacheAndQueueDriver: CacheAndQueryDriverType;
@@ -203,6 +229,8 @@ export class QueryCache {
   protected static readonly IN_MEMORY_CACHE_DISABLE_PERIOD = 5 * 60 * 1000;
 
   protected readonly localRefreshKeyEnabled: boolean;
+
+  protected readonly sqlIncludeTraceId: boolean;
 
   public constructor(
     protected readonly cachePrefix: string,
@@ -231,32 +259,20 @@ export class QueryCache {
       max: options.maxInMemoryCacheEntries || 10000
     });
     this.localRefreshKeyEnabled = options.localRefreshKey ?? false;
+    this.sqlIncludeTraceId = getEnv('sqlIncludeTraceId');
   }
 
-  /**
-   * Whether interval based refresh keys are answered from this instance clock instead of being
-   * run as queries and cached.
-   */
-  public isLocalRefreshKeyActive(): boolean {
+  /** Whether eligible local refresh keys have no shared cache entry to warm. */
+  public usesUncachedLocalRefreshKey(): boolean {
     return this.localRefreshKeyEnabled && !this.options.refreshKeyRenewalThreshold;
   }
 
-  public localRefreshKeyResult(queryOptions?: QueryOptions): [{ refresh_key: string }] | null {
-    if (!this.localRefreshKeyEnabled || !isValidLocalRefreshKey(queryOptions?.localRefreshKey)) {
+  private localRefreshKeyFor(queryOptions?: QueryOptions): LocalRefreshKeyDescriptor | null {
+    if (!this.localRefreshKeyEnabled || queryOptions?.incremental || !isValidLocalRefreshKey(queryOptions?.localRefreshKey)) {
       return null;
     }
 
-    // `refreshKeyRenewalThreshold` throttles how often the SQL result is re-read, and that is
-    // also what bounds how often the key advances: a value cached for a day advances daily,
-    // whatever `every` says. A locally evaluated key has no cache entry to age out, so the only
-    // way to keep honouring the override is to leave these keys on the SQL path.
-    // TODO: support the two together by snapping the local value to the threshold instead of
-    // falling back to a query.
-    if (!this.isLocalRefreshKeyActive()) {
-      return null;
-    }
-
-    return evaluateLocalRefreshKey(<LocalRefreshKeyDescriptor>queryOptions?.localRefreshKey);
+    return queryOptions.localRefreshKey;
   }
 
   public getCacheDriver(): CacheDriverInterface {
@@ -307,7 +323,9 @@ export class QueryCache {
         preAggregationsTablesToTempTables,
       ));
 
-    const renewalThreshold = queryBody.cacheKeyQueries?.renewalThreshold;
+    const renewalThreshold = Array.isArray(queryBody.cacheKeyQueries)
+      ? undefined
+      : queryBody.cacheKeyQueries?.renewalThreshold;
 
     const expireSecs = this.getExpireSecs(queryBody);
 
@@ -333,6 +351,7 @@ export class QueryCache {
             useCsvQuery: queryBody.useCsvQuery,
             lambdaTypes: queryBody.lambdaTypes,
             aliasNameToMember: queryBody.aliasNameToMember,
+            primaryQuery: true,
           }
         );
       } else {
@@ -348,6 +367,7 @@ export class QueryCache {
               dataSource: queryBody.dataSource,
               persistent: queryBody.persistent,
               inlineTables,
+              primaryQuery: true,
             }
           ),
         };
@@ -430,6 +450,7 @@ export class QueryCache {
         requestId: queryBody.requestId,
         dataSource: queryBody.dataSource,
         persistent: queryBody.persistent,
+        primaryQuery: true,
       }
     );
 
@@ -461,9 +482,12 @@ export class QueryCache {
   }
 
   private cacheKeyQueriesFrom(queryBody: QueryBody): QueryWithParams[] {
-    return queryBody.cacheKeyQueries?.queries ||
-      queryBody.cacheKeyQueries ||
-      [];
+    const { cacheKeyQueries } = queryBody;
+    if (Array.isArray(cacheKeyQueries)) {
+      return cacheKeyQueries;
+    }
+
+    return cacheKeyQueries?.queries || [];
   }
 
   public static queryCacheKey(queryBody: QueryBody): CacheKey {
@@ -490,7 +514,7 @@ export class QueryCache {
   public static refreshKeyIdentity(
     sqlQuery: QueryWithParams,
     dataSource: string,
-  ): [string, string[], boolean, string] {
+  ): RefreshKeyIdentity {
     const [query, values, options] = sqlQuery;
     // Both spellings of each default have to collapse to one key: producers write "source database"
     // as `false` or as an absent option, and `getQueue` resolves an absent `dataSource` to `default`.
@@ -505,7 +529,7 @@ export class QueryCache {
    */
   public static buildRangeInvalidateKey(
     preAggregation: { invalidateKeyQueries?: QueryWithParams[], dataSource?: string },
-  ): [string, string[], boolean, string] | false {
+  ): RefreshKeyIdentity | false {
     const keyQuery = preAggregation.invalidateKeyQueries?.[0];
     return keyQuery ? QueryCache.refreshKeyIdentity(keyQuery, preAggregation.dataSource) : false;
   }
@@ -516,16 +540,18 @@ export class QueryCache {
     options: RefreshKeyCacheOptions,
   ) {
     const [query, values, queryOptions] = sqlQuery;
+    const localRefreshKey = this.localRefreshKeyFor(queryOptions);
 
-    const local = this.localRefreshKeyResult(queryOptions);
-    if (local) {
-      return local;
+    if (localRefreshKey && this.usesUncachedLocalRefreshKey()) {
+      return evaluateLocalRefreshKey(localRefreshKey);
     }
 
     const cacheKey = QueryCache.refreshKeyIdentity(sqlQuery, options.dataSource);
 
+    // An explicit threshold keeps the shared entry and the SQL path's TTL and renewal rules.
     return this.cacheQueryResult(query, values, cacheKey, expiration, {
       ...options,
+      fetchResult: localRefreshKey ? async () => evaluateLocalRefreshKey(localRefreshKey) : undefined,
       renewalThreshold: this.options.refreshKeyRenewalThreshold
         || queryOptions?.renewalThreshold || 2 * 60,
       renewalKey: cacheKey,
@@ -538,8 +564,49 @@ export class QueryCache {
     return this.queryCacheKey(QueryCache.refreshKeyIdentity(sqlQuery, dataSource));
   }
 
+  public hasMemoryCacheEntry(redisKey: string): boolean {
+    return this.memoryCache.has(redisKey);
+  }
+
+  protected static queryHash(query: string | QueryWithParams, values: string[]): string {
+    return getCacheHash([query, values]);
+  }
+
   public static extractRequestUUID(requestId: string): string {
     return extractRequestUUID(requestId);
+  }
+
+  /**
+   * Applied at execution time, after the cache key has been computed from the
+   * untagged SQL — tagging earlier would give every request a unique key and
+   * defeat both result caching and in-flight query coalescing.
+   */
+  protected traceQuery(req: {
+    query: any,
+    requestId?: string,
+    renewCycle?: boolean,
+    primaryQuery?: boolean,
+  }): any {
+    if (
+      !this.sqlIncludeTraceId ||
+      !req.requestId ||
+      // Refresh keys, pre-aggregation helpers and background renewals ride the
+      // same path but answer to no API request.
+      !req.primaryQuery ||
+      // Independent guards, deliberately: `renewCycle` catches a refresh of a
+      // user's query, the prefix catches one the scheduler started itself.
+      req.renewCycle ||
+      req.requestId.startsWith('scheduler-')
+    ) {
+      return req.query;
+    }
+
+    if (Array.isArray(req.query)) {
+      const [sql, ...rest] = req.query;
+      return [addTraceComment(sql, req.requestId), ...rest];
+    }
+
+    return addTraceComment(req.query, req.requestId);
   }
 
   public static replacePreAggregationTableNamesInSql(
@@ -604,6 +671,8 @@ export class QueryCache {
       lambdaTypes,
       persistent,
       aliasNameToMember,
+      renewCycle,
+      primaryQuery,
     }: {
       cacheKey: CacheKey,
       dataSource: string,
@@ -615,7 +684,9 @@ export class QueryCache {
       useCsvQuery?: boolean,
       lambdaTypes?: TableStructure,
       persistent?: boolean,
-      aliasNameToMember?: { [alias: string]: string },
+      aliasNameToMember?: { [alias: string]: string } | null,
+      renewCycle?: boolean,
+      primaryQuery?: boolean,
     }
   ) {
     const queue = external
@@ -630,6 +701,8 @@ export class QueryCache {
       inlineTables,
       useCsvQuery,
       lambdaTypes,
+      renewCycle,
+      primaryQuery,
     };
 
     const opt = {
@@ -652,7 +725,7 @@ export class QueryCache {
    * A queue payload as it may be logged: an inline table's rows are data source
    * content and have no place in a log line, so only its name and columns stay.
    */
-  private static payloadForLog(req: { inlineTables?: InlineTables, [key: string]: any }): Record<string, any> {
+  private static payloadForLog(req: { inlineTables?: InlineTables, [key: string]: unknown }): Record<string, unknown> {
     if (!req.inlineTables) {
       return { ...req };
     }
@@ -674,7 +747,7 @@ export class QueryCache {
             if (req.useCsvQuery) {
               return this.csvQuery(client, req);
             } else {
-              return client.query(req.query, req.values, req);
+              return client.query(this.traceQuery(req), req.values, req);
             }
           },
           {
@@ -684,25 +757,26 @@ export class QueryCache {
             // Centralized continueWaitTimeout that can be overridden in queueOptions
             continueWaitTimeout: this.options.continueWaitTimeout,
             ...queueOptions,
-          }
+          },
+          (req) => this.traceQuery(req),
         );
       }
     }
     return this.queue[dataSource];
   }
 
-  protected async csvQuery(client, q) {
-    const headers = q.lambdaTypes.map(c => c.name);
+  protected async csvQuery(client: DriverInterface, q: any) {
+    const headers = q.lambdaTypes.map((c: TableStructure[number]) => c.name);
     const writer = csvWriter({
       headers,
       sendHeaders: false,
     });
-    let tableData;
+    let tableData: any;
 
     try {
       if (client.stream) {
-        tableData = await client.stream(q.query, q.values, q);
-        const errors = [];
+        tableData = await client.stream(this.traceQuery(q), q.values, q);
+        const errors: Error[] = [];
         await pipeline(tableData.rowStream, writer, (err) => {
           if (err) {
             errors.push(err);
@@ -712,9 +786,9 @@ export class QueryCache {
           throw new Error(`Lambda query errors ${errors.join(', ')}`);
         }
       } else {
-        tableData = await client.downloadQueryResults(q.query, q.values, q);
+        tableData = await client.downloadQueryResults(this.traceQuery(q), q.values, q);
         tableData.rows.forEach(
-          row => writer.write(row)
+          (row: Record<string, unknown>) => writer.write(row)
         );
         writer.end();
       }
@@ -759,8 +833,9 @@ export class QueryCache {
   public static createQueue(
     redisPrefix: string,
     clientFactory: DriverFactory,
-    executeFn: (client: BaseDriver, req: any) => any,
-    options: Omit<QueryQueueOptions, 'queryHandlers' | 'cancelHandlers'>
+    executeFn: (client: BaseDriver, req: any) => MaybeCancelablePromise<unknown>,
+    options: Omit<QueryQueueOptions, 'queryHandlers' | 'cancelHandlers'>,
+    traceFn: (req: any) => any = (req) => req.query,
   ): QueryQueue {
     const queue: any = new QueryQueue(redisPrefix, {
       queryHandlers: {
@@ -795,18 +870,21 @@ export class QueryCache {
           const client = await clientFactory();
 
           const resultPromise = executeFn(client, req);
-          let handle;
-          if (resultPromise.cancel) {
-            queue.cancelHandlerCounter += 1;
-            handle = queue.cancelHandlerCounter;
-            queue.handles[handle] = resultPromise;
-            await setCancelHandle(handle);
+          if (!resultPromise.cancel) {
+            return resultPromise;
           }
-          const result = await resultPromise;
-          if (handle) {
+
+          // The handle is stored in the queue item, which every node sharing the queue can read
+          // when it cancels the item, so it must not match another node's local handle.
+          const handle = crypto.randomUUID();
+          queue.handles[handle] = resultPromise;
+
+          try {
+            await setCancelHandle(handle);
+            return await resultPromise;
+          } finally {
             delete queue.handles[handle];
           }
-          return result;
         },
       },
       streamHandler: async (req, target) => {
@@ -815,9 +893,9 @@ export class QueryCache {
           let logged = false;
           Promise
             .all([clientFactory()])
-            .then(([client]) => (<DriverInterface>client).stream(req.query, req.values, { highWaterMark: getEnv('dbQueryStreamHighWaterMark'), requestId: req.requestId }))
+            .then(([client]) => (<DriverInterface>client).stream(traceFn(req), req.values, { highWaterMark: getEnv('dbQueryStreamHighWaterMark'), requestId: req.requestId }))
             .then((source) => {
-              const cleanup = async (error) => {
+              const cleanup = async (error?: Error) => {
                 if (source.release) {
                   const toRelease = source.release;
                   delete source.release;
@@ -884,7 +962,6 @@ export class QueryCache {
       logger: (msg, params) => options.logger(msg, params),
       ...options
     });
-    queue.cancelHandlerCounter = 0;
     queue.handles = {};
     return queue;
   }
@@ -902,7 +979,7 @@ export class QueryCache {
     cacheKeyQueries: QueryWithParams[],
     expireSecs: number,
     cacheKey: CacheKey,
-    renewalThreshold: any,
+    renewalThreshold: number,
     options: {
       requestId?: string,
       skipRefreshKeyWaitForRenew?: boolean,
@@ -937,7 +1014,7 @@ export class QueryCache {
     cacheKeyQueries: QueryWithParams[],
     expireSecs: number,
     cacheKey: CacheKey,
-    renewalThreshold: any,
+    renewalThreshold: number,
     options: {
       requestId?: string,
       skipRefreshKeyWaitForRenew?: boolean,
@@ -955,7 +1032,7 @@ export class QueryCache {
     return Promise.all(
       this.loadRefreshKeys(cacheKeyQueries, expireSecs, options),
     )
-      .catch(e => {
+      .catch((e): any[] => {
         if (e instanceof ContinueWaitError) {
           throw e;
         }
@@ -995,7 +1072,7 @@ export class QueryCache {
       ));
   }
 
-  public async loadRefreshKeysFromQuery(query: Query) {
+  public async loadRefreshKeysFromQuery(query: QueryBody) {
     return Promise.all(
       this.loadRefreshKeys(
         this.cacheKeyQueriesFrom(query),
@@ -1030,7 +1107,7 @@ export class QueryCache {
     );
   }
 
-  public withLock = <T = any>(
+  public withLock = <T = unknown>(
     key: string,
     ttl: number,
     callback: () => MaybeCancelablePromise<T>,
@@ -1041,6 +1118,7 @@ export class QueryCache {
     renewedAgo: number,
     options: CacheQueryResultOptions,
     renewalKey?: string,
+    queryHash?: () => string,
   ): CacheAction {
     const { renewalThreshold } = options;
     const isExpired = !renewalThreshold || !entry.time || renewedAgo > renewalThreshold * 1000;
@@ -1050,8 +1128,10 @@ export class QueryCache {
       return CacheAction.ServeCached;
     }
 
+    // Lazy so reads skip hashing the full SQL unless the requestIds match; writes always hash it
     const isSameRequest = options.requestId && entry.requestId &&
-      QueryCache.extractRequestUUID(entry.requestId) === QueryCache.extractRequestUUID(options.requestId);
+      QueryCache.extractRequestUUID(entry.requestId) === QueryCache.extractRequestUUID(options.requestId) &&
+      (!entry.queryHash || !queryHash || entry.queryHash === queryHash());
 
     // A client polling through continue-wait re-enters with the same requestId, so rejecting
     // the result it just wrote would restart the fetch on every poll and never converge while
@@ -1127,22 +1207,29 @@ export class QueryCache {
   ) {
     const { cacheKey, redisKey, renewalKey, expiration, spanId, options } = ctx;
 
-    return this.queryWithRetryAndRelease(query, values, {
-      cacheKey,
-      priority: options.priority,
-      external: options.external,
-      requestId: options.requestId,
-      spanId,
-      persistent: options.persistent,
-      dataSource: options.dataSource,
-      useCsvQuery: options.useCsvQuery,
-      lambdaTypes: options.lambdaTypes,
-    }).then(res => {
-      const entry = {
+    const result = options.fetchResult
+      ? options.fetchResult()
+      : this.queryWithRetryAndRelease(query, values, {
+        cacheKey,
+        priority: options.priority,
+        external: options.external,
+        requestId: options.requestId,
+        spanId,
+        persistent: options.persistent,
+        dataSource: options.dataSource,
+        useCsvQuery: options.useCsvQuery,
+        lambdaTypes: options.lambdaTypes,
+        renewCycle: options.renewCycle,
+        primaryQuery: options.primaryQuery,
+      });
+
+    return result.then(res => {
+      const entry: CacheEntry = {
         time: (new Date()).getTime(),
         result: res,
         renewalKey,
         requestId: options.requestId,
+        queryHash: QueryCache.queryHash(query, values),
       };
 
       return this
@@ -1259,7 +1346,8 @@ export class QueryCache {
       renewalThreshold,
     });
 
-    switch (QueryCache.decideCacheAction(entry, renewedAgo, options, ctx.renewalKey)) {
+    const queryHash = () => QueryCache.queryHash(query, values);
+    switch (QueryCache.decideCacheAction(entry, renewedAgo, options, ctx.renewalKey, queryHash)) {
       case CacheAction.WaitForRenew:
         ctx.log('Waiting for renew', { renewalThreshold });
         return this.fetchAndCacheQuery(query, values, ctx);
@@ -1281,14 +1369,14 @@ export class QueryCache {
     return entry.result;
   }
 
-  protected async lastRefreshTime(cacheKey) {
-    const cachedValue = await this.cacheDriver.get(this.queryCacheKey(cacheKey));
+  protected async lastRefreshTime(cacheKey: CacheKey) {
+    const cachedValue = await this.cacheDriver.get<CacheEntry>(this.queryCacheKey(cacheKey));
     return cachedValue && new Date(cachedValue.time);
   }
 
-  public async resultFromCacheIfExists(queryBody) {
+  public async resultFromCacheIfExists(queryBody: QueryBody) {
     const cacheKey = QueryCache.queryCacheKey(queryBody);
-    const cachedValue = await this.cacheDriver.get(this.queryCacheKey(cacheKey));
+    const cachedValue = await this.cacheDriver.get<CacheEntry>(this.queryCacheKey(cacheKey));
     if (cachedValue) {
       return {
         data: cachedValue.result,
@@ -1299,7 +1387,7 @@ export class QueryCache {
   }
 
   public queryCacheKey(cacheKey: CacheKey): string {
-    return this.getKey('SQL_QUERY_RESULT', getCacheHash(cacheKey) as any);
+    return this.getKey('SQL_QUERY_RESULT', getCacheHash(cacheKey));
   }
 
   public async cleanup() {

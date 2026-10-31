@@ -1,4 +1,4 @@
-import { SchemaFileRepository } from '@cubejs-backend/shared';
+import { getEnv, SchemaFileRepository } from '@cubejs-backend/shared';
 import { NativeInstance } from '@cubejs-backend/native';
 import { v4 as uuidv4 } from 'uuid';
 import { LRUCache } from 'lru-cache';
@@ -11,6 +11,7 @@ import {
   CubePropContextTranspiler,
   IIFETranspiler,
   ImportExportTranspiler,
+  MemoKeyTranspiler,
   TranspilerInterface,
   ValidationTranspiler,
 } from './transpilers';
@@ -26,6 +27,7 @@ import { CompilerCache } from './CompilerCache';
 import { YamlCompiler } from './YamlCompiler';
 import { ViewCompilationGate } from './ViewCompilationGate';
 import type { ErrorReporter } from './ErrorReporter';
+import type { BaseQuery, BaseQueryOptions } from '../adapter/BaseQuery';
 
 export type PrepareCompilerOptions = {
   nativeInstance?: NativeInstance,
@@ -40,13 +42,20 @@ export type PrepareCompilerOptions = {
   compiledScriptCache?: LRUCache<string, vm.Script>;
   compiledYamlCache?: LRUCache<string, string>;
   compiledJinjaCache?: LRUCache<string, string>;
+  /**
+   * Shared VM realm and string interning together. Defaults to CUBEJS_COMPILER_MULTI_TENANT_SHARING.
+   */
+  multiTenantSharing?: boolean;
+  // Per-feature overrides of multiTenantSharing, for tests
+  sharedVmContext?: boolean;
+  internStrings?: boolean;
 };
 
 export interface CompilerInterface {
   compile: (cubes: any[], errorReporter: ErrorReporter) => void;
 }
 
-export type Compiler = {
+export type CompilersParts = {
   compiler: DataSchemaCompiler;
   metaTransformer: CubeToMetaTransformer;
   cubeEvaluator: CubeEvaluator;
@@ -58,18 +67,69 @@ export type Compiler = {
   compilerId: string;
 };
 
-export const prepareCompiler = (repo: SchemaFileRepository, options: PrepareCompilerOptions = {}): Compiler => {
+export type DialectClass<T extends BaseQuery = BaseQuery> = new (compilers: Compilers, options: BaseQueryOptions) => T;
+
+export class Compilers {
+  public readonly compiler: DataSchemaCompiler;
+
+  public readonly metaTransformer: CubeToMetaTransformer;
+
+  public readonly cubeEvaluator: CubeEvaluator;
+
+  public readonly contextEvaluator: ContextEvaluator;
+
+  public readonly viewGroupEvaluator: ViewGroupEvaluator;
+
+  public readonly joinGraph: JoinGraph;
+
+  public readonly compilerCache: CompilerCache;
+
+  public readonly headCommitId?: string;
+
+  public readonly compilerId: string;
+
+  public constructor(parts: CompilersParts) {
+    this.compiler = parts.compiler;
+    this.metaTransformer = parts.metaTransformer;
+    this.cubeEvaluator = parts.cubeEvaluator;
+    this.contextEvaluator = parts.contextEvaluator;
+    this.viewGroupEvaluator = parts.viewGroupEvaluator;
+    this.joinGraph = parts.joinGraph;
+    this.compilerCache = parts.compilerCache;
+    this.headCommitId = parts.headCommitId;
+    this.compilerId = parts.compilerId;
+  }
+
+  public async compile(): Promise<void> {
+    await this.compiler.compile();
+  }
+
+  public createQuery<C extends DialectClass>(QueryClass: C, options: BaseQueryOptions): InstanceType<C> {
+    return new QueryClass(this, options) as InstanceType<C>;
+  }
+}
+
+export const prepareCompiler = (repo: SchemaFileRepository, options: PrepareCompilerOptions = {}): Compilers => {
   const nativeInstance = options.nativeInstance || new NativeInstance();
+  const multiTenantSharing = options.multiTenantSharing ?? getEnv('compilerMultiTenantSharing');
+  const internStrings = options.internStrings ?? multiTenantSharing;
   const cubeDictionary = new CubeDictionary();
   const cubeSymbols = new CubeSymbols();
   const viewCompiler = new CubeSymbols(true);
   const viewCompilationGate = new ViewCompilationGate();
   const cubeValidator = new CubeValidator(cubeSymbols);
-  const cubeEvaluator = new CubeEvaluator(cubeValidator);
+  const cubeEvaluator = new CubeEvaluator(cubeValidator, { internStrings });
   const contextEvaluator = new ContextEvaluator(cubeEvaluator);
   const viewGroupEvaluator = new ViewGroupEvaluator(cubeEvaluator, cubeValidator);
   const joinGraph = new JoinGraph(cubeValidator, cubeEvaluator);
-  const metaTransformer = new CubeToMetaTransformer(cubeValidator, cubeEvaluator, contextEvaluator, viewGroupEvaluator, joinGraph);
+  const metaTransformer = new CubeToMetaTransformer(
+    cubeValidator,
+    cubeEvaluator,
+    contextEvaluator,
+    viewGroupEvaluator,
+    joinGraph,
+    { internStrings },
+  );
   const { maxQueryCacheSize, maxQueryCacheAge } = options;
   const compilerCache = new CompilerCache({ maxQueryCacheSize, maxQueryCacheAge });
   const yamlCompiler = new YamlCompiler(cubeSymbols, cubeDictionary, nativeInstance, viewCompiler);
@@ -82,6 +142,7 @@ export const prepareCompiler = (repo: SchemaFileRepository, options: PrepareComp
     new ValidationTranspiler(),
     new ImportExportTranspiler(),
     new CubePropContextTranspiler(cubeSymbols, cubeDictionary, viewCompiler),
+    new MemoKeyTranspiler(),
     new IIFETranspiler(),
   ];
 
@@ -119,10 +180,11 @@ export const prepareCompiler = (repo: SchemaFileRepository, options: PrepareComp
     nativeInstance,
     yamlCompiler,
     compilerId,
-    ...options
+    ...options,
+    sharedVmContext: options.sharedVmContext ?? multiTenantSharing,
   });
 
-  return {
+  return new Compilers({
     compiler,
     metaTransformer,
     cubeEvaluator,
@@ -132,11 +194,11 @@ export const prepareCompiler = (repo: SchemaFileRepository, options: PrepareComp
     compilerCache,
     headCommitId: options.headCommitId,
     compilerId,
-  };
+  });
 };
 
-export const compile = async (repo: SchemaFileRepository, options?: PrepareCompilerOptions): Promise<Compiler> => {
+export const compile = async (repo: SchemaFileRepository, options?: PrepareCompilerOptions): Promise<Compilers> => {
   const compilers = prepareCompiler(repo, options);
-  await compilers.compiler.compile();
+  await compilers.compile();
   return compilers;
 };

@@ -80,6 +80,14 @@ on:
           - 'true'
           - 'false'
 
+permissions:
+  contents: read
+
+# Cancelling a superseded PR run also drops its jobs queued in `redshift-global`.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   latest-tag-sha:
     runs-on: ubuntu-24.04
@@ -110,7 +118,7 @@ jobs:
     name: Build native Linux ${{ matrix.node-version }} ${{ matrix.target }} Python ${{ matrix.python-version }}
     strategy:
       matrix:
-        node-version: [ 24.21.0 ]
+        node-version: [ 24.22.1 ]
         python-version: [ "fallback" ]
         target: [ "x86_64-unknown-linux-gnu" ]
       fail-fast: false
@@ -200,17 +208,27 @@ jobs:
           file: ./packages/cubejs-docker/testing-drivers.Dockerfile
           tags: cubejs/cube:testing-drivers
           push: ${{ (env.DOCKERHUB_USERNAME != '') }}
+      - name: Verify JDBC runtime
+        timeout-minutes: 1
+        run: |
+          docker run --rm --network none --workdir /cubejs --entrypoint node cubejs/cube:testing-drivers -e '
+            const java = require("java");
+            console.log("Java version:", java.callStaticMethodSync("java.lang.System", "getProperty", "java.version"));
+            // JVM threads keep Node alive after the check.
+            process.exit(0);
+          '
       - name: Save Docker image as artifact
         run: |
-          IMAGE_TAG=cubejs/cube:testing-drivers
-          docker save -o image.tar $IMAGE_TAG
-          gzip image.tar
+          set -o pipefail
+          docker save cubejs/cube:testing-drivers | zstd -T0 -3 -o image.tar.zst
         continue-on-error: true
       - name: Upload Docker image artifact
         uses: actions/upload-artifact@v7
         with:
           name: docker-image
-          path: image.tar.gz
+          path: image.tar.zst
+          # Already zstd-compressed; re-zipping it only burns CPU.
+          compression-level: 0
 
   tests:
     runs-on: ubuntu-24.04
@@ -218,7 +236,7 @@ jobs:
       id-token: write   # Needed for OIDC+AWS
       contents: read
 
-    timeout-minutes: 30
+    timeout-minutes: 40
     needs: [latest-tag-sha, build]
     if: (needs['latest-tag-sha'].outputs.sha != github.sha)
     env:
@@ -252,10 +270,12 @@ jobs:
       DRIVERS_TESTS_ATHENA_CUBEJS_AWS_KEY: ${{ secrets.DRIVERS_TESTS_ATHENA_CUBEJS_AWS_KEY }}
 
     # redshift Test Serverless Instance is so tiny that it can't serve a few test suites at once,
-    # so we constrain it to 1 test suite at time.
+    # so we constrain it to 1 test suite at time. `queue: max` makes extra suites wait instead of
+    # replacing each other: by default a group keeps one pending job and cancels the rest.
     concurrency:
       group: ${{ contains(matrix.database, 'redshift') && 'redshift-global' || format('drivers-tests-{0}-{1}', matrix.database, github.run_id) }}
       cancel-in-progress: false
+      queue: max
 
     strategy:
       matrix:
@@ -299,8 +319,6 @@ jobs:
           - database: crate
             use_tesseract_sql_planner: false
           - database: snowflake
-            use_tesseract_sql_planner: false
-          - database: redshift
             use_tesseract_sql_planner: false
           - database: bigquery-export-bucket-gcs
             use_tesseract_sql_planner: false
@@ -353,9 +371,9 @@ jobs:
           CUBESTORE_SKIP_POST_INSTALL: true
         with:
           max_attempts: 3
-          retry_on: error
+          retry_on: any
           retry_wait_seconds: 15
-          timeout_minutes: 20
+          timeout_minutes: 10
           command: yarn install --frozen-lockfile
 
       - name: Build client
@@ -376,8 +394,8 @@ jobs:
 
       - name: Load Docker image into Docker Daemon
         run: |
-          gunzip image.tar.gz
-          docker load -i image.tar
+          set -o pipefail
+          zstd -dc image.tar.zst | docker load
 
       - name: Configure AWS credentials via IRSA
         uses: aws-actions/configure-aws-credentials@v6

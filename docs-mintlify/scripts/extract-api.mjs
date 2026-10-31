@@ -142,6 +142,15 @@ function commonPathPrefix(pathList) {
   return prefix;
 }
 
+// A shared parent can be too broad when a tag spans sibling collections.
+const SNOWFLAKE_RESOURCE_ROOT = '/api/v1/deployments/{deploymentId}/snowflake-semantic-view-';
+const RESOURCE_PATH_OVERRIDES = {
+  'Snowflake Semantic View Sync': {
+    display: `${SNOWFLAKE_RESOURCE_ROOT}{pulls,syncs}`,
+    prefixes: [`${SNOWFLAKE_RESOURCE_ROOT}pulls`, `${SNOWFLAKE_RESOURCE_ROOT}syncs`],
+  },
+};
+
 // The v1 REST API, on both path families it is served under: /api/v1/… on the
 // main console-server pods, and /build/api/v1/… routed to the build pods (which
 // own the data-model / dev-mode / upload surface). Same host, same Bearer token.
@@ -186,6 +195,15 @@ const EXCLUDE_OPERATIONS = new Set([
   'POST /api/v1/deployments/{deploymentId}/evaluations',
   'GET /api/v1/deployments/{deploymentId}/evaluations/{evaluationId}',
   'GET /api/v1/deployments/{deploymentId}/evaluations/{evaluationId}/results',
+  'GET /api/v1/deployments/{deploymentId}/evaluations',
+  // Access requests: every operation's own description says "This is currently
+  // in preview — reach out to the Cube support team", not GA. Remove once the
+  // feature ships.
+  'POST /api/v1/access-requests',
+  'GET /api/v1/access-requests',
+  'GET /api/v1/access-requests/mine',
+  'POST /api/v1/access-requests/{id}/approve',
+  'POST /api/v1/access-requests/{id}/decline',
 ]);
 
 // Cube-staff-only operations (provisioning real cloud infrastructure — Regions,
@@ -224,8 +242,9 @@ const TAG_ORDER = [
   'Deployments', 'Deployment Creation', 'Environments', 'Env Variables', 'Regions',
   'Data Model', 'Data Model Uploads', 'GitHub', 'GitHub Connection', 'dbt Sync',
   'Databricks Metric View Publication', 'Databricks Metric View Integration',
+  'Snowflake Semantic View Sync',
   'Folders', 'Reports', 'External Documents', 'Workbooks', 'Workbook Promotions', 'Dashboard Exports', 'Notifications', 'Scheduled Tasks', 'Workspace', 'Agents', 'Metadata',
-  'Users', 'Users Admin', 'Groups', 'User Groups', 'API Keys',
+  'Users', 'Users Admin', 'Groups', 'User Groups', 'API Keys', 'Roles',
   'User Attributes', 'User Attribute Values', 'Resource Policies', 'Tenant Settings',
   'OAuth Integrations', 'User OAuth Tokens', 'OIDC Token Configs',
   'App Theme', 'AI Engineer', 'Embed', 'Embed Tenants', 'Dashboard Embed Access',
@@ -295,10 +314,32 @@ function cleanTag(raw) {
 
 const src = yaml.load(fs.readFileSync(SRC, 'utf8'));
 
+// Data alerts are in preview ("reach out to the Cube support team to activate
+// them"), so the `alert` field, its schemas and the prose about it stay out of
+// the reference. Remove once the feature ships.
+{
+  const stripAlertProse = (text) =>
+    text
+      .replace(/\s*To make it a data alert, create it, add its recipients, then set `alert`\s+with an update\./, '')
+      .replace(/\s*An `alert` needs notifications switched on and at least one recipient,\s+otherwise `400` is returned\./, '')
+      .replace(/`notificationFormat`\s+and\s+`alert`\./, 'and `notificationFormat`.');
+  for (const ops of Object.values(src.paths)) {
+    for (const m of METHODS) {
+      if (typeof ops[m]?.description === 'string') ops[m].description = stripAlertProse(ops[m].description);
+    }
+  }
+  for (const name of Object.keys(src.components.schemas)) {
+    if (/^DataAlertRule/.test(name)) delete src.components.schemas[name];
+  }
+  delete src.components.schemas.NotificationDto?.properties?.alert;
+  delete src.components.schemas.UpdateNotificationInput?.properties?.alert;
+}
+
 // 1. Filter to v1 REST paths, normalize keys (keep the real absolute path; drop a
 //    trailing slash — a trailing slash breaks Mintlify dev), and clean tags +
 //    operationIds.
 const paths = {};
+const operationIds = new Map();
 const matchedExcludes = new Set();
 let autoExcludedCount = 0;
 for (const [key, val] of Object.entries(src.paths)) {
@@ -337,6 +378,15 @@ for (const [key, val] of Object.entries(src.paths)) {
     // strip "XxxController." prefix from operationId for clean page slugs
     if (typeof val[m].operationId === 'string') {
       val[m].operationId = val[m].operationId.replace(/^[^.]*\./, '');
+      const prior = operationIds.get(val[m].operationId);
+      if (prior) {
+        console.error(
+          `Aborting: operationId collision after normalization: ${val[m].operationId} ` +
+            `(${prior} and ${m.toUpperCase()} ${newKey}).`
+        );
+        process.exit(1);
+      }
+      operationIds.set(val[m].operationId, `${m.toUpperCase()} ${newKey}`);
     }
   }
   if (!kept) continue; // every operation on this path was excluded
@@ -405,6 +455,26 @@ if (leakedStaffOnly.length) {
   process.exit(1);
 }
 
+// Fail closed on the data-alert stripping above: abort if preview alert prose or
+// an `alert` property survives (upstream reworded it, or another schema gained it).
+{
+  const leakedAlert = [];
+  for (const [p, ops] of Object.entries(paths)) {
+    for (const m of METHODS) {
+      if (!ops[m]) continue;
+      const text = `${ops[m]['x-mint']?.content ?? ''} ${ops[m].description ?? ''}`;
+      if (/\bdata alerts?\b|`alert`/i.test(text)) leakedAlert.push(`${m.toUpperCase()} ${p}`);
+    }
+  }
+  if (leakedAlert.length) {
+    console.error(
+      'Aborting: preview data-alert content survived stripping (upstream reworded it?):\n  ' +
+        leakedAlert.join('\n  ')
+    );
+    process.exit(1);
+  }
+}
+
 // 2. Transitive $ref schema closure.
 function collectRefs(node, acc) {
   if (Array.isArray(node)) { node.forEach((n) => collectRefs(n, acc)); return; }
@@ -431,6 +501,24 @@ while (queue.length) {
   const sub = new Set();
   collectRefs(def, sub);
   for (const s of sub) if (!schemas[s]) queue.push(s);
+}
+// Fail closed on the data-alert stripping: no published schema may carry an
+// `alert` property at any depth (allOf/oneOf/inline objects included).
+function hasAlertProperty(node) {
+  if (Array.isArray(node)) return node.some(hasAlertProperty);
+  if (!node || typeof node !== 'object') return false;
+  if (node.properties && Object.prototype.hasOwnProperty.call(node.properties, 'alert')) return true;
+  return Object.values(node).some(hasAlertProperty);
+}
+{
+  const leaked = Object.keys(schemas).filter((name) => hasAlertProperty(schemas[name]));
+  if (leaked.length) {
+    console.error(
+      'Aborting: preview data-alert property survived stripping (upstream added it elsewhere?):\n  ' +
+        leaked.join('\n  ')
+    );
+    process.exit(1);
+  }
 }
 // Hard-fail rather than shipping api.yaml with dangling $refs (broken docs).
 if (missing.length) {
@@ -467,6 +555,32 @@ function hoistNullableMeta(node) {
   }
   for (const v of Object.values(node)) hoistNullableMeta(v);
 }
+// Per-user OIDC subjects (`subjectType`, the `{user_*}` sub placeholders) are
+// gated behind the `useUserOidcTokens` tenant flag, not generally available.
+// Strip them from the generated schemas. Remove once the feature ships.
+{
+  for (const [name, def] of Object.entries(schemas)) {
+    if (/SubjectType$/.test(name) && Array.isArray(def.enum) && def.enum.includes('user')) {
+      delete schemas[name];
+      continue;
+    }
+    delete def.properties?.subjectType;
+    if (Array.isArray(def.required)) def.required = def.required.filter((r) => r !== 'subjectType');
+    for (const alt of def.properties?.subFormat?.oneOf ?? []) {
+      if (typeof alt.pattern === 'string') {
+        alt.pattern = alt.pattern.replace('|user_email|username|user_id', '').replace('.@+', '');
+      }
+    }
+  }
+}
+
+// Fail closed: abort if the flagged OIDC fields survive (upstream pattern changed)
+// or a `$ref` to a deleted `*SubjectType` schema is left dangling.
+if (/subjectType|SubjectType|user_email|\{user_|\.@\+/.test(JSON.stringify({ paths, schemas }))) {
+  console.error('Aborting: per-user OIDC fields survived stripping (did the upstream spec change?)');
+  process.exit(1);
+}
+
 hoistNullableMeta(paths);
 hoistNullableMeta(schemas);
 
@@ -563,12 +677,6 @@ if (leakedLegacyLinks.length) {
   process.exit(1);
 }
 
-writeOrCheck(OUT, yaml.dump(out, { lineWidth: 100, noRefs: true }));
-console.log('paths:', Object.keys(paths).length, '| schemas:', Object.keys(schemas).length, '| tags:', orderedTags.length);
-if (autoExcludedCount) {
-  console.log(`(${autoExcludedCount} Cube-staff-only operation(s) auto-excluded via SUPER_ADMIN_ONLY_MARKER)`);
-}
-
 // 5. Group operations by tag (pages in source order within a tag) and capture,
 //    per tag, its paths + the first operation's summary — used to build both the
 //    docs.json nav and the intro-table rows.
@@ -583,6 +691,25 @@ for (const [p, val] of Object.entries(paths)) {
     if (!(pathsForTag[tag] || []).includes(p)) (pathsForTag[tag] = pathsForTag[tag] || []).push(p);
     (summariesForTag[tag] = summariesForTag[tag] || []).push(val[m].summary || '');
   }
+}
+
+for (const [tag, { prefixes }] of Object.entries(RESOURCE_PATH_OVERRIDES)) {
+  const tagPaths = pathsForTag[tag];
+  const covered = (prefix, path) => path === prefix || path.startsWith(`${prefix}/`);
+  if (
+    !tagPaths?.length ||
+    !tagPaths.every((path) => prefixes.some((prefix) => covered(prefix, path))) ||
+    !prefixes.every((prefix) => tagPaths.some((path) => covered(prefix, path)))
+  ) {
+    console.error(`Aborting: RESOURCE_PATH_OVERRIDES entry for ${tag} does not match its paths.`);
+    process.exit(1);
+  }
+}
+
+writeOrCheck(OUT, yaml.dump(out, { lineWidth: 100, noRefs: true }));
+console.log('paths:', Object.keys(paths).length, '| schemas:', Object.keys(schemas).length, '| tags:', orderedTags.length);
+if (autoExcludedCount) {
+  console.log(`(${autoExcludedCount} Cube-staff-only operation(s) auto-excluded via SUPER_ADMIN_ONLY_MARKER)`);
 }
 
 // The tag's representative page for the intro table: its first operation, unless
@@ -639,7 +766,7 @@ const rows = groups
   .map(
     (g) =>
       `| [${g.group}](/api-reference/${kebab(g.group)}/${kebab(linkSummaryForTag(g.group))}) ` +
-      `| \`${commonPathPrefix(pathsForTag[g.group])}\` | v1 |`
+      `| \`${RESOURCE_PATH_OVERRIDES[g.group]?.display ?? commonPathPrefix(pathsForTag[g.group])}\` | v1 |`
   )
   .join('\n');
 const table = [INTRO_TABLE_HEAD, rows, INTRO_SCIM_ROWS].join('\n');

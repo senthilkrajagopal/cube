@@ -3,16 +3,19 @@ use super::*;
 use crate::logical_plan::visitor::{LogicalPlanRewriter, NodeRewriteResult};
 use crate::logical_plan::*;
 use crate::planner::collectors::{collect_cube_names_from_symbols, has_multi_stage_members};
+use crate::planner::filter::operators::date_range::DateRangeKind;
 use crate::planner::filter::typed_filter::resolve_base_symbol;
 use crate::planner::filter::FilterItem;
-use crate::planner::filter::FilterOp;
+use crate::planner::filter::{FilterOp, RollingScanBand};
 use crate::planner::join_hints::JoinHints;
 use crate::planner::multi_fact_join_groups::{MeasuresJoinHints, MultiFactJoinGroups};
 use crate::planner::planners::multi_stage::TimeShiftState;
 use crate::planner::planners::CommonUtils;
 use crate::planner::state::State;
-use crate::planner::time_dimension::QueryDateTime;
-use crate::planner::MemberSymbol;
+use crate::planner::symbols::MeasureTimeShifts;
+use crate::planner::time_dimension::{QueryDateTime, QueryDateTimeHelper};
+use crate::planner::JoinTree;
+use crate::planner::{CubeId, InputId, MemberId, MemberSymbol};
 use cubenativeutils::CubeError;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -22,6 +25,18 @@ pub struct PreAggregationUsage {
     pub index: usize,
     pub pre_aggregation: Rc<PreAggregation>,
     pub date_range: Option<(String, String)>,
+    /// The usage reads a band with no bound to state — e.g. an `unbounded`
+    /// rolling window — so no partition can be ruled out for it.
+    pub unbounded: bool,
+}
+
+/// The dates a matched node reads from its pre-aggregation.
+enum UsageScanRange {
+    /// No time-dimension filter states a range.
+    Unfiltered,
+    Bounded(String, String),
+    /// A rolling window whose band has no bound to state.
+    Unbounded,
 }
 
 impl PreAggregationUsage {
@@ -45,7 +60,7 @@ enum RowGrain {
     Aggregated,
     /// The query returns raw rows over the given join. `None` when the node is
     /// not a plain cube join, leaving nothing to establish row identity against.
-    RawRows(Option<Rc<LogicalJoin>>),
+    RawRows(Option<Rc<JoinTree>>),
 }
 
 // Outcome of one matching pass over a single set of candidate pre-aggregations.
@@ -61,18 +76,27 @@ enum MultiStageMatch {
 
 pub struct PreAggregationOptimizer {
     query_tools: Rc<State>,
+    // The join hints the query was planned with. A query whose members alone don't
+    // determine a join root resolves only with these, so the query-side hint sets
+    // rebuilt here have to start from them.
+    query_join_hints: Rc<JoinHints>,
     allow_multi_stage: bool,
     usages: Vec<PreAggregationUsage>,
     usage_counter: usize,
     /// Resolved primary-key names per cube. Every candidate pre-aggregation asks
     /// for the same cubes, and resolving them crosses the JS bridge.
-    primary_keys_cache: RefCell<HashMap<String, Vec<String>>>,
+    primary_keys_cache: RefCell<HashMap<CubeId, Vec<MemberId>>>,
 }
 
 impl PreAggregationOptimizer {
-    pub fn new(query_tools: Rc<State>, allow_multi_stage: bool) -> Self {
+    pub fn new(
+        query_tools: Rc<State>,
+        query_join_hints: Rc<JoinHints>,
+        allow_multi_stage: bool,
+    ) -> Self {
         Self {
             query_tools,
+            query_join_hints,
             allow_multi_stage,
             usages: Vec::new(),
             usage_counter: 0,
@@ -89,20 +113,13 @@ impl PreAggregationOptimizer {
         let cube_names = collect_cube_names_from_node(&plan)?;
         let mut compiler = PreAggregationsCompiler::try_new(self.query_tools.clone(), &cube_names)?;
 
-        let compiled_pre_aggregations =
-            compiler.compile_all_pre_aggregations(disable_external_pre_aggregations)?;
-
-        let filtered_pre_aggregations: Vec<_> = if let Some(id) = pre_aggregation_id {
-            compiled_pre_aggregations
-                .iter()
-                .filter(|pa| format!("{}.{}", pa.cube_name, pa.name) == id)
-                .cloned()
-                .collect()
+        let compiled_pre_aggregations = if let Some(id) = pre_aggregation_id {
+            compiler.compile_requested_pre_aggregation(id, disable_external_pre_aggregations)?
         } else {
-            compiled_pre_aggregations
+            compiler.compile_all_pre_aggregations(disable_external_pre_aggregations)?
         };
 
-        self.try_rewrite_root(&plan, &filtered_pre_aggregations)
+        self.try_rewrite_root(&plan, &compiled_pre_aggregations)
     }
 
     fn try_rewrite_root(
@@ -111,7 +128,7 @@ impl PreAggregationOptimizer {
         compiled_pre_aggregations: &[Rc<CompiledPreAggregation>],
     ) -> Result<Option<Rc<RootQuery>>, CubeError> {
         // A pre-aggregation covering the whole query replaces it
-        // entirely — CTEs included.
+        // entirely — subqueries included.
         if let Some(rewritten) = self.try_rewrite_query(
             root.query(),
             compiled_pre_aggregations,
@@ -119,11 +136,14 @@ impl PreAggregationOptimizer {
             true,
         )? {
             return Ok(Some(Rc::new(
-                RootQuery::builder().ctes(vec![]).query(rewritten).build(),
+                RootQuery::builder()
+                    .subqueries(vec![])
+                    .query(rewritten)
+                    .build(),
             )));
         }
 
-        if self.allow_multi_stage && !root.ctes().is_empty() {
+        if self.allow_multi_stage && !root.subqueries().is_empty() {
             return self.try_rewrite_root_with_multistages(root, compiled_pre_aggregations);
         }
 
@@ -148,29 +168,53 @@ impl PreAggregationOptimizer {
         time_shifts: &TimeShiftState,
         is_user_query: bool,
     ) -> Result<Option<Rc<Query>>, CubeError> {
+        let mut refused_branches = HashSet::new();
         for pre_aggregation in compiled_pre_aggregations.iter() {
+            if refused_branches.contains(&(&pre_aggregation.cube_name, &pre_aggregation.name)) {
+                continue;
+            }
             let external = pre_aggregation.external.unwrap_or(false);
-            let date_range =
-                Self::extract_date_range(&query.filter(), &self.query_tools, time_shifts, external);
+            let scan_range = Self::extract_scan_range(
+                &query.filter(),
+                pre_aggregation,
+                &self.query_tools,
+                time_shifts,
+                external,
+            );
             if let Some(rewritten) = self.try_rewrite_simple_query(
                 query,
                 pre_aggregation,
-                date_range,
+                scan_range,
                 is_user_query,
                 time_shifts,
             )? {
                 return Ok(Some(rewritten));
             }
+            refused_branches.extend(Self::lambda_branches(pre_aggregation));
         }
 
         Ok(None)
+    }
+
+    // A branch holds only part of its lambda's time range, so it must not serve
+    // a node the lambda itself was refused for.
+    fn lambda_branches(
+        pre_aggregation: &CompiledPreAggregation,
+    ) -> impl Iterator<Item = (&String, &String)> {
+        let items = match pre_aggregation.source.as_ref() {
+            PreAggregationSource::Union(union) => union.items.as_slice(),
+            _ => &[],
+        };
+        items
+            .iter()
+            .map(|item| (&item.table.cube_name, &item.table.name))
     }
 
     fn try_rewrite_simple_query(
         &mut self,
         query: &Rc<Query>,
         pre_aggregation: &Rc<CompiledPreAggregation>,
-        date_range: Option<(String, String)>,
+        scan_range: UsageScanRange,
         is_user_query: bool,
         time_shifts: &TimeShiftState,
     ) -> Result<Option<Rc<Query>>, CubeError> {
@@ -178,8 +222,8 @@ impl PreAggregationOptimizer {
         // very node will render, taken from the node itself rather than
         // re-resolved, so the two can never disagree.
         let row_grain = if is_user_query && query.modifers().ungrouped {
-            RowGrain::RawRows(match query.source() {
-                QuerySource::LogicalJoin(join) => Some(join.clone()),
+            RowGrain::RawRows(match query.source().base() {
+                InputBase::QueryInputs(inputs) => inputs.join().clone(),
                 _ => None,
             })
         } else {
@@ -194,20 +238,14 @@ impl PreAggregationOptimizer {
             if !Self::can_carry_time_shifts(
                 pre_aggregation,
                 &matched_measures,
-                &Self::read_member_names(&query.schema(), &query.filter()),
+                &Self::read_member_ids(&query.schema(), &query.filter()),
                 time_shifts,
             ) {
                 return Ok(None);
             }
             let source =
-                self.make_pre_aggregation_source(pre_aggregation, &matched_measures, date_range)?;
-            let new_query = Query::builder()
-                .schema(query.schema().clone())
-                .filter(query.filter().clone())
-                .modifers(query.modifers().clone())
-                .source(source.into())
-                .build();
-            Ok(Some(Rc::new(new_query)))
+                self.make_pre_aggregation_source(pre_aggregation, &matched_measures, scan_range)?;
+            Ok(Some(query.with_source(QuerySource::new(source))))
         } else {
             Ok(None)
         }
@@ -222,10 +260,15 @@ impl PreAggregationOptimizer {
         filter: &Rc<LogicalFilter>,
         compiled_pre_aggregations: &[Rc<CompiledPreAggregation>],
     ) -> Result<Option<Rc<Query>>, CubeError> {
+        let mut refused_branches = HashSet::new();
         for pre_aggregation in compiled_pre_aggregations.iter() {
+            if refused_branches.contains(&(&pre_aggregation.cube_name, &pre_aggregation.name)) {
+                continue;
+            }
             let external = pre_aggregation.external.unwrap_or(false);
-            let date_range = Self::extract_date_range(
+            let scan_range = Self::extract_scan_range(
                 filter,
+                pre_aggregation,
                 &self.query_tools,
                 &TimeShiftState::default(),
                 external,
@@ -243,7 +286,7 @@ impl PreAggregationOptimizer {
                 let source = self.make_pre_aggregation_source(
                     pre_aggregation,
                     &matched_measures,
-                    date_range,
+                    scan_range,
                 )?;
                 let new_query = Query::builder()
                     .schema(schema.clone())
@@ -252,12 +295,14 @@ impl PreAggregationOptimizer {
                         offset: None,
                         limit: None,
                         ungrouped: false,
+                        distinct: false,
                         order_by: vec![],
                     }))
-                    .source(source.into())
+                    .source(QuerySource::new(source))
                     .build();
                 return Ok(Some(Rc::new(new_query)));
             }
+            refused_branches.extend(Self::lambda_branches(pre_aggregation));
         }
         Ok(None)
     }
@@ -277,9 +322,17 @@ impl PreAggregationOptimizer {
         // a set one query can read, against an alternative of reading the fact
         // table. CubeStore goes first as the default and faster store.
         for external in [true, false] {
+            let is_in_pass = |pa: &CompiledPreAggregation| pa.external.unwrap_or(false) == external;
+            let left_out_branches: HashSet<_> = compiled_pre_aggregations
+                .iter()
+                .filter(|pa| !is_in_pass(pa))
+                .flat_map(|pa| Self::lambda_branches(pa))
+                .collect();
             let candidates: Vec<_> = compiled_pre_aggregations
                 .iter()
-                .filter(|pa| pa.external.unwrap_or(false) == external)
+                .filter(|pa| {
+                    is_in_pass(pa) && !left_out_branches.contains(&(&pa.cube_name, &pa.name))
+                })
                 .cloned()
                 .collect();
             let outcome = self.match_multistages(root, &candidates)?;
@@ -310,47 +363,46 @@ impl PreAggregationOptimizer {
         let saved_usages_len = self.usages.len();
         let saved_counter = self.usage_counter;
 
-        // Multiplied-measure CTEs don't carry their own filter — logically
+        // Multiplied-measure subqueries don't carry their own filter — logically
         // they apply the same filter as the root query, so we match against it.
         let root_filter = query.filter().clone();
 
-        // CTEs are processed in reverse definition order (dependents
+        // Subqueries are processed in reverse definition order (dependents
         // before dependencies) tracking which names are still
         // referenced. When a leaf is rewritten to a pre-aggregation
-        // scan, the CTEs it used to read from become unreachable and
+        // scan, the subqueries it used to read from become unreachable and
         // are dropped instead of being rewritten on their own.
-        // Dimension-calculation CTEs are joined by name through the
-        // builder context rather than through subquery refs, so they
-        // are always kept.
-        let mut needed: HashSet<String> = HashSet::new();
-        collect_cte_refs(&query.as_plan_node(), &mut needed);
+        // Dimension-calculation subqueries are always kept, even when no
+        // reader is left, so that a rewrite never drops one from the SQL.
+        let mut needed: HashSet<InputId> = HashSet::new();
+        collect_subquery_refs(&query.as_plan_node(), &mut needed);
 
         let mut rewritten_multistages_rev = Vec::new();
-        for multi_stage in root.ctes().iter().rev() {
-            let is_dimension_calc = matches!(
-                multi_stage.member_type,
-                MultiStageMemberLogicalType::DimensionCalculation(_)
-            );
-            if !is_dimension_calc && !needed.contains(&multi_stage.name) {
+        for multi_stage in root.subqueries().iter().rev() {
+            let is_dimension_calc =
+                matches!(multi_stage.body, SubqueryBody::DimensionCalculation(_));
+            if !is_dimension_calc && !needed.contains(&multi_stage.id) {
                 continue;
             }
             let rewritten = rewriter.rewrite_top_down_with(multi_stage.clone(), |plan_node| {
                 let res = match plan_node {
-                    PlanNode::MultiStageLeafMeasure(multi_stage_leaf_measure) => {
+                    PlanNode::Subquery(member) => {
+                        let SubqueryBody::LeafMeasure(leaf) = &member.body else {
+                            return Ok(NodeRewriteResult::pass());
+                        };
+                        let time_shifts = leaf
+                            .evaluation_context()
+                            .as_ref()
+                            .map(|context| context.time_shifts.clone())
+                            .unwrap_or_default();
                         if let Some(rewritten) = self.try_rewrite_query(
-                            &multi_stage_leaf_measure.query,
+                            &leaf,
                             compiled_pre_aggregations,
-                            &multi_stage_leaf_measure.evaluation_context.time_shifts,
+                            &time_shifts,
                             false,
                         )? {
-                            let new_leaf = Rc::new(MultiStageLeafMeasure {
-                                measures: multi_stage_leaf_measure.measures.clone(),
-                                evaluation_context: multi_stage_leaf_measure
-                                    .evaluation_context
-                                    .clone(),
-                                query: rewritten,
-                            });
-                            NodeRewriteResult::rewritten(new_leaf.as_plan_node())
+                            let new_member = member.with_body(SubqueryBody::LeafMeasure(rewritten));
+                            NodeRewriteResult::rewritten(new_member.as_plan_node())
                         } else {
                             has_unrewritten_leaf = true;
                             NodeRewriteResult::stop()
@@ -360,7 +412,7 @@ impl PreAggregationOptimizer {
                         // A multiplied subquery hoisted out of a multi-stage
                         // leaf carries that leaf's evaluation context (time
                         // shifts, mutated filter state) — matching it against
-                        // the root filter would be wrong. Such CTEs are
+                        // the root filter would be wrong. Such subqueries are
                         // covered by rewriting their leaf wrapper instead.
                         if agg.evaluation_context.is_some() {
                             has_unrewritten_leaf = true;
@@ -370,31 +422,23 @@ impl PreAggregationOptimizer {
                             &root_filter,
                             compiled_pre_aggregations,
                         )? {
-                            let new_agg = Rc::new(AggregateMultipliedSubquery {
-                                schema: agg.schema.clone(),
-                                keys_subquery: agg.keys_subquery.clone(),
-                                source: agg.source.clone(),
-                                dimension_subqueries: agg.dimension_subqueries.clone(),
-                                evaluation_context: agg.evaluation_context.clone(),
-                                pre_aggregation_override: Some(rewritten),
-                            });
+                            let new_agg = agg.with_pre_aggregation_override(rewritten);
                             NodeRewriteResult::rewritten(new_agg.as_plan_node())
                         } else {
                             has_unrewritten_leaf = true;
                             NodeRewriteResult::stop()
                         }
                     }
-                    PlanNode::LogicalMultiStageMember(_) => NodeRewriteResult::pass(),
                     _ => NodeRewriteResult::stop(),
                 };
                 Ok(res)
             })?;
             // The whole attempt rolls back on any unrewritten leaf — no
-            // point matching the remaining CTEs.
+            // point matching the remaining subqueries.
             if has_unrewritten_leaf {
                 break;
             }
-            collect_cte_refs(&rewritten.as_plan_node(), &mut needed);
+            collect_subquery_refs(&rewritten.as_plan_node(), &mut needed);
             rewritten_multistages_rev.push(rewritten);
         }
         let rewritten_multistages = rewritten_multistages_rev.into_iter().rev().collect();
@@ -405,17 +449,6 @@ impl PreAggregationOptimizer {
             self.usage_counter = saved_counter;
             return Ok(MultiStageMatch::UnmatchedStage);
         }
-
-        let source = if let QuerySource::FullKeyAggregate(full_key_aggregate) = query.source() {
-            let result = FullKeyAggregate::builder()
-                .schema(full_key_aggregate.schema().clone())
-                .use_full_join_and_coalesce(full_key_aggregate.use_full_join_and_coalesce())
-                .multi_stage_subquery_refs(full_key_aggregate.multi_stage_subquery_refs().clone())
-                .build();
-            Rc::new(result).into()
-        } else {
-            query.source().clone()
-        };
 
         // One query cannot read both external types, so a set that spans
         // them is unusable as a whole.
@@ -429,17 +462,10 @@ impl PreAggregationOptimizer {
             }
         }
 
-        let result = Query::builder()
-            .schema(query.schema().clone())
-            .filter(query.filter().clone())
-            .modifers(query.modifers().clone())
-            .source(source)
-            .build();
-
         Ok(MultiStageMatch::Matched(Rc::new(
             RootQuery::builder()
-                .ctes(rewritten_multistages)
-                .query(Rc::new(result))
+                .subqueries(rewritten_multistages)
+                .query(query.clone())
                 .build(),
         )))
     }
@@ -447,8 +473,8 @@ impl PreAggregationOptimizer {
     fn make_pre_aggregation_source(
         &mut self,
         pre_aggregation: &Rc<CompiledPreAggregation>,
-        matched_measures: &HashSet<String>,
-        date_range: Option<(String, String)>,
+        matched_measures: &HashSet<MemberId>,
+        scan_range: UsageScanRange,
     ) -> Result<Rc<PreAggregation>, CubeError> {
         let usage_index = self.usage_counter;
         self.usage_counter += 1;
@@ -456,7 +482,7 @@ impl PreAggregationOptimizer {
         let filtered_measures: Vec<Rc<MemberSymbol>> = pre_aggregation
             .measures
             .iter()
-            .filter(|m| matched_measures.contains(&m.full_name()))
+            .filter(|m| matched_measures.contains(m.peel_refs().id()))
             .cloned()
             .collect();
         let schema = LogicalSchema {
@@ -495,10 +521,16 @@ impl PreAggregationOptimizer {
             .build();
         let result = Rc::new(pre_aggregation_node);
 
+        let (date_range, unbounded) = match scan_range {
+            UsageScanRange::Unfiltered => (None, false),
+            UsageScanRange::Bounded(from, to) => (Some((from, to)), false),
+            UsageScanRange::Unbounded => (None, true),
+        };
         self.usages.push(PreAggregationUsage {
             index: usage_index,
             pre_aggregation: result.clone(),
             date_range,
+            unbounded,
         });
 
         Ok(result)
@@ -524,9 +556,7 @@ impl PreAggregationOptimizer {
                             usage_index: Some(usage_index),
                             ..item.table.as_ref().clone()
                         }),
-                        measures: item.measures.clone(),
-                        dimensions: item.dimensions.clone(),
-                        time_dimensions: item.time_dimensions.clone(),
+                        ..item.clone()
                     })
                     .collect();
                 Rc::new(PreAggregationSource::Union(PreAggregationUnion { items }))
@@ -558,9 +588,9 @@ impl PreAggregationOptimizer {
     // stored measure reading a shifted member is therefore always unusable,
     // however cleanly the shift could be attributed to it. Only the measures
     // matching consumed are examined, since the rest are never read.
-    // Resolved names of every member the query reads, so a stored member no
+    // Resolved ids of every member the query reads, so a stored member no
     // one reads cannot decide anything.
-    fn read_member_names(schema: &LogicalSchema, filter: &LogicalFilter) -> HashSet<String> {
+    fn read_member_ids(schema: &LogicalSchema, filter: &LogicalFilter) -> HashSet<MemberId> {
         let mut symbols: Vec<Rc<MemberSymbol>> = schema
             .dimensions
             .iter()
@@ -581,26 +611,23 @@ impl PreAggregationOptimizer {
             .map(|symbol| {
                 resolve_base_symbol(&symbol)
                     .resolve_reference_chain()
-                    .full_name()
+                    .id()
+                    .clone()
             })
             .collect()
     }
 
     fn can_carry_time_shifts(
         pre_aggregation: &CompiledPreAggregation,
-        matched_measures: &HashSet<String>,
-        read_members: &HashSet<String>,
+        matched_measures: &HashSet<MemberId>,
+        read_members: &HashSet<MemberId>,
         time_shifts: &TimeShiftState,
     ) -> bool {
         if time_shifts.is_empty() {
             return true;
         }
         let is_read = |member: &Rc<MemberSymbol>| {
-            read_members.contains(
-                &resolve_base_symbol(member)
-                    .resolve_reference_chain()
-                    .full_name(),
-            )
+            read_members.contains(resolve_base_symbol(member).resolve_reference_chain().id())
         };
         let grouping_members_carry_shift = pre_aggregation
             .time_dimensions
@@ -616,50 +643,186 @@ impl PreAggregationOptimizer {
             && pre_aggregation
                 .measures
                 .iter()
-                .filter(|measure| matched_measures.contains(&measure.full_name()))
+                .filter(|measure| matched_measures.contains(measure.peel_refs().id()))
                 .all(|measure| !time_shifts.has_shift_under(measure))
     }
 
-    fn extract_date_range(
+    // A shift lands only on the time members a query reads: named and common
+    // shifts on all of them, a dimension shift on those it lists. Dropping a
+    // stored member the build shifted would drop part of the stored shift.
+    fn stored_shifts_carry_over(
+        pre_aggregation: &CompiledPreAggregation,
+        matched_measures: &HashSet<MemberId>,
+        schema: &LogicalSchema,
         filter: &LogicalFilter,
+    ) -> Result<bool, CubeError> {
+        let base_name = |member: &Rc<MemberSymbol>| {
+            resolve_base_symbol(member)
+                .resolve_reference_chain()
+                .id()
+                .clone()
+        };
+        let stored_time_members: Vec<MemberId> = pre_aggregation
+            .time_dimensions
+            .iter()
+            .chain(pre_aggregation.dimensions.iter())
+            .filter(|member| {
+                resolve_base_symbol(member)
+                    .resolve_reference_chain()
+                    .as_dimension()
+                    .is_ok_and(|dimension| dimension.is_time())
+            })
+            .map(base_name)
+            .collect();
+        let read = Self::read_member_ids(schema, filter);
+
+        for stored in pre_aggregation
+            .measures
+            .iter()
+            .filter(|m| matched_measures.contains(m.peel_refs().id()))
+        {
+            let mut on_every_member = false;
+            let mut targets = HashSet::new();
+            let mut measure = stored.peel_refs().as_measure()?;
+            loop {
+                match measure.time_shift() {
+                    Some(MeasureTimeShifts::Dimensions(shifts)) => {
+                        targets.extend(shifts.iter().map(|shift| base_name(&shift.dimension)))
+                    }
+                    Some(_) => on_every_member = true,
+                    None => {}
+                }
+                match measure.time_shift_proxy_target() {
+                    Some(target) => measure = target.as_measure()?,
+                    None => break,
+                }
+            }
+            if stored_time_members
+                .iter()
+                .filter(|name| on_every_member || targets.contains(*name))
+                .any(|name| !read.contains(name))
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// The dates a node reads, taken from its filters on the pre-aggregation's
+    /// partition time dimension.
+    fn extract_scan_range(
+        filter: &LogicalFilter,
+        pre_aggregation: &CompiledPreAggregation,
         query_tools: &Rc<State>,
         time_shifts: &TimeShiftState,
         external: bool,
-    ) -> Option<(String, String)> {
+    ) -> UsageScanRange {
         let precision = query_tools
-            .base_tools()
-            .driver_tools(external)
+            .plan_sql_templates(external)
             .ok()
-            .and_then(|dt| dt.timestamp_precision().ok())
+            .and_then(|templates| templates.timestamp_precision().ok())
             .unwrap_or(3);
-        for item in &filter.time_dimensions_filters {
+        // Partitions are cut on the first time dimension, as in the JS side.
+        let partition_dimension = pre_aggregation.time_dimensions.first().map(|td| {
+            resolve_base_symbol(td)
+                .resolve_reference_chain()
+                .id()
+                .clone()
+        });
+        // Top-level items are ANDed, and a date range on the partition dimension
+        // can come as a plain filter as well as a time-dimension one.
+        let mut unbounded = false;
+        for item in filter
+            .time_dimensions_filters
+            .iter()
+            .chain(filter.dimensions_filters.iter())
+        {
             if let FilterItem::Item(base_filter) = item {
-                if let FilterOp::DateRange(date_range_op) = base_filter.operation() {
-                    if let Ok((from, to)) = date_range_op.formatted_date_range(precision) {
-                        // Apply time shift for this dimension if present.
-                        // SQL renders `column + interval`, so actual data range is `date - interval`.
-                        if let Some(interval) = time_shifts
-                            .get_for_symbol(base_filter.raw_member_evaluator_ref())
-                            .and_then(|s| s.interval.as_ref())
-                        {
-                            let tz = query_tools.timezone();
-                            let neg = -interval.clone();
-                            let shifted_from = QueryDateTime::from_date_str(tz, &from)
-                                .and_then(|dt| dt.add_interval(&neg))
-                                .map(|dt| dt.default_format())
-                                .unwrap_or(from);
-                            let shifted_to = QueryDateTime::from_date_str(tz, &to)
-                                .and_then(|dt| dt.add_interval(&neg))
-                                .map(|dt| dt.default_format())
-                                .unwrap_or(to);
-                            return Some((shifted_from, shifted_to));
-                        }
-                        return Some((from, to));
+                let member = base_filter.member_evaluator();
+                if partition_dimension.as_ref() != Some(member.resolve_reference_chain().id()) {
+                    continue;
+                }
+                let range = match base_filter.operation() {
+                    FilterOp::DateRange(date_range_op)
+                        if matches!(date_range_op.kind, DateRangeKind::InRange) =>
+                    {
+                        date_range_op.formatted_date_range(precision).ok()
                     }
+                    // An excluded range bounds nothing.
+                    FilterOp::DateRange(_) => None,
+                    // A band that can't be worked out leaves the partitions
+                    // unbounded rather than failing the query, unless another
+                    // filter bounds them.
+                    op => match Self::rolling_scan_range(op, query_tools, external, precision) {
+                        Ok(Some(RollingScanBand::Bounded(from, to))) => Some((from, to)),
+                        Ok(Some(RollingScanBand::Unbounded)) | Err(_) => {
+                            unbounded = true;
+                            None
+                        }
+                        Ok(None) => None,
+                    },
+                };
+                if let Some((from, to)) = range {
+                    // Apply time shift for this dimension if present.
+                    // SQL renders `column + interval`, so actual data range is `date - interval`.
+                    if let Some(interval) = time_shifts
+                        .get_for_symbol(base_filter.raw_member_evaluator_ref())
+                        .and_then(|s| s.interval.as_ref())
+                    {
+                        let tz = query_tools.timezone();
+                        let neg = -interval.clone();
+                        let shifted_from = QueryDateTime::from_date_str(tz, &from)
+                            .and_then(|dt| dt.add_interval(&neg))
+                            .map(|dt| dt.default_format())
+                            .unwrap_or(from);
+                        // A month shift clamps the day of month, so either end alone
+                        // can lose the last source day; the later of the two covers both.
+                        let tick = chrono::Duration::milliseconds(1);
+                        let inclusive = QueryDateTime::from_date_str(tz, &to)
+                            .and_then(|dt| dt.add_interval(&neg))
+                            .map(|dt| dt.default_format());
+                        let exclusive = QueryDateTime::from_date_str(tz, &to)
+                            .and_then(|dt| dt.add_duration(tick))
+                            .and_then(|dt| dt.add_interval(&neg))
+                            .and_then(|dt| dt.add_duration(-tick))
+                            .map(|dt| dt.default_format());
+                        let shifted_to = match (inclusive, exclusive) {
+                            (Ok(a), Ok(b)) => std::cmp::max(a, b),
+                            (Ok(a), Err(_)) | (Err(_), Ok(a)) => a,
+                            (Err(_), Err(_)) => to,
+                        };
+                        return UsageScanRange::Bounded(shifted_from, shifted_to);
+                    }
+                    return UsageScanRange::Bounded(from, to);
                 }
             }
         }
-        None
+        if unbounded {
+            UsageScanRange::Unbounded
+        } else {
+            UsageScanRange::Unfiltered
+        }
+    }
+
+    /// A rolling-window filter's band, formatted to the dialect's precision.
+    fn rolling_scan_range(
+        op: &FilterOp,
+        query_tools: &Rc<State>,
+        external: bool,
+        precision: u32,
+    ) -> Result<Option<RollingScanBand>, CubeError> {
+        // The series ends where the usage's own dialect renders it.
+        let templates = query_tools.plan_sql_templates(external)?;
+        let band = op.rolling_scan_band(query_tools.timezone(), |span| {
+            Ok(span.end(&templates)?.clone())
+        })?;
+        Ok(match band {
+            Some(RollingScanBand::Bounded(from, to)) => Some(RollingScanBand::Bounded(
+                QueryDateTimeHelper::format_from_date(&from, precision)?,
+                QueryDateTimeHelper::format_to_date(&to, precision)?,
+            )),
+            other => other,
+        })
     }
 
     fn is_schema_and_filters_match(
@@ -668,7 +831,7 @@ impl PreAggregationOptimizer {
         filters: &Rc<LogicalFilter>,
         pre_aggregation: &CompiledPreAggregation,
         row_grain: RowGrain,
-    ) -> Result<Option<HashSet<String>>, CubeError> {
+    ) -> Result<Option<HashSet<MemberId>>, CubeError> {
         let helper = OptimizerHelper::new();
 
         let match_state = self.match_dimensions(
@@ -685,6 +848,10 @@ impl PreAggregationOptimizer {
             return Ok(None);
         }
 
+        if !self.are_masks_renderable(schema, filters, &all_measures, pre_aggregation)? {
+            return Ok(None);
+        }
+
         if let RowGrain::RawRows(node_join) = &row_grain {
             if !self.is_raw_rows_match(node_join.as_ref(), pre_aggregation)? {
                 return Ok(None);
@@ -693,7 +860,7 @@ impl PreAggregationOptimizer {
 
         // The query's join groups answer both the multiplicativity gate
         // and the join-path comparison below, so build them once.
-        let query_groups = self.query_join_groups(schema, &all_measures)?;
+        let query_groups = self.query_join_groups(schema, filters, &all_measures)?;
 
         // A measure sitting under a row-multiplying join can't be rolled
         // up from a partially matching pre-aggregation.
@@ -710,15 +877,26 @@ impl PreAggregationOptimizer {
             return Ok(None);
         };
 
+        if match_state == MatchState::Partial
+            && !Self::stored_shifts_carry_over(pre_aggregation, &matched_measures, schema, filters)?
+        {
+            return Ok(None);
+        }
+
         // An ungrouped read projects stored columns as they are, with no
         // aggregate around them, so a measure kept as a mergeable sketch would
         // reach the client as the sketch instead of a number.
         if matches!(row_grain, RowGrain::RawRows(_)) {
             for symbol in pre_aggregation.measures.iter() {
-                if !matched_measures.contains(symbol.full_name().as_str()) {
+                if !matched_measures.contains(symbol.peel_refs().id()) {
                     continue;
                 }
-                if symbol.as_measure()?.kind().is_stored_as_state() {
+                if symbol
+                    .peel_refs()
+                    .as_measure()?
+                    .rollup_kind()
+                    .is_stored_as_state()
+                {
                     return Ok(None);
                 }
             }
@@ -748,13 +926,7 @@ impl PreAggregationOptimizer {
                 let query_has_multiplied = if has_filters {
                     MultiFactJoinGroups::try_new(
                         self.query_tools.clone(),
-                        MeasuresJoinHints::builder(&JoinHints::new())
-                            .add_dimensions(&schema.dimensions)
-                            .add_dimensions(&schema.time_dimensions)
-                            .add_filters(&filters.dimensions_filters)
-                            .add_filters(&filters.time_dimensions_filters)
-                            .add_filters(&filters.segments)
-                            .build(&all_measures)?,
+                        self.filtered_join_hints(schema, filters, &all_measures)?,
                     )?
                     .has_multiplied_measures()?
                 } else {
@@ -787,64 +959,103 @@ impl PreAggregationOptimizer {
     //
     // The join comes from the node being rewritten, so it is by construction the
     // one that node renders — filters, join hints and order-by members included.
+    //
+    // A lambda's branches hold disjoint time ranges, so its union is one row per
+    // raw row exactly when every branch is.
     fn is_raw_rows_match(
         &self,
-        node_join: Option<&Rc<LogicalJoin>>,
+        node_join: Option<&Rc<JoinTree>>,
         pre_aggregation: &CompiledPreAggregation,
     ) -> Result<bool, CubeError> {
-        // Only a plain rollup describes the grain its rows were stored at. A
-        // join or union source is described by declared members that need not
-        // reflect what the underlying rollups actually store, so its grain
-        // cannot be established here.
-        if !matches!(
-            pre_aggregation.source.as_ref(),
-            PreAggregationSource::Single(_)
-        ) {
-            return Ok(false);
-        }
-
-        // Anything but a plain cube join — a full-key aggregate, or a source
+        // Anything but a plain cube join — a merge, or a source
         // already rewritten to a pre-aggregation — has no single join to judge
         // row identity against.
         let Some(node_join) = node_join else {
             return Ok(false);
         };
-        let Some(root) = node_join.root() else {
-            return Ok(false);
-        };
+        let root = node_join.root();
 
-        let stored_dimensions: HashSet<String> = pre_aggregation
-            .dimensions
-            .iter()
-            .map(|d| d.clone().resolve_reference_chain().full_name())
-            .collect();
-
-        let joined_cubes: HashSet<String> = std::iter::once(root.name().clone())
+        // Each joined cube, and whether it is needed to identify a row.
+        let joined_cubes: Vec<(CubeId, bool)> = std::iter::once((root.cube_id().clone(), true))
             .chain(
                 node_join
                     .joins()
                     .iter()
-                    .map(|item| item.cube().name().clone()),
+                    .map(|item| (item.cube().cube_id().clone(), item.splits_rows())),
             )
             .collect();
 
-        // The pre-aggregation must not be stored at a finer grain than the node
-        // reads either: a cube it groups by but the node never joins splits its
-        // rows further, so the same row would come back more than once.
-        for cube_name in Self::pre_aggregation_grain_cubes(pre_aggregation)? {
-            if !joined_cubes.contains(&cube_name) {
+        match pre_aggregation.source.as_ref() {
+            PreAggregationSource::Single(_) => self.is_branch_raw_rows_match(
+                &pre_aggregation.dimensions,
+                &pre_aggregation.time_dimensions,
+                &pre_aggregation.segments,
+                &HashMap::new(),
+                &joined_cubes,
+            ),
+            PreAggregationSource::Union(union) => {
+                let Some(first) = union.items.first() else {
+                    return Ok(false);
+                };
+                let lambda_cube = CubeId::cube(&first.table.cube_name);
+                for item in union.items.iter() {
+                    let Some(branch_cubes) =
+                        Self::lambda_branch_cubes(pre_aggregation, &lambda_cube, item)
+                    else {
+                        return Ok(false);
+                    };
+                    if !self.is_branch_raw_rows_match(
+                        &item.dimensions,
+                        &item.time_dimensions,
+                        &item.segments,
+                        &branch_cubes,
+                        &joined_cubes,
+                    )? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            // A join source is described by declared members that need not
+            // reflect what its rollups actually store.
+            PreAggregationSource::Join(_) => Ok(false),
+        }
+    }
+
+    // `branch_cubes` maps a cube of the node's join to the cube a lambda branch
+    // stores it as; a cube absent from it is stored as itself.
+    fn is_branch_raw_rows_match(
+        &self,
+        dimensions: &[Rc<MemberSymbol>],
+        time_dimensions: &[Rc<MemberSymbol>],
+        segments: &[Rc<MemberSymbol>],
+        branch_cubes: &HashMap<CubeId, CubeId>,
+        joined_cubes: &[(CubeId, bool)],
+    ) -> Result<bool, CubeError> {
+        let as_stored = |cube: &CubeId| branch_cubes.get(cube).unwrap_or(cube).clone();
+
+        let stored_dimensions: HashSet<MemberId> = dimensions
+            .iter()
+            .map(|d| d.clone().resolve_reference_chain().id().clone())
+            .collect();
+
+        // The rows must not be stored at a finer grain than the node reads
+        // either: a cube grouped by but never joined splits them further, so the
+        // same row would come back more than once.
+        let stored_cubes: HashSet<CubeId> = joined_cubes
+            .iter()
+            .map(|(cube, _)| as_stored(cube))
+            .collect();
+        for cube_name in Self::grain_cubes(dimensions, time_dimensions, segments)? {
+            if !stored_cubes.contains(&cube_name) {
                 return Ok(false);
             }
         }
 
-        let identifying_cubes = std::iter::once(root.name().clone()).chain(
-            node_join
-                .joins()
-                .iter()
-                .filter(|item| item.splits_rows())
-                .map(|item| item.cube().name().clone()),
-        );
-
+        let identifying_cubes = joined_cubes
+            .iter()
+            .filter(|(_, identifying)| *identifying)
+            .map(|(cube, _)| as_stored(cube));
         for cube_name in identifying_cubes {
             let keys = self.resolved_primary_keys(&cube_name)?;
             if keys.is_empty() {
@@ -858,50 +1069,120 @@ impl PreAggregationOptimizer {
         Ok(true)
     }
 
-    /// Cubes that set the grain the pre-aggregation stores its rows at, which is
-    /// what it groups by: its dimensions and time dimensions, plus its segments,
-    /// which are appended to the dimension list when the table is materialized
-    /// and so group the stored rows too. Measures are excluded — a measure joins
-    /// whatever its own SQL references, but that join is aggregated away inside
-    /// the rollup and leaves its row count untouched.
-    fn pre_aggregation_grain_cubes(
+    // A branch on another cube stores the lambda cube's members under its own
+    // same-named ones. Any other cube must be stored as itself: a same-named
+    // column on the branch cube says nothing about that cube's rows.
+    fn lambda_branch_cubes(
         pre_aggregation: &CompiledPreAggregation,
-    ) -> Result<Vec<String>, CubeError> {
-        let members = pre_aggregation
+        lambda_cube: &CubeId,
+        item: &PreAggregationUnionItem,
+    ) -> Option<HashMap<CubeId, CubeId>> {
+        let time_base = |td: &Rc<MemberSymbol>| match td.as_time_dimension() {
+            Ok(t) => t.base_symbol().clone(),
+            Err(_) => td.clone(),
+        };
+        let branch_time_bases = item
+            .time_dimensions
+            .iter()
+            .map(time_base)
+            .collect::<Vec<_>>();
+        let pairs = pre_aggregation
             .dimensions
             .iter()
-            .chain(pre_aggregation.time_dimensions.iter())
-            .chain(pre_aggregation.segments.iter())
+            .map(|d| Some((d.clone(), item.find_member(d, &item.dimensions).ok()?)))
+            .chain(pre_aggregation.time_dimensions.iter().map(|td| {
+                let lambda_base = time_base(td);
+                let branch_base = item.find_member(&lambda_base, &branch_time_bases).ok()?;
+                Some((lambda_base, branch_base))
+            }));
+
+        let mut branch_cubes = HashMap::new();
+        for pair in pairs {
+            let (lambda_member, branch_member) = pair?;
+            let (from, to) = (lambda_member.cube_id(), branch_member.cube_id());
+            if from == to {
+                continue;
+            }
+            if &from != lambda_cube {
+                return None;
+            }
+            if branch_cubes
+                .insert(from, to.clone())
+                .is_some_and(|prev| prev != to)
+            {
+                return None;
+            }
+        }
+        Some(branch_cubes)
+    }
+
+    // A rollup's grain is its GROUP BY: segments are materialized as grouping
+    // columns too, while a measure's own joins are aggregated away inside it.
+    fn grain_cubes(
+        dimensions: &[Rc<MemberSymbol>],
+        time_dimensions: &[Rc<MemberSymbol>],
+        segments: &[Rc<MemberSymbol>],
+    ) -> Result<Vec<CubeId>, CubeError> {
+        let members = dimensions
+            .iter()
+            .chain(time_dimensions.iter())
+            .chain(segments.iter())
             .cloned()
             .collect::<Vec<_>>();
         collect_cube_names_from_symbols(&members)
     }
 
-    fn resolved_primary_keys(&self, cube_name: &String) -> Result<Vec<String>, CubeError> {
-        if let Some(cached) = self.primary_keys_cache.borrow().get(cube_name) {
+    fn resolved_primary_keys(&self, cube_id: &CubeId) -> Result<Vec<MemberId>, CubeError> {
+        if let Some(cached) = self.primary_keys_cache.borrow().get(cube_id) {
             return Ok(cached.clone());
         }
         let keys = CommonUtils::new(self.query_tools.clone())
-            .primary_keys_dimensions(cube_name)?
+            .primary_keys_dimensions(cube_id)?
             .into_iter()
-            .map(|key| key.resolve_reference_chain().full_name())
+            .map(|key| key.resolve_reference_chain().id().clone())
             .collect::<Vec<_>>();
         self.primary_keys_cache
             .borrow_mut()
-            .insert(cube_name.clone(), keys.clone());
+            .insert(cube_id.clone(), keys.clone());
         Ok(keys)
     }
 
     fn query_join_groups(
         &self,
         schema: &Rc<LogicalSchema>,
+        filters: &Rc<LogicalFilter>,
         measures: &[Rc<MemberSymbol>],
     ) -> Result<MultiFactJoinGroups, CubeError> {
-        let hints = MeasuresJoinHints::builder(&JoinHints::new())
+        let hints = MeasuresJoinHints::builder(&self.query_join_hints)
             .add_dimensions(&schema.dimensions)
             .add_dimensions(&schema.time_dimensions)
             .build(measures)?;
-        MultiFactJoinGroups::try_new(self.query_tools.clone(), hints)
+        if let Ok(groups) =
+            MultiFactJoinGroups::try_new_if_joinable(self.query_tools.clone(), hints)?
+        {
+            return Ok(groups);
+        }
+        // A filtered member can be the only link between the cubes the query
+        // selects from, and the query itself is planned with its filters.
+        MultiFactJoinGroups::try_new(
+            self.query_tools.clone(),
+            self.filtered_join_hints(schema, filters, measures)?,
+        )
+    }
+
+    fn filtered_join_hints(
+        &self,
+        schema: &Rc<LogicalSchema>,
+        filters: &Rc<LogicalFilter>,
+        measures: &[Rc<MemberSymbol>],
+    ) -> Result<MeasuresJoinHints, CubeError> {
+        MeasuresJoinHints::builder(&self.query_join_hints)
+            .add_dimensions(&schema.dimensions)
+            .add_dimensions(&schema.time_dimensions)
+            .add_filters(&filters.dimensions_filters)
+            .add_filters(&filters.time_dimensions_filters)
+            .add_filters(&filters.segments)
+            .build(measures)
     }
 
     fn are_join_paths_matching(
@@ -943,7 +1224,7 @@ impl PreAggregationOptimizer {
         measures: &Vec<Rc<MemberSymbol>>,
         pre_aggregation: &CompiledPreAggregation,
         only_additive: bool,
-    ) -> Result<Option<HashSet<String>>, CubeError> {
+    ) -> Result<Option<HashSet<MemberId>>, CubeError> {
         let mut matcher = MeasureMatcher::new(pre_aggregation, only_additive);
         for measure in measures.iter() {
             if !matcher.try_match(measure)? {
@@ -951,6 +1232,33 @@ impl PreAggregationOptimizer {
             }
         }
         Ok(Some(matcher.matched_measures().clone()))
+    }
+
+    fn are_masks_renderable(
+        &self,
+        schema: &Rc<LogicalSchema>,
+        filters: &Rc<LogicalFilter>,
+        all_measures: &Vec<Rc<MemberSymbol>>,
+        pre_aggregation: &CompiledPreAggregation,
+    ) -> Result<bool, CubeError> {
+        if !self.query_tools.query_tools().has_masked_members() {
+            return Ok(true);
+        }
+        let filter_members = filters
+            .dimensions_filters
+            .iter()
+            .chain(filters.time_dimensions_filters.iter())
+            .chain(filters.segments.iter())
+            .flat_map(|item| item.all_member_evaluators())
+            .collect::<Vec<_>>();
+        MaskMatcher::new(self.query_tools.query_tools().clone(), pre_aggregation).try_match(
+            schema
+                .dimensions
+                .iter()
+                .chain(schema.time_dimensions.iter())
+                .chain(all_measures.iter())
+                .chain(filter_members.iter()),
+        )
     }
 
     fn match_dimensions(
@@ -976,11 +1284,11 @@ impl PreAggregationOptimizer {
     }
 }
 
-/// Collects the names of CTEs the given subtree references by name —
-/// every node contributes via `LogicalNode::referenced_cte_names`.
-fn collect_cte_refs(node: &PlanNode, result: &mut HashSet<String>) {
-    result.extend(node.referenced_cte_names());
+/// Collects the subqueries the given subtree references — every node
+/// contributes via `LogicalNode::referenced_inputs`.
+fn collect_subquery_refs(node: &PlanNode, result: &mut HashSet<InputId>) {
+    result.extend(node.referenced_inputs());
     for input in node.inputs() {
-        collect_cte_refs(&input, result);
+        collect_subquery_refs(&input, result);
     }
 }

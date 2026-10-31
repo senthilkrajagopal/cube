@@ -78,6 +78,7 @@ impl<'a> FilterSqlContext<'a> {
         match member_type.as_deref() {
             Some("boolean") => self.plan_templates.bool_param_cast(value),
             Some("number") => self.plan_templates.number_param_cast(value),
+            Some("time") => self.plan_templates.time_param_cast(value),
             _ => Ok(value.to_string()),
         }
     }
@@ -231,10 +232,7 @@ impl<'a> FilterSqlContext<'a> {
 
     /// Upper bound of `span` for the series shape this dialect renders.
     pub fn series_span_end<'s>(&self, span: &'s SeriesSpan) -> Result<&'s String, CubeError> {
-        let generated = self
-            .plan_templates
-            .supports_generated_time_series(span.predefined_granularity)?;
-        Ok(span.to(generated))
+        span.end(self.plan_templates)
     }
 
     pub fn date_range_from_time_series(&self) -> Result<(String, String), CubeError> {

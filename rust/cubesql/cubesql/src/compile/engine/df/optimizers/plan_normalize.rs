@@ -11,8 +11,8 @@ use datafusion::{
             Limit, Partitioning, Projection, Repartition, Sort, Subquery, TableScan, TableUDFs,
             Union, Values, Window,
         },
-        union_with_alias, Column, DFSchema, ExprRewritable, ExprSchemable, LogicalPlan,
-        LogicalPlanBuilder, Operator,
+        union_with_alias, Column, DFSchema, ExprRewritable, ExprSchemable, ExprVisitable,
+        ExpressionVisitor, LogicalPlan, LogicalPlanBuilder, Operator, Recursion,
     },
     optimizer::{
         optimizer::{OptimizerConfig, OptimizerRule},
@@ -23,7 +23,9 @@ use datafusion::{
 };
 
 use crate::compile::{
-    date_parser::parse_date_str, engine::CubeContext, rewrite::rules::utils::DatePartToken,
+    date_parser::parse_date_str,
+    engine::{udf::CURRENT_TIMESTAMP_STAND_INS, CubeContext},
+    rewrite::rules::utils::DatePartToken,
 };
 
 /// PlanNormalize optimizer rule walks through the query and applies transformations
@@ -1422,12 +1424,12 @@ fn binary_expr_normalize(
             return Ok(Box::new(Expr::BinaryExpr {
                 left,
                 op,
-                right: evaluate_expr(optimizer, right.cast_to(&left_type, schema)?)?,
+                right: cast_date_unless_stand_in(optimizer, right, &left_type, schema),
             }));
         }
         (DataType::Date32, DataType::Timestamp(_, _)) => {
             return Ok(Box::new(Expr::BinaryExpr {
-                left: evaluate_expr(optimizer, left.cast_to(&right_type, schema)?)?,
+                left: cast_date_unless_stand_in(optimizer, left, &right_type, schema),
                 op,
                 right,
             }));
@@ -1476,10 +1478,95 @@ fn normalize_temporal_operand(
             data_type: target_type.clone(),
         }));
     }
-    if matches!(expr_type, DataType::Date32) {
-        return evaluate_expr(optimizer, expr.cast_to(target_type, schema)?);
+    // A stand-in the rewrite replaces is not folded; see `holds_timestamp_stand_in`
+    if matches!(expr_type, DataType::Date32) && !holds_timestamp_stand_in(&expr) {
+        return Ok(
+            fold_date_to_timestamp(optimizer, &expr, target_type, schema)
+                .or_else(|| fold_date_to_millis(optimizer, &expr, target_type, schema))
+                .map_or(expr, Box::new),
+        );
     }
     Ok(expr)
+}
+
+/// [`cast_date_to_timestamp`], but a `DATE` holding a stand-in the rewrite
+/// replaces keeps the explicit cast unfolded; see `holds_timestamp_stand_in`.
+fn cast_date_unless_stand_in(
+    optimizer: &PlanNormalize,
+    expr: Box<Expr>,
+    data_type: &DataType,
+    schema: &DFSchema,
+) -> Box<Expr> {
+    if holds_timestamp_stand_in(&expr) {
+        return Box::new(Expr::Cast {
+            expr,
+            data_type: data_type.clone(),
+        });
+    }
+    cast_date_to_timestamp(optimizer, expr, data_type, schema)
+}
+
+/// Casts a `DATE` operand of `TIMESTAMP` arithmetic and folds it to a constant. When it can't
+/// be folded the explicit cast is kept, since mixed `TIMESTAMP`/`DATE` arithmetic has no type;
+/// it then renders as a cast in the pushed down SQL.
+fn cast_date_to_timestamp(
+    optimizer: &PlanNormalize,
+    expr: Box<Expr>,
+    target_type: &DataType,
+    schema: &DFSchema,
+) -> Box<Expr> {
+    Box::new(
+        fold_date_to_timestamp(optimizer, &expr, target_type, schema).unwrap_or_else(|| {
+            Expr::Cast {
+                expr,
+                data_type: target_type.clone(),
+            }
+        }),
+    )
+}
+
+/// Casts a `DATE` operand to the given `TIMESTAMP` type and folds it to a constant, or returns
+/// `None` when it can't be folded. Never errors, since `PlanNormalize` runs as
+/// `optimize(..).unwrap_or(plan)` and an error would drop every other normalization.
+fn fold_date_to_timestamp(
+    optimizer: &PlanNormalize,
+    expr: &Expr,
+    target_type: &DataType,
+    schema: &DFSchema,
+) -> Option<Expr> {
+    let casted = expr.clone().cast_to(target_type, schema).ok()?;
+    match evaluate_expr_stacked(optimizer, casted) {
+        Ok(folded) => Some(folded),
+        Err(err) => {
+            log::trace!(
+                "Can't fold DATE operand {} to {}: {}",
+                expr,
+                target_type,
+                err
+            );
+            None
+        }
+    }
+}
+
+/// Folds a `DATE` operand to a millisecond timestamp when the target is a nanosecond one, which
+/// can't hold dates past 2262-04-11 such as `9999-12-31`. Staying a `TIMESTAMP` keeps the bound a
+/// member filter and renders it as a timestamp literal, which strict dialects require.
+fn fold_date_to_millis(
+    optimizer: &PlanNormalize,
+    expr: &Expr,
+    target_type: &DataType,
+    schema: &DFSchema,
+) -> Option<Expr> {
+    let DataType::Timestamp(TimeUnit::Nanosecond, tz) = target_type else {
+        return None;
+    };
+    fold_date_to_timestamp(
+        optimizer,
+        expr,
+        &DataType::Timestamp(TimeUnit::Millisecond, tz.clone()),
+        schema,
+    )
 }
 
 /// Checks if the expression is `DATE +/- INTERVAL` arithmetic, possibly offset by more
@@ -1532,9 +1619,13 @@ fn cast_string_literal_expr(
             TimeUnit::Microsecond => {
                 ScalarValue::TimestampMicrosecond(Some(parsed.timestamp_micros()), tz.clone())
             }
-            TimeUnit::Nanosecond => {
-                ScalarValue::TimestampNanosecond(Some(parsed.timestamp_nanos_opt()?), tz.clone())
-            }
+            TimeUnit::Nanosecond => match parsed.timestamp_nanos_opt() {
+                Some(nanos) => ScalarValue::TimestampNanosecond(Some(nanos), tz.clone()),
+                // Past 2262-04-11: millisecond timestamp, see `fold_date_to_millis`.
+                None => {
+                    ScalarValue::TimestampMillisecond(Some(parsed.timestamp_millis()), tz.clone())
+                }
+            },
         };
         return Some(Box::new(Expr::Literal(scalar)));
     }
@@ -1622,11 +1713,19 @@ fn in_list_expr_normalize(
             }
 
             let list_expr_type = list_expr_normalized.get_type(schema)?;
-            if !matches!(list_expr_type, DataType::Date32) {
+            if !matches!(list_expr_type, DataType::Date32)
+                || holds_timestamp_stand_in(&list_expr_normalized)
+            {
                 return Ok(list_expr_normalized);
             }
 
-            evaluate_expr_stacked(optimizer, list_expr_normalized.cast_to(&expr_type, schema)?)
+            Ok(
+                fold_date_to_timestamp(optimizer, &list_expr_normalized, &expr_type, schema)
+                    .or_else(|| {
+                        fold_date_to_millis(optimizer, &list_expr_normalized, &expr_type, schema)
+                    })
+                    .unwrap_or(list_expr_normalized),
+            )
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -1682,12 +1781,36 @@ fn between_expr_normalize(
         if !bound_is_temporal || (bound_type == expr_type && !bound_is_computed) {
             return Ok(Box::new(bound));
         }
+        // `current_timestamp` and `localtimestamp` are stand-ins the rewrite
+        // replaces, which constant folding must not run; a bound holding one
+        // keeps its cast unfolded, as a comparison operand does
+        if holds_timestamp_stand_in(&bound) {
+            return Ok(Box::new(Expr::Cast {
+                expr: Box::new(bound),
+                data_type: expr_type.clone(),
+            }));
+        }
 
         let casted = Expr::Cast {
-            expr: Box::new(bound),
+            expr: Box::new(bound.clone()),
             data_type: expr_type.clone(),
         };
-        Ok(Box::new(evaluate_expr_stacked(optimizer, casted)?))
+        Ok(Box::new(match evaluate_expr_stacked(optimizer, casted) {
+            Ok(folded) => folded,
+            // A computed bound keeps its explicit cast for strict dialects; a plain bound falls
+            // back to a millisecond timestamp, see `fold_date_to_millis`.
+            Err(err) if bound_is_computed => {
+                log::trace!("Keeping BETWEEN bound {} unfolded: {}", bound, err);
+                Expr::Cast {
+                    expr: Box::new(bound),
+                    data_type: expr_type.clone(),
+                }
+            }
+            Err(err) => {
+                log::trace!("Can't fold BETWEEN bound {}: {}", bound, err);
+                fold_date_to_millis(optimizer, &bound, &expr_type, schema).unwrap_or(bound)
+            }
+        }))
     };
 
     let low = normalize_bound(low)?;
@@ -1699,6 +1822,31 @@ fn between_expr_normalize(
         low,
         high,
     }))
+}
+
+/// Whether the expression holds `current_timestamp` or `localtimestamp`, the
+/// stand-ins whose body panics, anywhere in it.
+fn holds_timestamp_stand_in(expr: &Expr) -> bool {
+    struct Finder(bool);
+
+    impl ExpressionVisitor for Finder {
+        fn pre_visit(mut self, expr: &Expr) -> Result<Recursion<Self>> {
+            let is_stand_in = matches!(
+                expr,
+                Expr::ScalarUDF { fun, .. }
+                    if CURRENT_TIMESTAMP_STAND_INS.contains(&fun.name.as_str())
+            );
+            if is_stand_in {
+                self.0 = true;
+                return Ok(Recursion::Stop(self));
+            }
+            Ok(Recursion::Continue(self))
+        }
+    }
+
+    expr.accept(Finder(false))
+        .map(|found| found.0)
+        .unwrap_or(true)
 }
 
 fn evaluate_expr_stacked(optimizer: &PlanNormalize, expr: Expr) -> Result<Expr> {

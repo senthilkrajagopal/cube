@@ -68,6 +68,8 @@ interface ApiGatewayOptions {
   requestLoggerMiddleware?: RequestLoggerMiddlewareFn;
   queryRewrite?: QueryRewriteFn;
   subscriptionStore?: any;
+  /** Resolved by server-core from CreateOptions.devServer; defaults to CUBEJS_DEV_MODE */
+  devServer?: boolean;
   enforceSecurityChecks?: boolean;
   playgroundAuthSecret?: string;
   /** Rotation window: any listed secret verifies. Takes precedence over `apiSecret`. */
@@ -80,7 +82,7 @@ interface ApiGatewayOptions {
   event?: (name: string, props?: object) => void;
 }
 
-export {
+export type {
   UserBackgroundContext,
   ScheduledRefreshContextsFn,
   ApiGatewayOptions,

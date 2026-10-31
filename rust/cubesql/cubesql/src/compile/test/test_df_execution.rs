@@ -141,6 +141,38 @@ SELECT
     );
 }
 
+/// With too few values, sample variance and standard deviation are NULL and population ones
+/// are 0. See https://www.postgresql.org/docs/current/functions-aggregate.html
+#[tokio::test]
+async fn test_variance_too_few_values() {
+    init_testing_logger();
+
+    // language=PostgreSQL
+    let query = r#"
+SELECT
+    n,
+    VAR_SAMP(v) AS var_samp,
+    VAR_POP(v) AS var_pop,
+    STDDEV_SAMP(v) AS stddev_samp,
+    STDDEV_POP(v) AS stddev_pop
+FROM (
+    SELECT 0 AS n, NULL::float8 AS v
+    UNION ALL SELECT 1, 5.0::float8
+    UNION ALL SELECT 2, 1.0::float8
+    UNION ALL SELECT 2, 3.0::float8
+) t
+GROUP BY n
+ORDER BY n
+;
+        "#;
+
+    insta::assert_snapshot!(
+        execute_query(query.to_string(), DatabaseProtocol::PostgreSQL)
+            .await
+            .unwrap()
+    );
+}
+
 #[tokio::test]
 async fn test_date_part_interval() {
     init_testing_logger();
@@ -304,4 +336,58 @@ async fn test_case_with_uncoercible_then_types() {
     .await
     .unwrap_err()
     .to_string());
+}
+
+/// Filters over subqueries of literal SELECTs become column-free after being rewritten
+/// over the literal projection, and must not be lost during filter push down.
+#[tokio::test]
+async fn test_filter_over_literal_subquery() {
+    init_testing_logger();
+
+    let queries = [
+        "SELECT x FROM (SELECT 1 x) t WHERE x = 2",
+        "SELECT x FROM (SELECT 1 x) t WHERE x = 1",
+        "SELECT x FROM (SELECT 1 x) t WHERE x + 0 = 2",
+        "SELECT g FROM (SELECT 'a' g UNION ALL SELECT 'b') t WHERE g = 'b'",
+        "SELECT x FROM (SELECT 1 x UNION SELECT 2) t WHERE x = 2",
+        "SELECT 1 x WHERE 1 = 2",
+        "SELECT x FROM (SELECT 1 x) t WHERE x = NULL",
+        "SELECT x FROM (SELECT 1 x) t WHERE x + NULL = 1",
+    ];
+
+    let mut results = vec![];
+    for query in queries {
+        let result = execute_query(query.to_string(), DatabaseProtocol::PostgreSQL)
+            .await
+            .unwrap();
+        results.push(format!("{query}\n{result}"));
+    }
+    insta::assert_snapshot!(results.join("\n"));
+}
+
+/// Same as above, but the literal projection sits on top of a system table scan,
+/// and column-free predicates are mixed with ones referencing a column.
+#[tokio::test]
+async fn test_filter_over_literal_column_of_table_scan() {
+    init_testing_logger();
+
+    let subquery = "SELECT 'a' AS c, oid FROM pg_catalog.pg_namespace";
+    let predicates = [
+        "c = 'b'",
+        "c = 'b' AND oid > 0",
+        "c = 'a' AND oid > 0",
+        "c = 'a' AND oid < 0",
+        "c = 'b' OR oid < 0",
+        "c = 'b' OR oid > 0",
+    ];
+
+    let mut results = vec![];
+    for predicate in predicates {
+        let query = format!("SELECT c, oid FROM ({subquery}) AS t WHERE {predicate} ORDER BY oid");
+        let result = execute_query(query.clone(), DatabaseProtocol::PostgreSQL)
+            .await
+            .unwrap();
+        results.push(format!("{query}\n{result}"));
+    }
+    insta::assert_snapshot!(results.join("\n"));
 }

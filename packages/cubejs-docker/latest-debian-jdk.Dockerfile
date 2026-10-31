@@ -1,8 +1,10 @@
 # syntax=docker/dockerfile-upstream:master-experimental
-FROM node:24.21.0-trixie-slim AS builder
+FROM node:24.22.1-trixie-slim AS builder
+
+# Use the image's Node headers to avoid concurrent node-gyp downloads and copies.
+ENV npm_config_nodedir=/usr/local
 
 WORKDIR /cube
-COPY . .
 
 RUN yarn policies set-version v1.22.22
 # Yarn v1 uses aggressive timeouts with summing time spending on fs, https://github.com/yarnpkg/yarn/issues/4890
@@ -16,6 +18,8 @@ RUN apt-get update \
     && update-alternatives --install /usr/bin/python python /usr/bin/python3.13 1 \
     && rm -rf /var/lib/apt/lists/*
 
+COPY . .
+
 # We are copying root yarn.lock file to the context folder during the Publish GH
 # action. So, a process will use the root lock file here.
 RUN yarn install --prod \
@@ -24,7 +28,7 @@ RUN yarn install --prod \
     && rm -rf /cube/node_modules/@duckdb/node-bindings-*-musl \
     && yarn cache clean
 
-FROM node:24.21.0-trixie-slim
+FROM node:24.22.1-trixie-slim
 
 ARG IMAGE_VERSION=unknown
 

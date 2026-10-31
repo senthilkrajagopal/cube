@@ -9,10 +9,13 @@ import {
   Folder,
   FolderInclude,
   FolderMember,
+  GranularityDefinition,
   HierarchyDefinition,
   JoinDefinition,
   PreAggregationDefinition,
   PreAggregationDefinitionRollup,
+  type SqlDefinition,
+  type SqlFn,
   type ToString,
   ViewDefaultValueFilter,
   ViewIncludedMember
@@ -22,6 +25,7 @@ import { BaseQuery, PreAggregationDefinitionExtended } from '../adapter';
 import type { CubeValidator } from './CubeValidator';
 import type { ErrorReporter } from './ErrorReporter';
 import { FinishedJoinTree } from './JoinGraph';
+import { internStringsDeep } from './StringInterning';
 
 export type SegmentDefinition = {
   type: string;
@@ -31,6 +35,7 @@ export type SegmentDefinition = {
   fieldType?: string;
   // TODO should we have it here?
   multiStage?: boolean;
+  aliasMember?: string;
 };
 
 export type MultiStageFilterIncludeMember = {
@@ -81,6 +86,7 @@ export type DimensionDefinition = {
   sql(): string;
   primaryKey?: true;
   ownedByCube: boolean;
+  included?: boolean;
   fieldType?: string;
   multiStage?: boolean;
   shiftInterval?: string;
@@ -91,6 +97,9 @@ export type DimensionDefinition = {
   addGroupByReferences?: string[];
   filter?: MultiStageFilterDirective;
   links?: LinkDefinition[];
+  granularities?: Record<string, GranularityDefinition>;
+  propagateFiltersToSubQuery?: boolean;
+  aliasMember?: string;
 };
 
 export type TimeShiftDefinition = {
@@ -107,12 +116,39 @@ export type TimeShiftDefinitionReference = {
   type?: 'next' | 'prior';
 };
 
+/**
+ * A `fixed` rolling window, the default when `type` is omitted. `trailing`
+ * and `leading` are intervals or `unbounded`.
+ */
+export type FixedRollingWindow = {
+  type?: 'fixed';
+  trailing?: string;
+  leading?: string;
+  offset?: 'start' | 'end';
+};
+
+export type ToDateRollingWindow = {
+  type: 'to_date';
+  granularity: string;
+};
+
+/**
+ * @deprecated Use `to_date` with a `granularity`.
+ */
+export type LegacyToDateRollingWindow =
+  | { type: 'year_to_date' }
+  | { type: 'quarter_to_date' }
+  | { type: 'month_to_date' };
+
+export type RollingWindow = FixedRollingWindow | ToDateRollingWindow | LegacyToDateRollingWindow;
+
 export type MeasureDefinition = {
   type: string;
   aggType?: string,
   sql(): string;
   ownedByCube: boolean;
-  rollingWindow?: any
+  included?: boolean;
+  rollingWindow?: RollingWindow;
   filters?: any
   filter?: MultiStageFilterDirective;
   primaryKey?: true;
@@ -127,6 +163,49 @@ export type MeasureDefinition = {
   reduceByReferences?: string[];
   addGroupByReferences?: string[];
   timeShiftReferences?: TimeShiftDefinitionReference[];
+  patchedFrom?: { cubeName: string; name: string };
+  aliasMember?: string;
+};
+
+export type CaseLabel = string | SqlDefinition;
+
+/**
+ * A member `case`, both forms flattened: `when`/`label` items, or a `switch`
+ * with `when`/`value` items and an `else.sql`.
+ */
+export type MemberCaseDefinition = {
+  switch?: SqlFn;
+  when: Array<{ sql: SqlFn; label?: CaseLabel; value?: string }>;
+  else?: { label?: CaseLabel; sql?: SqlFn };
+};
+
+export type MemberMask = SqlDefinition | number | boolean | string;
+
+export type MemberOrderBy = {
+  sql: SqlFn;
+  dir?: 'asc' | 'desc';
+};
+
+/**
+ * Fields BaseQuery reads off a member definition. `type` and `sql` are typed required,
+ * though segments have no `type` and count measures / case, geo, switch dimensions no `sql`.
+ */
+export type MemberSymbolDefinition = {
+  type: string;
+  aggType?: string;
+  sql: SqlFn;
+  case?: MemberCaseDefinition;
+  mask?: MemberMask;
+  subQuery?: boolean;
+  latitude?: SqlDefinition;
+  longitude?: SqlDefinition;
+  orderBy?: MemberOrderBy[];
+  filters?: SqlDefinition[];
+  multiStage?: boolean;
+  primaryKey?: boolean;
+  ownedByCube?: boolean;
+  shiftInterval?: string;
+  aliasMember?: string;
   patchedFrom?: { cubeName: string; name: string };
 };
 
@@ -201,6 +280,48 @@ export type EvaluatedCube = {
   includedMembers?: ViewIncludedMember[];
   defaultFilters?: ViewDefaultValueFilter[];
   refreshKey?: CubeRefreshKey;
+  joinMap?: string[][];
+  rewriteQueries?: boolean;
+  sqlAlias?: string;
+};
+
+/**
+ * A member path resolved through its joins. An aliased join, or any join below
+ * one, reaches a cube instance of its own: `orders.customer.city` is `users.city`.
+ */
+export type ResolvedMemberPath = {
+  // The path as written, without a granularity.
+  fullPath: string,
+  // The cube instance the member belongs to: `orders.customer`, or a cube name.
+  instancePath: string,
+  targetCube: string,
+  member: string,
+  // The member in the data model: `users.city`.
+  targetPath: string,
+  granularity?: string,
+  // Whether the member belongs to a joined cube instance.
+  aliased: boolean,
+};
+
+const INTERNED_CUBE_COLLECTIONS = ['measures', 'dimensions', 'segments', 'hierarchies', 'preAggregations', 'joins'] as const;
+
+// Deliberately broad: any date-filter value that isn't an absolute date is
+// treated as relative, so a form Tesseract learns later is still recompiled.
+const DATE_OPERATORS = ['inDateRange', 'notInDateRange', 'beforeDate', 'beforeOrOnDate', 'afterDate', 'afterOrOnDate', 'onTheDate'];
+// The forms Tesseract parses: a date, or a date and time with seconds and an
+// optional `Z` / `±HH:MM` offset.
+const ABSOLUTE_DATE = /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?)?$/;
+
+const hasRelativeDateValue = (item: any): boolean => {
+  if (!item) {
+    return false;
+  }
+  const group = item.or || item.and;
+  if (group) {
+    return group.some(hasRelativeDateValue);
+  }
+  return DATE_OPERATORS.includes(item.operator) && Array.isArray(item.values) &&
+    item.values.some((value: unknown) => typeof value === 'string' && !ABSOLUTE_DATE.test(value.trim()));
 };
 
 export class CubeEvaluator extends CubeSymbols {
@@ -208,17 +329,25 @@ export class CubeEvaluator extends CubeSymbols {
 
   public primaryKeys: Record<string, string[]> = {};
 
-  public byFileName: Record<string, CubeDefinitionExtended[]> = {};
+  public byFileName: Partial<Record<string, CubeDefinitionExtended[]>> = {};
 
   private isRbacEnabledCache: boolean | null = null;
 
+  /**
+   * Cubes with a multi-stage `filter.include` on a relative date range. Their
+   * SQL depends on the current time.
+   */
+  public relativeDateFilterCubes: Set<string> = new Set();
+
   public constructor(
-    protected readonly cubeValidator: CubeValidator
+    protected readonly cubeValidator: CubeValidator,
+    protected readonly options: { internStrings?: boolean } = {},
   ) {
     super(true);
   }
 
   public compile(cubes: any[], errorReporter: ErrorReporter) {
+    this.relativeDateFilterCubes = new Set();
     super.compile(cubes, errorReporter);
     const validCubes = this.cubeList.filter(cube => this.cubeValidator.isCubeValid(cube)).sort((a, b) => {
       if (a.isView) {
@@ -234,6 +363,14 @@ export class CubeEvaluator extends CubeSymbols {
       this.evaluatedCubes[cube.name] = this.prepareCube(cube, errorReporter);
     }
 
+    if (this.options.internStrings) {
+      for (const cube of validCubes) {
+        this.internCubeStrings(cube);
+      }
+      // Member definitions resolved for references, a second copy of the members' strings
+      internStringsDeep(this.symbols);
+    }
+
     this.byFileName = R.groupBy(v => v.fileName || v.name, validCubes);
     this.primaryKeys = R.fromPairs(
       validCubes.map((v) => {
@@ -247,7 +384,17 @@ export class CubeEvaluator extends CubeSymbols {
     );
   }
 
-  protected prepareCube(cube, errorReporter: ErrorReporter): EvaluatedCube {
+  private internCubeStrings(cube: CubeDefinitionExtended) {
+    internStringsDeep(cube);
+
+    // The walk skips accessors: read the memoized member maps here
+    for (const collection of INTERNED_CUBE_COLLECTIONS) {
+      internStringsDeep(cube[collection]);
+    }
+  }
+
+  // Takes a CubeDefinitionExtended and mutates it in place into an EvaluatedCube.
+  protected prepareCube(cube: any, errorReporter: ErrorReporter): EvaluatedCube {
     this.prepareJoins(cube, errorReporter);
     this.preparePreAggregations(cube, errorReporter);
     this.prepareMembers(cube.measures, cube, errorReporter);
@@ -289,8 +436,9 @@ export class CubeEvaluator extends CubeSymbols {
         }
       }
 
+      // A path through a join alias names one instance of the cube it reaches
       const match = lookupPath
-        ? included.find((m) => m.memberPath === lookupPath)
+        ? included.find((m) => m.path === lookupPath) ?? included.find((m) => m.memberPath === lookupPath)
         : included.find((m) => m.name === lookupName);
 
       if (!match) {
@@ -429,7 +577,9 @@ export class CubeEvaluator extends CubeSymbols {
     const fullPath = this.evaluateReferences(null, joinPath, { collectJoinHints: true });
 
     const pathParts = fullPath.split('.');
-    const pathCubeName = pathParts[pathParts.length - 1];
+    // A path through a join alias reaches one instance of the cube it ends at
+    const pathCubeName = this.resolveJoinPathTarget(pathParts);
+    const aliased = this.joinPathBeforeAlias(pathParts).length < pathParts.length;
 
     if (!this.evaluatedCubes[pathCubeName]) {
       errorReporter.error(
@@ -459,10 +609,13 @@ export class CubeEvaluator extends CubeSymbols {
 
     if (cube.includedMembers) {
       return cube.includedMembers.filter((m: ViewIncludedMember) => {
+        if (aliased) {
+          return m.path?.split('.').slice(0, -1).join('.') === fullPath;
+        }
         const memberPathParts = m.memberPath.split('.');
         const memberCubeName = memberPathParts[0];
 
-        return memberCubeName === pathCubeName;
+        return memberCubeName === pathCubeName && m.path === undefined;
       });
     }
 
@@ -471,7 +624,9 @@ export class CubeEvaluator extends CubeSymbols {
 
   private prepareFolders(cube: CubeDefinitionExtended, errorReporter: ErrorReporter): void {
     const folders = cube.rawFolders();
-    if (!folders.length) return;
+    if (!folders.length) {
+      return;
+    }
 
     const seen = new Set<string>();
 
@@ -556,15 +711,41 @@ export class CubeEvaluator extends CubeSymbols {
     }
 
     if (cube.isView && (cube.includedMembers || []).length) {
-      const includedMemberPaths: string[] = R.uniq(cube.includedMembers.map(it => it.memberPath));
+      const includedMemberPaths: string[] = R.uniq(cube.includedMembers.map((it: ViewIncludedMember) => it.memberPath));
       const includedCubeNames: string[] = R.uniq(includedMemberPaths.map(it => it.split('.')[0]));
 
-      // Path to name (which can be prefixed or aliased) map for hierarchy
-      const hierarchyPathToName = cube.includedMembers.filter(it => it.type === 'hierarchies').reduce((acc, it) => ({
-        ...acc,
-        [it.memberPath]: it.name
-      }), {});
-      const includedHierarchyNames = cube.includedMembers.filter(it => it.type === 'hierarchies').map(it => it.memberPath.split('.')[1]);
+      const hierarchyIncludes = cube.includedMembers.filter((it: ViewIncludedMember) => it.type === 'hierarchies');
+      const includedHierarchyNames = hierarchyIncludes.map((it: ViewIncludedMember) => it.memberPath.split('.')[1]);
+      // The instance a member is included through: a cube may be included
+      // once per join alias, and a hierarchy reached through one reads its
+      // levels from that instance or the cubes it joins, never another instance
+      const instanceOf = (member: ViewIncludedMember) => member.path?.split('.').slice(0, -1).join('.');
+      const plainMember = (level: string) => cube.includedMembers.find(
+        (m: ViewIncludedMember) => m.memberPath === level && m.path === undefined
+      );
+      const levelMember = (level: string, hierarchyCube: string, instance?: string) => {
+        if (instance === undefined) {
+          return plainMember(level);
+        }
+        // A cube the instance joins without an alias is read through it, but
+        // the hierarchy's own cube is only ever the instance itself
+        const levelCube = level.split('.')[0];
+        const plainlyBelow = (memberInstance: string) => {
+          let current = hierarchyCube;
+          return memberInstance.slice(instance.length + 1).split('.').every(step => {
+            const joined = this.joinsWithoutAlias(current, step);
+            current = step;
+            return joined;
+          });
+        };
+        return cube.includedMembers.find((m: ViewIncludedMember) => {
+          const memberInstance = instanceOf(m);
+          return m.memberPath === level && memberInstance !== undefined && (memberInstance === instance ||
+            (levelCube !== hierarchyCube && memberInstance.startsWith(`${instance}.`) && plainlyBelow(memberInstance)));
+        });
+      };
+
+      const includedHierarchies: any[] = [];
 
       for (const cubeName of includedCubeNames) {
         // As views come after cubes in the list, we can safely assume that cube is already evaluated
@@ -573,54 +754,63 @@ export class CubeEvaluator extends CubeSymbols {
         if (Array.isArray(hierarchies) && hierarchies.length) {
           const filteredHierarchies = hierarchies
             .filter(it => includedHierarchyNames.includes(it.name))
-            .map(it => {
-              const levels = it.levels.filter(level => {
-                const member = cube.includedMembers.find(m => m.memberPath === level);
-                if (member && member.type !== 'dimensions') {
-                  const memberName = level.split('.')[1] || level;
-                  errorReporter.error(`Only dimensions can be part of a hierarchy. Please remove the '${memberName}' member from the '${it.name}' hierarchy.`);
-                } else if (member) {
-                  return includedMemberPaths.includes(level);
-                }
-
-                return null;
-              })
-                .filter(Boolean);
-
+            .flatMap(it => {
               const aliasMember = [cubeName, it.name].join('.');
-
-              const name = hierarchyPathToName[aliasMember];
-              if (!name) {
+              const includes = hierarchyIncludes.filter(
+                (include: ViewIncludedMember) => include.memberPath === aliasMember
+              );
+              if (!includes.length) {
                 throw new UserError(`Hierarchy '${it.name}' not found in cube '${cubeName}'`);
               }
 
-              return {
-                // Title might be overridden in the view
-                title: cube.hierarchies?.[it.name]?.override?.title || it.title,
-                ...it,
-                aliasMember,
-                name,
-                levels
-              };
+              return includes.map((include: ViewIncludedMember) => {
+                const instance = instanceOf(include);
+                const levels = it.levels.filter(level => {
+                  const member = levelMember(level, cubeName, instance);
+                  if (member && member.type !== 'dimensions') {
+                    const memberName = level.split('.')[1] || level;
+                    errorReporter.error(`Only dimensions can be part of a hierarchy. Please remove the '${memberName}' member from the '${it.name}' hierarchy.`);
+                  } else if (member) {
+                    return true;
+                  }
+
+                  return null;
+                })
+                  .filter(Boolean)
+                  .map(level => [cube.name, levelMember(level, cubeName, instance)!.name].join('.'));
+
+                return {
+                  // Title might be overridden in the view
+                  title: cube.hierarchies?.[it.name]?.override?.title || it.title,
+                  ...it,
+                  aliasMember,
+                  name: include.name,
+                  levels
+                };
+              });
             })
             .filter(it => it.levels.length);
 
-          cube.evaluatedHierarchies = [...(cube.evaluatedHierarchies || []), ...filteredHierarchies];
+          includedHierarchies.push(...filteredHierarchies);
         }
       }
 
-      cube.evaluatedHierarchies = (cube.evaluatedHierarchies || []).map((hierarchy) => ({
-        ...hierarchy,
-        levels: hierarchy.levels.map((level) => {
-          const member = cube.includedMembers.find(m => m.memberPath === level);
+      cube.evaluatedHierarchies = [
+        ...(cube.evaluatedHierarchies || []).map((hierarchy: EvaluatedHierarchy) => ({
+          ...hierarchy,
+          levels: hierarchy.levels.map((level) => {
+            const member = plainMember(level) ??
+              cube.includedMembers.find((m: ViewIncludedMember) => m.memberPath === level);
 
-          if (!member) {
-            return null;
-          }
+            if (!member) {
+              return null;
+            }
 
-          return [cube.name, member.name].join('.');
-        }).filter(Boolean)
-      }));
+            return [cube.name, member.name].join('.');
+          }).filter(Boolean)
+        })),
+        ...includedHierarchies,
+      ];
     }
   }
 
@@ -663,6 +853,9 @@ export class CubeEvaluator extends CubeSymbols {
           }
           if (typeof filter.keepOnly === 'function') {
             filter.keepOnlyReferences = this.evaluateReferences(cubeName, filter.keepOnly);
+          }
+          if (Array.isArray(filter.include) && filter.include.some(hasRelativeDateValue)) {
+            this.relativeDateFilterCubes.add(cubeName);
           }
           member.filter = filter;
         }
@@ -792,10 +985,12 @@ export class CubeEvaluator extends CubeSymbols {
         if (preAggregation.outputColumnTypes) {
           cube.preAggregations[preAggregationName] = {
             ...preAggregation,
-            outputColumnTypes: preAggregation.outputColumnTypes.map(column => ({
-              ...column,
-              name: this.evaluateReferences(cube.name, column.member, { originalSorting: true }),
-            })),
+            outputColumnTypes: preAggregation.outputColumnTypes.map(
+              (column: { member: () => ToString, type: string }) => ({
+                ...column,
+                name: this.evaluateReferences(cube.name, column.member, { originalSorting: true }),
+              })
+            ),
           };
         }
       }
@@ -815,7 +1010,7 @@ export class CubeEvaluator extends CubeSymbols {
       }
       if (member.sql && !member.subQuery) {
         const funcArgs = this.funcArguments(member.sql);
-        const { cubeReferencesUsed, evaluatedSql, pathReferencesUsed } = this.collectUsedCubeReferences(cube.name, member.sql);
+        const { cubeReferencesUsed, evaluatedSql, pathReferencesUsed, joinAliasUsed } = this.collectUsedCubeReferences(cube.name, member.sql);
         // We won't check for FILTER_PARAMS here as it shouldn't affect ownership, and it should obey the same reference rules.
         // To affect ownership FILTER_PARAMS can be declared as `${FILTER_PARAMS.Foo.bar.filter(`${Foo.bar}`)}`.
         // It isn't owned if there are non {CUBE} references
@@ -824,7 +1019,9 @@ export class CubeEvaluator extends CubeSymbols {
         }
         // Aliases one to one some another member as in case of views
         // Note: Segments do not have type set
-        if (!ownedByCube && !member.filters && (!member.type || CubeSymbols.isCalculatedMeasureType(member.type)) && pathReferencesUsed.length === 1 && this.pathFromArray(pathReferencesUsed[0]) === evaluatedSql) {
+        // A reference through a join alias names a member of a cube instance,
+        // not the member of the cube it instantiates
+        if (!ownedByCube && !joinAliasUsed && !member.filters && (!member.type || CubeSymbols.isCalculatedMeasureType(member.type)) && pathReferencesUsed.length === 1 && this.pathFromArray(pathReferencesUsed[0]) === evaluatedSql) {
           aliasMember = this.pathFromArray(pathReferencesUsed[0]);
         }
         const foreignCubes = cubeReferencesUsed.filter(usedCube => usedCube !== cube.name);
@@ -872,18 +1069,14 @@ export class CubeEvaluator extends CubeSymbols {
     }
   }
 
-  public cubesByFileName(fileName): CubeDefinitionExtended[] {
+  public cubesByFileName(fileName: string): CubeDefinitionExtended[] {
     return this.byFileName[fileName] || [];
   }
 
   public timeDimensionPathsForCube(cube: string): string[] {
-    return R.compose(
-      R.map(dimName => `${cube}.${dimName}`),
-      R.keys,
-      // @ts-ignore
-      R.filter((d: any) => d.type === 'time')
-      // @ts-ignore
-    )(this.evaluatedCubes[cube].dimensions || {});
+    return Object.entries(this.evaluatedCubes[cube].dimensions || {})
+      .filter(([_, d]) => d.type === 'time')
+      .map(([dimName]) => `${cube}.${dimName}`);
   }
 
   public measuresForCube(cube: string): Record<string, MeasureDefinition> {
@@ -929,7 +1122,9 @@ export class CubeEvaluator extends CubeSymbols {
    */
   public preAggregations(filter: PreAggregationFilters): Array<PreAggregationInfo> {
     const { scheduled, dataSources, cubes, preAggregationIds } = filter || {};
-    const idFactory = ({ cube, preAggregationName }) => `${cube}.${preAggregationName}`;
+    const idFactory = ({ cube, preAggregationName }: { cube: string, preAggregationName: string }) => (
+      `${cube}.${preAggregationName}`
+    );
 
     return Object.keys(this.evaluatedCubes)
       .filter((cube) => (
@@ -940,9 +1135,7 @@ export class CubeEvaluator extends CubeSymbols {
         ) && (
           !dataSources ||
           (dataSources && dataSources.length === 0) ||
-          dataSources.includes(
-            this.evaluatedCubes[cube].dataSource || 'default'
-          )
+          dataSources.includes(this.cubeDataSource(cube))
         )
       ))
       .flatMap(cube => {
@@ -967,10 +1160,10 @@ export class CubeEvaluator extends CubeSymbols {
               preAggregationName,
               preAggregation: preAggregations[preAggregationName],
               cube,
-              dataSource: this.evaluatedCubes[cube].dataSource || 'default',
+              dataSource: this.cubeDataSource(cube),
               references: this.evaluatePreAggregationReferences(cube, preAggregations[preAggregationName]),
               refreshKey,
-              indexesReferences: indexes && Object.keys(indexes).reduce((obj, indexName) => {
+              indexesReferences: indexes && Object.keys(indexes).reduce<Record<string, unknown>>((obj, indexName) => {
                 obj[indexName] = {
                   columns: this.evaluateReferences(
                     cube,
@@ -1038,6 +1231,10 @@ export class CubeEvaluator extends CubeSymbols {
     return this.evaluatedCubes[this.cubeNameFromPath(path)];
   }
 
+  public cubeDataSource(path: string): string {
+    return this.cubeFromPath(path).dataSource || 'default';
+  }
+
   public cubeNameFromPath(path: string) {
     const cubeAndName = path.split('.');
     if (!this.evaluatedCubes[cubeAndName[0]]) {
@@ -1102,6 +1299,55 @@ export class CubeEvaluator extends CubeSymbols {
     return path.split('.');
   }
 
+  /**
+   * Resolves a member path the way the SQL planner does, or `null` when it
+   * names no member. A path through no aliased join resolves to the member of
+   * the last cube it names, as `A.B.dim` always has.
+   */
+  public resolveMemberPath(path: string | string[]): ResolvedMemberPath | null {
+    const parts = Array.isArray(path) ? path : path.split('.');
+    if (parts.length < 2 || !this.evaluatedCubes[parts[0]]) {
+      return null;
+    }
+    let instancePath = parts[0];
+    let targetCube = parts[0];
+    let aliased = false;
+
+    for (let i = 1; i < parts.length; i++) {
+      const part = parts[i];
+      const rest = parts.length - i - 1;
+      const cube = this.evaluatedCubes[targetCube];
+      const dimension = cube.dimensions?.[part];
+      const isMember = dimension || cube.measures?.[part] || cube.segments?.[part];
+      if (isMember && (rest === 0 || (rest === 1 && dimension?.type === 'time'))) {
+        return {
+          fullPath: [...parts.slice(0, i), part].join('.'),
+          instancePath,
+          targetCube,
+          member: part,
+          targetPath: `${targetCube}.${part}`,
+          granularity: rest === 1 ? parts[i + 1] : undefined,
+          aliased,
+        };
+      }
+      // Inside an instance the cube's own name means the instance itself
+      if (!aliased || part !== targetCube) {
+        const join = (cube.joins || []).find(j => (j.alias ?? j.name) === part);
+        if (join && (join.alias || aliased)) {
+          instancePath = `${instancePath}.${part}`;
+          targetCube = join.name;
+          aliased = true;
+        } else if (!aliased && this.evaluatedCubes[part]) {
+          instancePath = part;
+          targetCube = part;
+        } else {
+          return null;
+        }
+      }
+    }
+    return null;
+  }
+
   public isRbacEnabledForCube(cube: any): boolean {
     return cube.accessPolicy?.length;
   }
@@ -1126,6 +1372,7 @@ export class CubeEvaluator extends CubeSymbols {
 
     const cubeReferencesUsed: string[] = [];
     const pathReferencesUsed: string[][] = [];
+    let joinAliasUsed = false;
 
     const evaluatedSql = cubeEvaluator.resolveSymbolsCall(sqlFn, (name) => {
       const referencedCube = cubeEvaluator.symbols[name] && name || cube;
@@ -1144,6 +1391,9 @@ export class CubeEvaluator extends CubeSymbols {
     }, {
       // eslint-disable-next-line no-shadow
       sqlResolveFn: (_symbol: unknown, cubeName: string, memberName: string) => {
+        if (cubeEvaluator.resolveSymbolsCallContext?.joinAlias) {
+          joinAliasUsed = true;
+        }
         const path = [cubeName, memberName];
         pathReferencesUsed.push(path);
         return cubeEvaluator.pathFromArray(path);
@@ -1151,7 +1401,7 @@ export class CubeEvaluator extends CubeSymbols {
       contextSymbols: BaseQuery.emptyParametrizedContextSymbols(this, () => '$empty_param$'),
       cubeReferencesUsed,
     });
-    return { cubeReferencesUsed, pathReferencesUsed, evaluatedSql };
+    return { cubeReferencesUsed, pathReferencesUsed, evaluatedSql, joinAliasUsed };
   }
 
   /**
@@ -1191,7 +1441,7 @@ export class CubeEvaluator extends CubeSymbols {
       timeDimensions,
       rollups:
         aggregation.rollupReferences && this.evaluateReferences(cube, aggregation.rollupReferences, { originalSorting: true }) || [],
-      rollupsReferences: [], // May be filled in PreAggregations.evaluateAllReferences()
+      rollupsReferences: [], // Filled on a copy in PreAggregations.evaluatedPreAggregationObj()
     };
   }
 }

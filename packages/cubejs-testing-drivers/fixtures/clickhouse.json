@@ -254,12 +254,21 @@
     "SQL API: Rollup with aliases",
     "SQL API: Simple Rollup",
     "SQL API: SQL push down push to cube quoted alias",
+    "SQL API: EXTRACT DOW from column reference in SQL push down",
 
     "SKIPPED SQL API (due to inconsistency)",
     "---------------------------------------",
     "Below doesn't work probably due to strict type comparison in ClickHouse, but tests run across all DBs",
     "SQL API: Rolling Window YTD (year + month + day + date_trunc equal)",
-    "SQL API: Rolling Window YTD (year + month + day + date_trunc IN)"
+    "SQL API: Rolling Window YTD (year + month + day + date_trunc IN)",
+    "---- Time-shifted measure rolled up from a rollup: native planner, Postgres and BigQuery only ----",
+    "querying RetailOrders: named prior month by category for one day (pre-aggregation in CubeStore)",
+    "querying RetailOrders: named prior month by category over two months (pre-aggregation in CubeStore)",
+    "SQL API: named prior month by category for one day",
+    "---------------------------------------",
+    "Multi-stage results combined over dimensions: verified on Trino only so far",
+    "---------------------------------------",
+    "querying BigECommerce: multi-stage measures combined over dimensions"
   ],
   "tesseractSkip": [
     "---------------------------------------",
@@ -312,6 +321,7 @@
     "SQL API: Rollup with aliases",
     "SQL API: Simple Rollup",
     "SQL API: SQL push down push to cube quoted alias",
+    "SQL API: EXTRACT DOW from column reference in SQL push down",
 
     "SKIPPED SQL API (due to inconsistency)",
     "---------------------------------------",
@@ -327,6 +337,14 @@
 ,
     "---- Calendar-shifted measure stored in a rollup: covered on Postgres only for now ----",
     "querying BigECommerce with Retail Calendar: prior year and month by week (no pre-aggregation)",
-    "querying BigECommerce with Retail Calendar: prior year and month by week (pre-aggregation in CubeStore)"
+    "querying BigECommerce with Retail Calendar: prior year and month by week (pre-aggregation in CubeStore)",
+    "---- Time-shifted measure rolled up from a rollup: native planner, Postgres and BigQuery only ----",
+    "querying RetailOrders: named prior month by category for one day (pre-aggregation in CubeStore)",
+    "querying RetailOrders: named prior month by category over two months (pre-aggregation in CubeStore)",
+    "SQL API: named prior month by category for one day",
+    "---------------------------------------",
+    "Multi-stage results combined over dimensions: verified on Trino only so far",
+    "---------------------------------------",
+    "querying BigECommerce: multi-stage measures combined over dimensions"
   ]
 }

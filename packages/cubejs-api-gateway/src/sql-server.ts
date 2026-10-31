@@ -5,13 +5,20 @@ import {
   execSql,
   sql4sql,
   rest4sql,
+  getSqlFilters,
+  addSqlFilters,
+  setSqlFilters,
+  deleteSqlFilters,
+  replaceSqlFilters,
   SqlInterfaceInstance,
   Request as NativeRequest,
   LoadRequestMeta,
   Sql4SqlResponse,
   QueryConvertResponse,
+  SqlFilterItem,
+  SqlFiltersResponse,
 } from '@cubejs-backend/native';
-import type { ShutdownMode } from '@cubejs-backend/native';
+import type { ShutdownMode, SqlResponseStream } from '@cubejs-backend/native';
 import { displayCLIWarning, getEnv, CacheMode } from '@cubejs-backend/shared';
 
 import * as crypto from 'crypto';
@@ -31,6 +38,8 @@ export type SQLServerOptions = {
 
 export type SQLServerConstructorOptions = {
   gatewayPort?: number,
+  /** Resolved by the gateway, so the native logger matches the Node one */
+  devServer?: boolean,
 };
 
 export type SqlAuthServiceAuthenticateRequest = {
@@ -43,14 +52,21 @@ export class SQLServer {
 
   protected readonly gatewayPort: number | undefined;
 
+  // The native side can only read CUBEJS_DEV_MODE, and CreateOptions.devServer beats it,
+  // so the resolved value is kept here and handed to registerInterface below. Without it
+  // the SQL API would redact query logs in a process the Node side logs in full
+  protected readonly devServer: boolean;
+
   public constructor(
     protected readonly apiGateway: ApiGateway,
     options: SQLServerConstructorOptions,
   ) {
+    this.devServer = options.devServer ?? getEnv('devMode');
+
     setupLogger(
       ({ event }) => apiGateway.log(event),
       process.env.CUBEJS_LOG_LEVEL === 'trace' ? 'trace' : 'warn',
-      process.env.NODE_ENV === 'production'
+      !this.devServer
     );
 
     // Actually, proxy is enabled in gateway
@@ -76,7 +92,7 @@ export class SQLServer {
     return this.sqlInterfaceInstance;
   }
 
-  public async execSql(sqlQuery: string, stream: any, securityContext?: any, cacheMode?: CacheMode, timezone?: string, throwContinueWait?: boolean, requestId?: string) {
+  public async execSql(sqlQuery: string, stream: SqlResponseStream, securityContext?: any, cacheMode?: CacheMode, timezone?: string, throwContinueWait?: boolean, requestId?: string) {
     await execSql(this.getSqlInterfaceInstance(), sqlQuery, stream, securityContext, cacheMode, timezone, throwContinueWait, requestId);
   }
 
@@ -86,6 +102,26 @@ export class SQLServer {
 
   public async rest4sql(sqlQuery: string, securityContext?: unknown): Promise<QueryConvertResponse> {
     return rest4sql(this.getSqlInterfaceInstance(), sqlQuery, securityContext);
+  }
+
+  public async getSqlFilters(sqlQuery: string, securityContext?: unknown): Promise<SqlFiltersResponse> {
+    return getSqlFilters(this.getSqlInterfaceInstance(), sqlQuery, securityContext);
+  }
+
+  public async addSqlFilters(sqlQuery: string, filters: SqlFilterItem[], securityContext?: unknown): Promise<SqlFiltersResponse> {
+    return addSqlFilters(this.getSqlInterfaceInstance(), sqlQuery, filters, securityContext);
+  }
+
+  public async setSqlFilters(sqlQuery: string, filters: SqlFilterItem[], securityContext?: unknown): Promise<SqlFiltersResponse> {
+    return setSqlFilters(this.getSqlInterfaceInstance(), sqlQuery, filters, securityContext);
+  }
+
+  public async deleteSqlFilters(sqlQuery: string, filters: SqlFilterItem[], securityContext?: unknown): Promise<SqlFiltersResponse> {
+    return deleteSqlFilters(this.getSqlInterfaceInstance(), sqlQuery, filters, securityContext);
+  }
+
+  public async replaceSqlFilters(sqlQuery: string, oldFilters: SqlFilterItem[], newFilters: SqlFilterItem[], securityContext?: unknown): Promise<SqlFiltersResponse> {
+    return replaceSqlFilters(this.getSqlInterfaceInstance(), sqlQuery, oldFilters, newFilters, securityContext);
   }
 
   protected buildCheckSqlAuth(options: SQLServerOptions): CheckSQLAuthFn {
@@ -131,6 +167,7 @@ export class SQLServer {
     this.sqlInterfaceInstance = await registerInterface({
       gatewayPort: this.gatewayPort,
       pgPort: options.pgSqlPort,
+      devServer: this.devServer,
       contextToApiScopes: async ({ securityContext }) => this.apiGateway.contextToApiScopesFn(
         securityContext,
         getEnv('defaultApiScope') || await this.apiGateway.contextToApiScopesDefFn()
@@ -194,7 +231,7 @@ export class SQLServer {
           }
         });
       },
-      sqlApiLoad: async ({ request, session, query, queryKey, sqlQuery, streaming, cacheMode }) => {
+      sqlApiLoad: async ({ request, session, query, queryKey, sqlQuery, external, preAggregations, streaming, cacheMode }) => {
         const context = await contextByRequest(request, session);
 
         // eslint-disable-next-line no-async-promise-executor
@@ -204,6 +241,8 @@ export class SQLServer {
               queryKey,
               query,
               sqlQuery,
+              external,
+              preAggregations,
               streaming,
               cacheMode,
               context,
@@ -226,7 +265,7 @@ export class SQLServer {
           }
         });
       },
-      sql: async ({ request, session, query, memberToAlias, expressionParams }) => {
+      sql: async ({ request, session, query, memberToAlias, expressionParams, disableExternalPreAggregations }) => {
         const context = await contextByRequest(request, session);
 
         // eslint-disable-next-line no-async-promise-executor
@@ -238,7 +277,9 @@ export class SQLServer {
               expressionParams,
               exportAnnotatedSql: true,
               memberExpressions: true,
-              disableExternalPreAggregations: true,
+              // The SQL gets wrapped in the dialect of the data source it runs on, so a
+              // Cube Store rollup can serve it only when cubesql says it can render for Cube Store
+              disableExternalPreAggregations: disableExternalPreAggregations ?? true,
               queryType: 'multi',
               disableLimitEnforcing: true,
               context,
@@ -254,6 +295,32 @@ export class SQLServer {
                 resolve(response);
               },
               apiType: 'sql',
+            });
+          } catch (e) {
+            reject(e);
+          }
+        });
+      },
+      preAggregationMatch: async ({ request, session, queries }) => {
+        const context = await contextByRequest(request, session);
+
+        // eslint-disable-next-line no-async-promise-executor
+        return new Promise(async (resolve, reject) => {
+          try {
+            await this.apiGateway.preAggregationMatch({
+              queries,
+              context,
+              res: (response) => {
+                if ('error' in response) {
+                  reject({
+                    message: response.error
+                  });
+
+                  return;
+                }
+
+                resolve(response);
+              },
             });
           } catch (e) {
             reject(e);
@@ -342,6 +409,8 @@ export class SQLServer {
     let allowedUser: string | null = options.sqlUser || getEnv('sqlUser');
     let allowedPassword: string | null = options.sqlPassword || getEnv('sqlPassword');
 
+    // Deliberately the env var, not the gateway's resolved devServer: `pgSqlPort` keys
+    // the SQL API's default port off the same variable, so the two stay in step
     if (!getEnv('devMode')) {
       if (!allowedUser) {
         allowedUser = 'cube';

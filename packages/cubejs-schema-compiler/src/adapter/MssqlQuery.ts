@@ -2,13 +2,18 @@ import R from 'ramda';
 import moment from 'moment-timezone';
 
 import { getEnv, QueryAlias, parseSqlInterval } from '@cubejs-backend/shared';
-import { BaseQuery } from './BaseQuery';
+import { BaseQuery, type BaseQueryOptions } from './BaseQuery';
+import type { Compilers } from '../compiler/PrepareCompiler';
 import { BaseFilter } from './BaseFilter';
+import type { QueryFilterTreeItem, QueryMember } from './QueryTypes';
+import type { EvaluatedPreAggregationDefinition } from './PreAggregations';
 import { BaseSegment } from './BaseSegment';
+import { BaseMeasure } from './BaseMeasure';
+import { BaseTimeDimension } from './BaseTimeDimension';
 import { ParamAllocator } from './ParamAllocator';
 import { resolveWindowsTimezone } from './windows-iana';
 
-const abbrs = {
+const abbrs: Record<string, string> = {
   EST: 'Eastern Standard Time',
   EDT: 'Eastern Standard Time',
   CST: 'Central Standard Time',
@@ -26,12 +31,12 @@ moment.fn.zoneName = () => {
 };
 
 class MssqlParamAllocator extends ParamAllocator {
-  public paramPlaceHolder(paramIndex) {
+  public paramPlaceHolder(paramIndex: number) {
     return `@_${paramIndex + 1}`;
   }
 }
 
-const GRANULARITY_TO_INTERVAL = {
+const GRANULARITY_TO_INTERVAL: Record<string, (date: string) => string> = {
   day: (date) => `dateadd(day, DATEDIFF(day, 0, ${date}), 0)`,
   week: (date) => `dateadd(week, DATEDIFF(week, 0, ${date}), 0)`,
   hour: (date) => `dateadd(hour, DATEDIFF(hour, 0, ${date}), 0)`,
@@ -44,11 +49,11 @@ const GRANULARITY_TO_INTERVAL = {
 
 class MssqlFilter extends BaseFilter {
   // noinspection JSMethodCanBeStatic
-  public escapeWildcardChars(param) {
+  public escapeWildcardChars(param: unknown) {
     return typeof param === 'string' ? param.replace(/([_%])/gi, '[$1]') : param;
   }
 
-  public likeIgnoreCase(column, not, param, type) {
+  public likeIgnoreCase(column: string, not: boolean, param: unknown, type: string) {
     const p = (!type || type === 'contains' || type === 'ends') ? '%' : '';
     const s = (!type || type === 'contains' || type === 'starts') ? '%' : '';
     return `LOWER(${column})${not ? ' NOT' : ''} LIKE CONCAT('${p}', LOWER(${this.allocateParam(param)}) , '${s}')`;
@@ -74,23 +79,23 @@ class MssqlSegment extends BaseSegment {
 }
 
 export class MssqlQuery extends BaseQuery {
-  private readonly useNamedTimezones: boolean;
+  protected readonly useNamedTimezones: boolean;
 
-  public constructor(compilers: any, options: any) {
+  public constructor(compilers: Compilers, options: BaseQueryOptions) {
     super(compilers, options);
 
     this.useNamedTimezones = getEnv('mssqlUseNamedTimezones', { dataSource: this.dataSource });
   }
 
-  public newFilter(filter) {
+  public newFilter(filter: QueryFilterTreeItem) {
     return new MssqlFilter(this, filter);
   }
 
-  public newSegment(segment): BaseSegment {
+  public newSegment(segment: QueryMember): BaseSegment {
     return new MssqlSegment(this, segment);
   }
 
-  public castToString(sql) {
+  public castToString(sql: string) {
     return `CAST(${sql} as VARCHAR)`;
   }
 
@@ -98,7 +103,7 @@ export class MssqlQuery extends BaseQuery {
     return strings.join(' + ');
   }
 
-  public convertTz(field) {
+  public convertTz(field: string) {
     if (this.useNamedTimezones) {
       const windowsTz = resolveWindowsTimezone(this.timezone);
       return `CAST(${field} AT TIME ZONE 'UTC' AT TIME ZONE '${windowsTz}' AS DATETIME2)`;
@@ -146,7 +151,7 @@ export class MssqlQuery extends BaseQuery {
     )`;
   }
 
-  public newParamAllocator(expressionParams) {
+  public newParamAllocator(expressionParams?: unknown[]) {
     return new MssqlParamAllocator(expressionParams);
   }
 
@@ -222,9 +227,15 @@ export class MssqlQuery extends BaseQuery {
     return dimensionColumns.length ? ` GROUP BY ${dimensionColumns.join(', ')}` : '';
   }
 
-  public overTimeSeriesSelect(cumulativeMeasures, dateSeriesSql, baseQuery, dateJoinConditionSql, baseQueryAlias) {
+  public overTimeSeriesSelect(
+    cumulativeMeasures: BaseMeasure[],
+    dateSeriesSql: string,
+    baseQuery: string,
+    dateJoinConditionSql: string,
+    baseQueryAlias: string
+  ) {
     // Group by time dimensions
-    const timeDimensionsColumns = this.timeDimensions.map(
+    const timeDimensionsColumns: (string | null)[] = this.timeDimensions.map(
       (t) => `${t.dateSeriesAliasName()}.${this.escapeColumnName('date_from')}`
     );
 
@@ -253,16 +264,16 @@ export class MssqlQuery extends BaseQuery {
     return `DATEDIFF(SECOND,'1970-01-01', GETUTCDATE())`;
   }
 
-  public preAggregationLoadSql(cube, preAggregation, tableName) {
+  public preAggregationLoadSql(cube: string, preAggregation: EvaluatedPreAggregationDefinition, tableName: string) {
     const sqlAndParams = this.preAggregationSql(cube, preAggregation);
     return [`SELECT * INTO ${tableName} FROM (${sqlAndParams[0]}) AS PreAggregation`, sqlAndParams[1]];
   }
 
-  public wrapSegmentForDimensionSelect(sql) {
+  public wrapSegmentForDimensionSelect(sql: string) {
     return `CAST((CASE WHEN ${sql} THEN 1 ELSE 0 END) AS BIT)`;
   }
 
-  public seriesSql(timeDimension) {
+  public seriesSql(timeDimension: BaseTimeDimension) {
     const values = timeDimension.timeSeries().map(([from, to]) => `('${from}', '${to}')`);
     return `SELECT ${this.dateTimeCast('date_from')} date_from, ${this.dateTimeCast(
       'date_to'
@@ -293,9 +304,17 @@ export class MssqlQuery extends BaseQuery {
 
   public sqlTemplates() {
     const templates = super.sqlTemplates();
+    // INT tokens truncate float division. DECIMAL keeps fractional arithmetic and
+    // INT's ten whole digits, avoiding ROUND overflow from minimally sized decimals.
+    // Larger literals already infer NUMERIC; keep their precision and scale unchanged.
+    templates.expressions.float_literal = '{% if is_int32 %}CAST({{ value }} AS DECIMAL(10, 0)){% else %}{{ value }}{% endif %}';
     templates.functions.LEAST = 'LEAST({{ args_concat }})';
     templates.functions.GREATEST = 'GREATEST({{ args_concat }})';
     templates.functions.UTCTIMESTAMP = 'GETUTCDATE()';
+    templates.functions.STDDEV_SAMP = 'STDEV({{ args_concat }})';
+    templates.functions.STDDEV_POP = 'STDEVP({{ args_concat }})';
+    templates.functions.VAR_SAMP = 'VAR({{ args_concat }})';
+    templates.functions.VAR_POP = 'VARP({{ args_concat }})';
     // MSSQL ROUND requires 2 arguments: ROUND(number, length)
     templates.functions.ROUND = 'ROUND({{ args_concat }}{% if args | length < 2 %}, 0{% endif %})';
     // DATEADD is being rewritten to DATE_ADD
@@ -320,6 +339,12 @@ export class MssqlQuery extends BaseQuery {
     templates.expressions.timestamp_literal = 'CONVERT(DATETIME2, \'{{ value }}\', 127)';
     templates.types.string = 'VARCHAR';
     templates.types.boolean = 'BIT';
+    templates.expressions.true = 'CAST(1 AS BIT)';
+    templates.expressions.false = 'CAST(0 AS BIT)';
+    // SQL API expressions distinguish stored BIT values from SQL predicates.
+    // Keep UNKNOWN when a predicate is projected or used as a scalar operand.
+    templates.expressions.scalar_to_predicate = '({{ expr }} = CAST(1 AS BIT))';
+    templates.expressions.predicate_to_scalar = 'CAST(CASE WHEN {{ expr }} THEN 1 WHEN NOT ({{ expr }}) THEN 0 ELSE NULL END AS BIT)';
     templates.types.integer = 'INT';
     templates.types.float = 'FLOAT(24)';
     templates.types.double = 'FLOAT(53)';
@@ -342,15 +367,15 @@ export class MssqlQuery extends BaseQuery {
       '{% endfor %}' +
       ') AS dates (date_from, date_to)';
     // MSSQL uses recursive CTE for time series generation.
-    // The template body becomes content of `time_series AS (...)` CTE,
-    // so it self-references `time_series` for recursion.
+    // The template body becomes content of the series CTE, so it
+    // self-references that CTE (`series_name`) for recursion.
     templates.statements.generated_time_series_select =
       'SELECT CAST({{ start }} AS DATETIME2) AS date_from,\n' +
       '       DATEADD(MILLISECOND, -1, DATEADD({{ minimal_time_unit }}, 1, CAST({{ start }} AS DATETIME2))) AS date_to\n' +
       'UNION ALL\n' +
       'SELECT DATEADD({{ minimal_time_unit }}, 1, date_from),\n' +
       '       DATEADD(MILLISECOND, -1, DATEADD({{ minimal_time_unit }}, 1, DATEADD({{ minimal_time_unit }}, 1, date_from)))\n' +
-      'FROM time_series\n' +
+      'FROM {{ series_name }}\n' +
       'WHERE DATEADD({{ minimal_time_unit }}, 1, date_from) <= CAST({{ end }} AS DATETIME2)';
 
     templates.statements.generated_time_series_with_cte_range_source =
@@ -362,7 +387,7 @@ export class MssqlQuery extends BaseQuery {
       'SELECT DATEADD({{ minimal_time_unit }}, 1, date_from),\n' +
       '       DATEADD(MILLISECOND, -1, DATEADD({{ minimal_time_unit }}, 1, DATEADD({{ minimal_time_unit }}, 1, date_from))),\n' +
       '       max_date\n' +
-      'FROM time_series\n' +
+      'FROM {{ series_name }}\n' +
       'WHERE DATEADD({{ minimal_time_unit }}, 1, date_from) <= max_date';
 
     // MSSQL uses OFFSET/FETCH instead of LIMIT/OFFSET
@@ -376,8 +401,9 @@ export class MssqlQuery extends BaseQuery {
       '{{ ctes | join(\',\n\') }}\n' +
       '{% endif %}' +
       // T-SQL clause order is SELECT [ALL | DISTINCT] [TOP (expr)], so DISTINCT has to come
-      // first: `SELECT TOP 0 DISTINCT ...` is a syntax error
-      'SELECT {% if distinct %}DISTINCT {% endif %}{% if limit is not none and (not order_by or limit == 0) %}TOP {{ limit }} {% endif %}' +
+      // first: `SELECT TOP 0 DISTINCT ...` is a syntax error. A param limit (a string
+      // placeholder) needs the parenthesized `TOP (@_1)` form.
+      'SELECT {% if distinct %}DISTINCT {% endif %}{% if limit is not none and (not order_by or limit == 0) %}TOP {% if limit is string %}({{ limit }}){% else %}{{ limit }}{% endif %} {% endif %}' +
       '{{ select_concat | map(attribute=\'aliased\') | join(\', \') }} {% if from %}\n' +
       'FROM (\n' +
       '{{ from | indent(2, true) }}\n' +
@@ -389,10 +415,8 @@ export class MssqlQuery extends BaseQuery {
       '{% if group_by %}\nGROUP BY {{ group_by }}{% endif %}' +
       '{% if having %}\nHAVING {{ having }}{% endif %}' +
       '{% if order_by %}\nORDER BY {{ order_by | map(attribute=\'expr\') | join(\', \') }}' +
-      // FETCH NEXT must be greater than zero in T-SQL, so `LIMIT 0` is rendered as
-      // `TOP 0` above and the OFFSET/FETCH tail is dropped entirely. `limit` is always a
-      // number here (both renderers pass Option<usize>); `limit | int` would not work as a
-      // guard, since `none | int` is 0 and that would drop the 2147483647 fallback below
+      // `limit` may be a param placeholder string, so don't guard with `limit | int`:
+      // `none | int` is 0 and would drop the 2147483647 fallback below
       '{% if limit != 0 %}\nOFFSET {% if offset is not none %}{{ offset }}{% else %}0{% endif %} ROWS' +
       '\nFETCH NEXT {% if limit is not none %}{{ limit }}{% else %}2147483647{% endif %} ROWS ONLY{% endif %}{% endif %}' +
       '{% if ctes %}\nOPTION (MAXRECURSION 0){% endif %}';

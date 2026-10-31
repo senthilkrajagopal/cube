@@ -15,7 +15,7 @@ export const processUidRE = /^[0-9a-f]{8}\b-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-
 export function getCacheHash(queryKey: QueryKey | CacheKey, processUid?: string): QueryKeyHash {
   processUid = processUid || getProcessUid();
   if (typeof queryKey === 'string' && queryKey.length < 256) {
-    return queryKey as any;
+    return queryKey as QueryKeyHash;
   }
 
   if (typeof queryKey === 'object' && 'persistent' in queryKey && queryKey.persistent) {
@@ -23,12 +23,12 @@ export function getCacheHash(queryKey: QueryKey | CacheKey, processUid?: string)
       .createHash('md5')
       .update(JSON.stringify(queryKey))
       .digest('hex')
-    }@${processUid}` as any;
+    }@${processUid}` as QueryKeyHash;
   } else {
     return crypto
       .createHash('md5')
       .update(JSON.stringify(queryKey))
-      .digest('hex') as any;
+      .digest('hex') as QueryKeyHash;
   }
 }
 
@@ -52,7 +52,7 @@ export function evaluateLocalRefreshKey(
   return [{ refresh_key: String(Math.floor((utcOffset + nowMs / 1000 - dayOffset) / interval)) }];
 }
 
-export function isValidLocalRefreshKey(descriptor?: LocalRefreshKeyDescriptor): boolean {
+export function isValidLocalRefreshKey(descriptor?: LocalRefreshKeyDescriptor): descriptor is LocalRefreshKeyDescriptor {
   return !!descriptor &&
     Number.isFinite(descriptor.interval) && descriptor.interval > 0 &&
     Number.isFinite(descriptor.utcOffset) &&

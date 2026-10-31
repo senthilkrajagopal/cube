@@ -328,7 +328,7 @@ impl MockSchemaBuilder {
             segments: HashMap::new(),
             pre_aggregations: Vec::new(),
             granularities: HashMap::new(),
-            joins: HashMap::new(),
+            joins: Vec::new(),
         }
     }
 
@@ -340,7 +340,9 @@ impl MockSchemaBuilder {
             measures: HashMap::new(),
             dimensions: HashMap::new(),
             segments: HashMap::new(),
+            pre_aggregations: Vec::new(),
             default_filters: Vec::new(),
+            granularities: HashMap::new(),
         }
     }
 
@@ -365,7 +367,7 @@ pub struct MockCubeBuilder {
     pre_aggregations: Vec<(String, Rc<MockPreAggregationDescription>)>,
     granularities: HashMap<String, HashMap<String, Rc<MockGranularityDefinition>>>,
     #[allow(dead_code)]
-    joins: HashMap<String, MockJoinItemDefinition>,
+    joins: Vec<MockJoinItemDefinition>,
 }
 
 impl MockCubeBuilder {
@@ -429,8 +431,8 @@ impl MockCubeBuilder {
     }
 
     #[allow(dead_code)]
-    pub fn add_join(mut self, name: impl Into<String>, definition: MockJoinItemDefinition) -> Self {
-        self.joins.insert(name.into(), definition);
+    pub fn add_join(mut self, definition: MockJoinItemDefinition) -> Self {
+        self.joins.push(definition);
         self
     }
 
@@ -469,10 +471,25 @@ pub struct MockViewBuilder {
     measures: HashMap<String, Rc<MockMeasureDefinition>>,
     dimensions: HashMap<String, Rc<MockDimensionDefinition>>,
     segments: HashMap<String, Rc<MockSegmentDefinition>>,
+    pre_aggregations: Vec<(String, Rc<MockPreAggregationDescription>)>,
     default_filters: Vec<MockViewFilterDefinition>,
+    granularities: HashMap<String, HashMap<String, Rc<MockGranularityDefinition>>>,
 }
 
 impl MockViewBuilder {
+    pub fn add_granularity(
+        mut self,
+        dimension_name: &str,
+        granularity_name: &str,
+        definition: MockGranularityDefinition,
+    ) -> Self {
+        self.granularities
+            .entry(dimension_name.to_string())
+            .or_default()
+            .insert(granularity_name.to_string(), Rc::new(definition));
+        self
+    }
+
     pub fn include_cube(mut self, join_path: impl Into<String>, includes: Vec<String>) -> Self {
         self.view_cubes.push(ViewCube {
             join_path: join_path.into(),
@@ -524,21 +541,53 @@ impl MockViewBuilder {
         self
     }
 
+    pub fn add_pre_aggregation(
+        mut self,
+        name: impl Into<String>,
+        definition: MockPreAggregationDescription,
+    ) -> Self {
+        self.pre_aggregations
+            .push((name.into(), Rc::new(definition)));
+        self
+    }
+
     pub fn add_default_filter(mut self, filter: MockViewFilterDefinition) -> Self {
         self.default_filters.push(filter);
         self
+    }
+
+    // The cube a join path ends at, following each step through the joins of
+    // the cube before it, so an aliased step leads to the cube it joins.
+    fn join_path_target(cubes: &HashMap<String, MockCube>, parts: &[&str]) -> Option<String> {
+        let mut current = parts.first()?.to_string();
+        for part in &parts[1..] {
+            current = match cubes
+                .get(&current)
+                .and_then(|cube| cube.definition.get_join(part))
+            {
+                Some(join) => join.static_data().name.clone(),
+                None => part.to_string(),
+            };
+        }
+        Some(current)
     }
 
     pub fn finish_view(mut self) -> MockSchemaBuilder {
         let mut all_dimensions = self.dimensions;
         let mut all_measures = self.measures;
         let mut all_segments = self.segments;
+        let mut all_granularities = self.granularities;
 
         for view_cube in &self.view_cubes {
             let join_path_parts: Vec<&str> = view_cube.join_path.split('.').collect();
             let target_cube_name = join_path_parts.last().unwrap();
+            let source_cube_name =
+                Self::join_path_target(&self.schema_builder.cubes, &join_path_parts);
 
-            if let Some(source_cube) = self.schema_builder.cubes.get(*target_cube_name) {
+            if let Some(source_cube) = source_cube_name
+                .as_ref()
+                .and_then(|name| self.schema_builder.cubes.get(name))
+            {
                 let members_to_include: Vec<String> = if view_cube.includes.is_empty() {
                     let mut all_members = Vec::new();
                     all_members.extend(source_cube.dimensions.keys().cloned());
@@ -570,12 +619,19 @@ impl MockViewBuilder {
                             );
                         }
 
+                        // Like the schema compiler, a view dimension re-exports
+                        // the source's type, mask and granularities only.
+                        if let Some(granularities) = source_cube.granularities.get(member_name) {
+                            all_granularities.insert(view_name.clone(), granularities.clone());
+                        }
                         all_dimensions.insert(
                             view_name,
                             Rc::new(
                                 MockDimensionDefinition::builder()
                                     .dimension_type(dimension.static_data().dimension_type.clone())
                                     .sql(view_member_sql)
+                                    .resolved_mask_sql_opt(dimension.raw_mask_sql())
+                                    .included(Some(true))
                                     .build(),
                             ),
                         );
@@ -613,6 +669,8 @@ impl MockViewBuilder {
                                     .sql(view_member_sql)
                                     .multi_stage(measure.static_data().multi_stage)
                                     .order_by(measure.raw_order_by())
+                                    .resolved_mask_sql_opt(measure.raw_mask_sql())
+                                    .included(Some(true))
                                     .build(),
                             ),
                         );
@@ -685,8 +743,8 @@ impl MockViewBuilder {
             measures: all_measures,
             dimensions: all_dimensions,
             segments: all_segments,
-            pre_aggregations: Vec::new(),
-            granularities: HashMap::new(),
+            pre_aggregations: self.pre_aggregations,
+            granularities: all_granularities,
         };
 
         self.schema_builder.cubes.insert(self.view_name, view_cube);

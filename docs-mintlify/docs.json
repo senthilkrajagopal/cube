@@ -21,6 +21,7 @@
             "pages": [
               "docs/introduction",
               "docs/preferences",
+              "docs/inbox",
               {
                 "group": "Getting Started",
                 "pages": [
@@ -122,11 +123,15 @@
                   },
                   "docs/explore-analyze/dashboards/styling",
                   "docs/explore-analyze/dashboards/dashboards-as-code",
-                  "docs/explore-analyze/dashboards/dashboard-agent"
+                  "docs/explore-analyze/dashboards/dashboard-agent",
+                  "docs/explore-analyze/dashboards/comments",
+                  "docs/explore-analyze/dashboards/reviews"
                 ]
               },
               "docs/explore-analyze/apps",
               "docs/explore-analyze/scheduled-refreshes",
+              "docs/explore-analyze/data-alerts",
+              "docs/explore-analyze/google-sheets-deliveries",
               "docs/explore-analyze/notifications"
             ]
           },
@@ -217,6 +222,7 @@
               "docs/integrations/google-sheets",
               "docs/integrations/snowflake-semantic-views",
               "docs/integrations/databricks-metric-views",
+              "docs/integrations/apache-ossie",
               "docs/integrations/dbt",
               {
                 "group": "Semantic Layer Sync",
@@ -274,6 +280,7 @@
               },
               "admin/connect-to-data/multiple-data-sources",
               "admin/connect-to-data/concurrency",
+              "admin/connect-to-data/query-tracing",
               "admin/connect-to-data/oauth-authentication"
             ]
           },
@@ -678,10 +685,12 @@
                   "recipes/data-modeling/designing-metrics",
                   "recipes/data-modeling/entity-attribute-value",
                   "recipes/data-modeling/dbt",
+                  "recipes/data-modeling/dbt-cli",
                   "recipes/data-modeling/using-dynamic-measures",
                   "recipes/data-modeling/dynamic-union-tables",
                   "recipes/data-modeling/cross-data-source-queries",
                   "recipes/data-modeling/polymorphic-cubes",
+                  "recipes/data-modeling/reusing-view-measures",
                   "recipes/data-modeling/custom-order"
                 ]
               },
@@ -893,6 +902,18 @@
                 ]
               },
               {
+                "group": "Snowflake Semantic View Sync",
+                "openapi": "/api-reference/api.yaml",
+                "pages": [
+                  "POST /api/v1/deployments/{deploymentId}/snowflake-semantic-view-pulls",
+                  "GET /api/v1/deployments/{deploymentId}/snowflake-semantic-view-pulls/{syncJobId}",
+                  "GET /api/v1/deployments/{deploymentId}/snowflake-semantic-view-pulls/{syncJobId}/result",
+                  "POST /api/v1/deployments/{deploymentId}/snowflake-semantic-view-syncs",
+                  "GET /api/v1/deployments/{deploymentId}/snowflake-semantic-view-syncs/{syncJobId}",
+                  "GET /api/v1/deployments/{deploymentId}/snowflake-semantic-view-syncs/{syncJobId}/result"
+                ]
+              },
+              {
                 "group": "Folders",
                 "openapi": "/api-reference/api.yaml",
                 "pages": [
@@ -915,6 +936,8 @@
                   "DELETE /api/v1/deployments/{deploymentId}/reports/{reportId}",
                   "PUT /api/v1/deployments/{deploymentId}/reports/{reportId}/connect-workbook",
                   "DELETE /api/v1/deployments/{deploymentId}/reports/{reportId}/connect-workbook",
+                  "GET /api/v1/deployments/{deploymentId}/reports/{reportId}/file",
+                  "PATCH /api/v1/deployments/{deploymentId}/reports/{reportId}/file",
                   "PUT /api/v1/deployments/{deploymentId}/reports/{reportId}/refresh"
                 ]
               },
@@ -937,6 +960,8 @@
                   "DELETE /api/v1/deployments/{deploymentId}/workbooks/{workbookId}",
                   "PUT /api/v1/deployments/{deploymentId}/workbooks/{workbookId}/dashboard",
                   "POST /api/v1/deployments/{deploymentId}/workbooks/{workbookId}/dashboard/ai-widget-thread",
+                  "GET /api/v1/deployments/{deploymentId}/workbooks/{workbookId}/dashboard/file",
+                  "PATCH /api/v1/deployments/{deploymentId}/workbooks/{workbookId}/dashboard/file",
                   "POST /api/v1/deployments/{deploymentId}/workbooks/{workbookId}/duplicate",
                   "POST /api/v1/deployments/{deploymentId}/workbooks/{workbookId}/publish"
                 ]
@@ -976,6 +1001,19 @@
                 ]
               },
               {
+                "group": "Scheduled Tasks",
+                "openapi": "/api-reference/api.yaml",
+                "pages": [
+                  "GET /api/v1/deployments/{deploymentId}/scheduled-tasks",
+                  "POST /api/v1/deployments/{deploymentId}/scheduled-tasks",
+                  "GET /api/v1/deployments/{deploymentId}/scheduled-tasks/{taskId}",
+                  "PUT /api/v1/deployments/{deploymentId}/scheduled-tasks/{taskId}",
+                  "DELETE /api/v1/deployments/{deploymentId}/scheduled-tasks/{taskId}",
+                  "POST /api/v1/deployments/{deploymentId}/scheduled-tasks/{taskId}/run",
+                  "GET /api/v1/deployments/{deploymentId}/scheduled-tasks/{taskId}/runs"
+                ]
+              },
+              {
                 "group": "Workspace",
                 "openapi": "/api-reference/api.yaml",
                 "pages": [
@@ -984,6 +1022,14 @@
                   "POST /api/v1/deployments/{deploymentId}/workspace/bulk-delete",
                   "POST /api/v1/deployments/{deploymentId}/workspace/bulk-move",
                   "POST /api/v1/deployments/{deploymentId}/workspace/move"
+                ]
+              },
+              {
+                "group": "Agents",
+                "openapi": "/api-reference/api.yaml",
+                "pages": [
+                  "GET /api/v1/deployments/{deploymentId}/agent-defaults",
+                  "GET /api/v1/deployments/{deploymentId}/agent-suggestions"
                 ]
               },
               {
@@ -1000,7 +1046,8 @@
                   "POST /api/v1/users",
                   "POST /api/v1/users/bulk",
                   "PUT /api/v1/users/{id}",
-                  "DELETE /api/v1/users/{id}"
+                  "DELETE /api/v1/users/{id}",
+                  "GET /api/v1/users/{id}/roles"
                 ]
               },
               {
@@ -1011,6 +1058,20 @@
                   "POST /api/v1/api-keys",
                   "GET /api/v1/api-keys/{id}",
                   "DELETE /api/v1/api-keys/{id}"
+                ]
+              },
+              {
+                "group": "Roles",
+                "openapi": "/api-reference/api.yaml",
+                "pages": [
+                  "GET /api/v1/roles",
+                  "POST /api/v1/roles",
+                  "GET /api/v1/roles/{roleId}",
+                  "PUT /api/v1/roles/{roleId}",
+                  "DELETE /api/v1/roles/{roleId}",
+                  "GET /api/v1/roles/{roleId}/users",
+                  "PUT /api/v1/roles/{roleId}/users/{userId}",
+                  "DELETE /api/v1/roles/{roleId}/users/{userId}"
                 ]
               },
               {
@@ -1138,6 +1199,41 @@
                 ]
               },
               {
+                "group": "Chat History",
+                "openapi": "/api-reference/api.yaml",
+                "pages": [
+                  "GET /api/v1/deployments/{deploymentId}/chat-history/threads",
+                  "GET /api/v1/deployments/{deploymentId}/chat-history/threads/{chatId}"
+                ]
+              },
+              {
+                "group": "Ossie Conversion",
+                "openapi": "/api-reference/api.yaml",
+                "pages": [
+                  "POST /api/v1/deployments/{deploymentId}/ossie-conversions",
+                  "GET /api/v1/deployments/{deploymentId}/ossie-conversions/{conversionId}",
+                  "DELETE /api/v1/deployments/{deploymentId}/ossie-conversions/{conversionId}",
+                  "GET /api/v1/deployments/{deploymentId}/ossie-conversions/{conversionId}/files",
+                  "GET /api/v1/deployments/{deploymentId}/ossie-conversions/{conversionId}/result"
+                ]
+              },
+              {
+                "group": "Report Deliveries",
+                "openapi": "/api-reference/api.yaml",
+                "pages": [
+                  "GET /api/v1/deployments/{deploymentId}/report-deliveries",
+                  "POST /api/v1/deployments/{deploymentId}/report-deliveries",
+                  "GET /api/v1/deployments/{deploymentId}/report-deliveries/{id}",
+                  "PUT /api/v1/deployments/{deploymentId}/report-deliveries/{id}",
+                  "DELETE /api/v1/deployments/{deploymentId}/report-deliveries/{id}",
+                  "POST /api/v1/deployments/{deploymentId}/report-deliveries/{id}/pause",
+                  "POST /api/v1/deployments/{deploymentId}/report-deliveries/{id}/resume",
+                  "GET /api/v1/deployments/{deploymentId}/report-deliveries/{id}/runs",
+                  "POST /api/v1/deployments/{deploymentId}/report-deliveries/{id}/runs",
+                  "GET /api/v1/deployments/{deploymentId}/report-deliveries/{id}/runs/{runId}"
+                ]
+              },
+              {
                 "group": "Users (SCIM)",
                 "openapi": "/api-reference/scim.yaml",
                 "pages": [
@@ -1215,6 +1311,110 @@
     }
   },
   "redirects": [
+    {
+      "source": "/admin/connect-to-data/aws-athena",
+      "destination": "/admin/connect-to-data/data-sources/aws-athena"
+    },
+    {
+      "source": "/admin/connect-to-data/aws-redshift",
+      "destination": "/admin/connect-to-data/data-sources/aws-redshift"
+    },
+    {
+      "source": "/admin/connect-to-data/clickhouse",
+      "destination": "/admin/connect-to-data/data-sources/clickhouse"
+    },
+    {
+      "source": "/admin/connect-to-data/databricks-jdbc",
+      "destination": "/admin/connect-to-data/data-sources/databricks-jdbc"
+    },
+    {
+      "source": "/admin/connect-to-data/druid",
+      "destination": "/admin/connect-to-data/data-sources/druid"
+    },
+    {
+      "source": "/admin/connect-to-data/duckdb",
+      "destination": "/admin/connect-to-data/data-sources/duckdb"
+    },
+    {
+      "source": "/admin/connect-to-data/firebolt",
+      "destination": "/admin/connect-to-data/data-sources/firebolt"
+    },
+    {
+      "source": "/admin/connect-to-data/google-bigquery",
+      "destination": "/admin/connect-to-data/data-sources/google-bigquery"
+    },
+    {
+      "source": "/admin/connect-to-data/hive",
+      "destination": "/admin/connect-to-data/data-sources/hive"
+    },
+    {
+      "source": "/admin/connect-to-data/ksqldb",
+      "destination": "/admin/connect-to-data/data-sources/ksqldb"
+    },
+    {
+      "source": "/admin/connect-to-data/materialize",
+      "destination": "/admin/connect-to-data/data-sources/materialize"
+    },
+    {
+      "source": "/admin/connect-to-data/mongodb",
+      "destination": "/admin/connect-to-data/data-sources/mongodb"
+    },
+    {
+      "source": "/admin/connect-to-data/ms-fabric",
+      "destination": "/admin/connect-to-data/data-sources/ms-fabric"
+    },
+    {
+      "source": "/admin/connect-to-data/ms-sql",
+      "destination": "/admin/connect-to-data/data-sources/ms-sql"
+    },
+    {
+      "source": "/admin/connect-to-data/mysql",
+      "destination": "/admin/connect-to-data/data-sources/mysql"
+    },
+    {
+      "source": "/admin/connect-to-data/oracle",
+      "destination": "/admin/connect-to-data/data-sources/oracle"
+    },
+    {
+      "source": "/admin/connect-to-data/pinot",
+      "destination": "/admin/connect-to-data/data-sources/pinot"
+    },
+    {
+      "source": "/admin/connect-to-data/postgres",
+      "destination": "/admin/connect-to-data/data-sources/postgres"
+    },
+    {
+      "source": "/admin/connect-to-data/presto",
+      "destination": "/admin/connect-to-data/data-sources/presto"
+    },
+    {
+      "source": "/admin/connect-to-data/questdb",
+      "destination": "/admin/connect-to-data/data-sources/questdb"
+    },
+    {
+      "source": "/admin/connect-to-data/risingwave",
+      "destination": "/admin/connect-to-data/data-sources/risingwave"
+    },
+    {
+      "source": "/admin/connect-to-data/singlestore",
+      "destination": "/admin/connect-to-data/data-sources/singlestore"
+    },
+    {
+      "source": "/admin/connect-to-data/snowflake",
+      "destination": "/admin/connect-to-data/data-sources/snowflake"
+    },
+    {
+      "source": "/admin/connect-to-data/sqlite",
+      "destination": "/admin/connect-to-data/data-sources/sqlite"
+    },
+    {
+      "source": "/admin/connect-to-data/trino",
+      "destination": "/admin/connect-to-data/data-sources/trino"
+    },
+    {
+      "source": "/admin/connect-to-data/vertica",
+      "destination": "/admin/connect-to-data/data-sources/vertica"
+    },
     {
       "source": "/docs/workspace/saved-reports",
       "destination": "/docs/explore-analyze/explore#saving-explorations"
@@ -1370,6 +1570,42 @@
     {
       "source": "/api-reference/workbooks/update-published-dashboard-ai-widget-thread",
       "destination": "/api-reference/workbooks/update-workbook-dashboard"
+    },
+    {
+      "source": "/api-reference/env-variables/get-env-variables",
+      "destination": "/api-reference/env-variables/list-environment-variables%2C-including-the-database-connection-settings"
+    },
+    {
+      "source": "/api-reference/env-variables/set-env-variables",
+      "destination": "/api-reference/env-variables/set-environment-variables%2C-including-connecting-or-changing-a-database"
+    },
+    {
+      "source": "/admin/connect-to-data/hive-sparksql",
+      "destination": "/admin/connect-to-data/data-sources/hive"
+    },
+    {
+      "source": "/admin/connect-to-data/mssql",
+      "destination": "/admin/connect-to-data/data-sources/ms-sql"
+    },
+    {
+      "source": "/admin/connect-to-data/prestodb",
+      "destination": "/admin/connect-to-data/data-sources/presto"
+    },
+    {
+      "source": "/docs/data-modeling/concepts/working-with-joins",
+      "destination": "/docs/data-modeling/joins"
+    },
+    {
+      "source": "/docs/data-modeling/concepts/code-reusability-extending-cubes",
+      "destination": "/docs/data-modeling/extending-cubes"
+    },
+    {
+      "source": "/docs/product/data-modeling/reference/context-variables",
+      "destination": "/reference/data-modeling/context-variables"
+    },
+    {
+      "source": "/recipes/data-modeling/non-additivity",
+      "destination": "/recipes/pre-aggregations/non-additivity"
     }
   ]
 }

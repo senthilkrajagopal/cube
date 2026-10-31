@@ -28,8 +28,9 @@ Model Context Protocol (MCP) is an open standard that enables AI assistants to s
 Cube hosts an MCP server endpoint. MCP clients connect over HTTPS and authenticate via OAuth.
 
 - **Endpoint:** `https://cubecloud.dev/mcp`
-- **OAuth flow:** Authorization Code + PKCE, `client_id` = `cube-mcp-client`, scope = `mcp-agent-access`. Clients discover it automatically from the endpoint — there is nothing to configure by hand.
+- **OAuth flow:** Authorization Code + PKCE, scope = `mcp-agent-access`. Most clients discover OAuth automatically and use the public client ID `cube-mcp-client`. Microsoft 365 Copilot requires a separate [OAuth setup](#connect-to-microsoft-365-copilot).
 - **Account selection:** You sign in to Cube as part of the OAuth flow and, if you belong to more than one account, choose which one to connect.
+- **Stateless:** Cube MCP is stateless and follows the [2026-07-28 MCP specification](https://modelcontextprotocol.io/specification/2026-07-28). Each request carries everything the server needs, so no server-side session has to be kept between requests.
 - **Deployment selection:** On connect, the client lands on the tenant **default deployment** set by your admin (or the first deployment you can access). Clients can also target a specific deployment and agent per request — see [Select a deployment and agent](#select-a-deployment-and-agent).
 
 ### One endpoint for everyone
@@ -55,7 +56,8 @@ client to reach a deployment's region directly without passing through the contr
 
 Before enabling MCP, make sure you have:
 
-- **Admin privileges** in your Cube instance
+- **Admin privileges** in your Cube instance, or a [custom role][ref-custom-roles] with the
+  **Manage MCP server and connectors** permission
 - An active Cube tenant
 
 ### 1) Check the MCP page
@@ -65,6 +67,8 @@ ready-made setup snippets for each supported client. If it reads “MCP configur
 unavailable,” the MCP server host isn’t configured for the account yet.
 
 ### 2) Configure deployment access
+
+This step requires admin privileges; the section is hidden from other users.
 
 Go to **Admin → MCP Server** and use the **Deployment Access** section to control which
 deployments MCP clients can reach and where they connect by default:
@@ -112,6 +116,51 @@ which bundles this server with Cube agent skills.
 <Frame>
   <img src="https://lgo0ecceic.ucarecd.net/68c3e7e2-def2-4aec-84a5-8cded3473def/" />
 </Frame>
+
+## Connect to Microsoft 365 Copilot
+
+<Warning>
+
+Microsoft 365 Copilot setup is currently in preview. Reach out to the
+[Cube support team](/admin/account-billing/support) to activate it for your account.
+
+</Warning>
+
+An admin can get the OAuth client details for the selected MCP endpoint from
+**Admin → MCP Server → Microsoft 365 Copilot setup**.
+
+1. On the MCP Server page, select the [single endpoint or a region-specific
+   endpoint](#one-endpoint-for-everyone), then click **Get OAuth client details**.
+   The credentials and OAuth URLs correspond to the displayed **MCP Endpoint**.
+2. In the [Teams developer portal](https://dev.teams.microsoft.com/), open
+   **Tools → OAuth client registration** and create a registration with these values:
+
+   | Cube Admin | Teams OAuth client registration |
+   | --- | --- |
+   | Client ID, Client secret, Scope | Same-named fields |
+   | Authorization URL | Authorization endpoint |
+   | Token URL | Token endpoint and Refresh endpoint |
+   | MCP Endpoint | Base URL |
+
+   Set **Restrict usage by app** to **Any Teams app** and leave PKCE enabled.
+   [Microsoft warns](https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/plugin-authentication-oauth#use-the-teams-developer-portal)
+   that binding an MCP registration to an existing Teams app ID causes Copilot tool calls
+   to return `404`.
+
+   For **Restrict usage by org**, choose **My organization only** for one Microsoft 365
+   organization or **Any Microsoft 365 organization** for cross-organization use.
+3. Save the registration. In your Microsoft 365 Copilot plugin manifest, set the MCP
+   server `url` to the **MCP Endpoint** you entered as **Base URL**, use `OAuthPluginVault`
+   as the runtime authentication type, and set `reference_id` to the OAuth client
+   registration ID from the portal.
+   Follow [Microsoft's OAuth setup
+   guide](https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/plugin-authentication-oauth)
+   for the remaining plugin configuration.
+
+Cube registers the Teams redirect URI
+`https://teams.microsoft.com/api/platform/v1.0/oAuthRedirect` for this client. The client
+secret is shared by every Cube account and cannot be rotated per account. Access is still
+granted per user: each user signs in to Cube to authorize Copilot.
 
 ## Connect to Cursor
 
@@ -174,14 +223,14 @@ Three tools work together:
 - **`listDeployments`** — discovery. Returns every deployment you can access via MCP
   (already filtered by the admin's deployment-access settings and your permissions) and
   each deployment's agents. Use it to find valid `deploymentId` and `agentId` values
-  before calling `chat`. Every deployment offers an **Auto** agent (`agentId: null`) in
-  addition to any configured agents.
+  before calling `chat`. A deployment offers an **Auto** agent (`agentId: null`) in
+  addition to any configured agents, unless an admin has turned Auto off for it.
 - **`chat`** — accepts two optional selection parameters:
   - **`deploymentId`** — the deployment to use for this request. When omitted, the chat
     uses the deployment from the current session (the default resolved at connect time).
-  - **`agentId`** — the agent to use for this request. When omitted or `null`, the
-    deployment's **Auto** agent is used. Pass a specific `agentId` to route to a
-    configured agent.
+  - **`agentId`** — the agent to use for this request. When omitted, the session's
+    agent is used (see [Pin an agent for the session](#pin-an-agent-for-the-session)).
+    Pass `null` for **Auto**, or a specific `agentId` to route to a configured agent.
 - **`loadQueryResults`** — paginates through the results of a previous query on the same
   deployment context.
 
@@ -197,8 +246,8 @@ A typical client workflow:
   </Step>
   <Step title="Chat">
     Call `chat` with your `input`, optionally passing `deploymentId` and/or `agentId` to
-    target a specific deployment or agent. Omit both to use the session default deployment
-    with its Auto agent.
+    target a specific deployment or agent. Omit both to use the session's deployment
+    and agent.
   </Step>
 </Steps>
 
@@ -206,6 +255,27 @@ Requests are always validated against the admin's deployment-access settings. A 
 that is outside the allow-list — or that you don't have permission to see — is rejected
 with a **403 Forbidden** (`Deployment <id> is not available via MCP for this account`), so
 neither `listDeployments` nor the `chat` selection can reach an excluded deployment.
+
+### Pin an agent for the session
+
+To run every request of a session on one agent, connect with its `agentId`:
+
+```text
+https://cubecloud.dev/mcp?agentId=<agentId>
+```
+
+A client that can't set a query parameter can send the same value as an
+`x-mcp-agent-id` header instead (checked first; `mcp-agent-id` is a lower-priority
+alias). A per-call `agentId` on `chat` still overrides it for that one request. The pinned
+id isn't checked at connect time: an id that doesn't exist on the deployment, or that you
+can't use, makes each `chat` call fail rather than fall back to another agent. An agent
+belongs to one deployment, so a `chat` call whose `deploymentId` targets another deployment
+ignores the pin and uses that deployment's default agent (or Auto) unless it passes its own
+`agentId`.
+
+When the client names no agent, the session uses the deployment's
+[default agent](/admin/ai/multi-agent#default-agent-and-auto) (or Auto). With Auto turned
+off, `agentId: null` runs on the default agent too.
 
 ## Target a dev-mode branch
 
@@ -440,6 +510,11 @@ still need `switchUserBranch` to see the result.
 
 These tools inspect and trigger [pre-aggregation][ref-pre-aggregations] builds. They are
 registered under the same semantic-model permission as the data model tools above.
+`buildPreAggregation` also checks your role on the target deployment at call time: the
+role must allow **Build pre-aggregations** or **Edit deployment** on that deployment
+([deployment permissions][ref-deployment-permissions]), or **Manage deployments
+(account-wide)**. These are the same permissions that allow builds on the
+Pre-Aggregations page. Without one of them, the call fails, even on a dev branch.
 
 | Tool | Description | Access |
 | --- | --- | --- |
@@ -554,6 +629,8 @@ and friends) are set.
 - **`Deployment <id> is not available via MCP for this account` (403)**: The requested deployment is excluded by the deployment-access allow-list or by the user's permissions. Call `listDeployments` to see which deployments are reachable, or adjust the allow-list in **Admin → MCP Server → Deployment Access**.
 
 [ref-roles]: /admin/users-and-permissions/roles-and-permissions
+[ref-custom-roles]: /admin/users-and-permissions/custom-roles#global-permissions
+[ref-deployment-permissions]: /admin/users-and-permissions/custom-roles#deployment-permissions
 [ref-pre-aggregations]: /docs/pre-aggregations/using-pre-aggregations
 [ref-sql-api]: /reference/core-data-apis/sql-api
 [ref-workbooks]: /docs/explore-analyze/workbooks

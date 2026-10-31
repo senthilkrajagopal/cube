@@ -8,7 +8,6 @@ use crate::test_fixtures::cube_bridge::{
 };
 use cubenativeutils::CubeError;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +41,8 @@ struct YamlCube {
 #[derive(Debug, Deserialize)]
 struct YamlJoin {
     name: String,
+    #[serde(default)]
+    alias: Option<String>,
     sql: String,
     relationship: String,
 }
@@ -80,6 +81,12 @@ struct YamlView {
     cubes: Vec<YamlViewCube>,
     #[serde(default)]
     default_filters: Vec<YamlViewDefaultFilter>,
+    #[serde(default)]
+    pre_aggregations: Vec<YamlPreAggregationEntry>,
+    #[serde(default)]
+    dimensions: Vec<YamlDimensionEntry>,
+    #[serde(default)]
+    measures: Vec<YamlMeasureEntry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,14 +120,18 @@ impl YamlSchema {
         let mut builder = MockSchemaBuilder::new();
 
         for cube in self.cubes {
-            let mut joins = HashMap::new();
-            for join in cube.joins {
-                let join_def = MockJoinItemDefinition::builder()
-                    .relationship(join.relationship)
-                    .sql(join.sql)
-                    .build();
-                joins.insert(join.name.clone(), join_def);
-            }
+            let joins = cube
+                .joins
+                .into_iter()
+                .map(|join| {
+                    MockJoinItemDefinition::builder()
+                        .name(join.name)
+                        .alias_opt(join.alias)
+                        .relationship(join.relationship)
+                        .sql(join.sql)
+                        .build()
+                })
+                .collect::<Vec<_>>();
 
             let cube_def = MockCubeDefinition::builder()
                 .name(cube.name.clone())
@@ -172,7 +183,26 @@ impl YamlSchema {
         }
 
         for view in self.views {
+            let view_name = view.name.clone();
             let mut view_builder = builder.add_view(view.name);
+
+            for dim_entry in view.dimensions {
+                let result = dim_entry.definition.build();
+                view_builder =
+                    view_builder.add_dimension(dim_entry.name.clone(), result.definition);
+                for (gran_name, gran_def) in result.granularities {
+                    view_builder =
+                        view_builder.add_granularity(&dim_entry.name, &gran_name, gran_def);
+                }
+            }
+
+            for meas_entry in view.measures {
+                let meas_rc = meas_entry.definition.build_with_cube_name(Some(&view_name));
+                let meas_def = Rc::try_unwrap(meas_rc)
+                    .ok()
+                    .expect("Rc should have single owner");
+                view_builder = view_builder.add_measure(meas_entry.name, meas_def);
+            }
 
             for view_cube in view.cubes {
                 let includes = match view_cube.includes {
@@ -193,6 +223,14 @@ impl YamlSchema {
                     .unless_references(filter.unless)
                     .build();
                 view_builder = view_builder.add_default_filter(mock_filter);
+            }
+
+            for pre_agg_entry in view.pre_aggregations {
+                let pre_agg_rc = pre_agg_entry.definition.build(pre_agg_entry.name.clone());
+                let pre_agg_def = Rc::try_unwrap(pre_agg_rc)
+                    .ok()
+                    .expect("Rc should have single owner");
+                view_builder = view_builder.add_pre_aggregation(pre_agg_entry.name, pre_agg_def);
             }
 
             builder = view_builder.finish_view();
@@ -265,8 +303,42 @@ mod tests {
         let schema = yaml_schema.build().unwrap();
 
         let cube = schema.get_cube("orders").unwrap();
-        assert_eq!(cube.definition.joins().len(), 1);
+        assert_eq!(cube.definition.join_definitions().len(), 1);
         assert!(cube.definition.get_join("users").is_some());
+    }
+
+    #[test]
+    fn test_parse_aliased_joins_to_same_cube() {
+        let yaml = indoc! {r#"
+            cubes:
+              - name: orders
+                sql: "SELECT * FROM orders"
+                joins:
+                  - name: users
+                    alias: customer
+                    sql: "{CUBE}.customer_id = {users.id}"
+                    relationship: many_to_one
+                  - name: users
+                    alias: manager
+                    sql: "{CUBE}.manager_id = {users.id}"
+                    relationship: many_to_one
+                dimensions:
+                  - name: id
+                    type: number
+                    sql: id
+        "#};
+
+        let yaml_schema: YamlSchema = serde_yaml::from_str(yaml).unwrap();
+        let schema = yaml_schema.build().unwrap();
+
+        let cube = schema.get_cube("orders").unwrap();
+        assert_eq!(cube.definition.join_definitions().len(), 2);
+        assert!(cube.definition.get_join("users").is_none());
+        for alias in ["customer", "manager"] {
+            let join = cube.definition.get_join(alias).unwrap().static_data();
+            assert_eq!(join.name, "users");
+            assert_eq!(join.alias.as_deref(), Some(alias));
+        }
     }
 
     #[test]
@@ -744,10 +816,10 @@ mod tests {
         assert!(schema.get_cube("orders_view").is_some());
 
         let orders_cube = schema.get_cube("orders").unwrap();
-        assert_eq!(orders_cube.definition.joins().len(), 1);
+        assert_eq!(orders_cube.definition.join_definitions().len(), 1);
 
         let line_items_cube = schema.get_cube("line_items").unwrap();
-        assert_eq!(line_items_cube.definition.joins().len(), 1);
+        assert_eq!(line_items_cube.definition.join_definitions().len(), 1);
 
         let amount_dim = schema.get_dimension("orders", "amount").unwrap();
         assert_eq!(amount_dim.static_data().sub_query, Some(true));
