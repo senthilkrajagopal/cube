@@ -429,6 +429,39 @@ export class XcubeApiGateway extends ApiGateway {
   }
 
   /**
+   * `DELETE /v1/running-query/:requestId` from any instance on the queue.
+   * Cube looks for the request only in the queues this process has opened,
+   * each opened by its first query to that data source, so an instance that
+   * has served none of the model would answer `[]` and cancel nothing. The
+   * context's queues are opened first: they read the shared queue.
+   */
+  public override async cancelQuery(args: Parameters<ApiGateway['cancelQuery']>[0]) {
+    try {
+      await this.openQueues(args.context);
+    } catch (e: any) {
+      this.log({ type: 'Queues of a cancel not opened', error: (e.stack || e).toString() }, args.context);
+    }
+    return super.cancelQuery(args);
+  }
+
+  /** Opens the query and pre-aggregation queues of each data source a context's orchestrator serves. */
+  protected async openQueues(context: RequestContext) {
+    const declared = getEnv('dataSources');
+    const names = new Set<string>(declared.length ? declared : ['default']);
+    const runtime = this.xcubeRuntime();
+    const model = runtime?.modelOfContext(context);
+    if (runtime && model) {
+      (await runtime.dataSourcesServing(model)).forEach((name) => names.add(name));
+      runtime.overlayConnectionsOf(context, { strict: false })?.connections.forEach((_c, name) => names.add(name));
+    }
+    const orchestrator = (await this.getAdapterApi(context)).getQueryOrchestrator();
+    for (const name of names) {
+      await orchestrator.getQueryCache().getQueue(name);
+      await orchestrator.getPreAggregations().getQueue(name);
+    }
+  }
+
+  /**
    * A model's pre-aggregation build queue in its served epoch: of each data
    * source it is served over, the builds in its rollup schema (a model
    * without connections shares its orchestrator with others), as Cube's

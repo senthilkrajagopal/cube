@@ -103,6 +103,13 @@ In both modes:
   first, for up to `XCUBE_CATCH_UP_MS`, and otherwise answers `503` with
   `Retry-After`. Responses carry `x-xcube-revision: <model>@<revision>` (or
   `disk`) and `x-xcube-generation`.
+- **Cancelling a query.** `DELETE /v1/running-query/{requestId}` finds the
+  request from any instance on the same queue, including one that has
+  served none of the model: xcube opens the context's queues before Cube
+  looks in them. The entry is taken out of the queue at once; a query
+  already running stops at its owner's next heartbeat (8 s) where its
+  driver can cancel it, and runs on in the database otherwise (PostgreSQL's
+  `/v1/load` queries).
 - **Without a model.** A token that names no model is served Cube's own data
   model directory (`schemaPath`), unless `withoutModel: 'refuse'`.
 
@@ -1847,6 +1854,7 @@ that fails when it changes:
 | The environment variable names behind `getEnv` keys xcube sets or reads | `test/unit/cube-contract.test.ts` |
 | The text of Cube's compile errors, which xcube places by file and line | `test/unit/errors.test.ts`, on a live compile |
 | The queue options Cube builds, with xcube's heartbeat | `test/unit/config.test.ts`, through Cube's own `OptsHandler` |
+| A running query's cancel from an instance that hasn't opened its queues | `test/integration/builds.test.ts`, on the memory queue and Cube Store |
 | Each driver's option names: every connection field reaches the driver, and no `CUBEJS_DB_*` or `PG*` value does | `test/image/drivers-env.js`, in the image (CI) |
 | Policies, routing, overlays, connections and refresh, end to end | The integration tests and `test/image/serving.sh` |
 | DuckDB's extensions for the image's platform, and its `allowed_directories` on `s3://` | `test/image/duckdb.sh`, in the image (by hand) |

@@ -34,7 +34,9 @@ const ADMIN_TOKEN = 'admin-token-0123456789abcdef-builds';
 describeWithDatabase('a processing build stopped by the queue\'s cancel', () => {
   const suffix = crypto.randomBytes(4).toString('hex');
   const schema = `xcube_t_${suffix}`;
-  const models = { internal: `inb_${suffix}`, external: `exb_${suffix}`, shared: `shb_${suffix}` };
+  const models = {
+    internal: `inb_${suffix}`, external: `exb_${suffix}`, shared: `shb_${suffix}`, queried: `qrb_${suffix}`, queriedCs: `qcb_${suffix}`,
+  };
   const url = new URL(DATABASE_URL ?? 'postgres://x@localhost/x');
   const environment: Record<string, string> = {
     CUBEJS_DB_TYPE: 'postgres',
@@ -194,6 +196,58 @@ describeWithDatabase('a processing build stopped by the queue\'s cancel', () => 
     }
     return { answer, took, entry, status, gone: (await running()).length === 0 };
   };
+
+  /**
+   * Runs a query that sleeps 30 s through `runner`, cancels it by its
+   * request id through `canceller`, an instance that has served none of its
+   * model, and asks both again: the request is found once, at the first.
+   */
+  const cancelRequest = async (model: string, runner: http.Server, canceller: http.Server) => {
+    const marker = `xcube_cancel_${model}`;
+    const yaml = 'cubes:\n  - name: slow\n'
+      + `    sql: SELECT 1 AS id, '${marker}' AS marker FROM pg_sleep(30)\n`
+      + '    dimensions:\n      - name: id\n        sql: id\n        type: number\n        primary_key: true\n'
+      + '    measures:\n      - name: count\n        type: count\n';
+    const { revision } = (await admin(model, 'put', '/snapshot', {
+      baseRevision: null, folders: [{ id: 'froot', parentId: null }], items: [{ folderId: 'froot', name: 'slow', kind: 'cube', yaml }],
+    }).expect(201)).body;
+    const token = jwt.sign({ wechartModel: model, wechartRevision: revision }, API_SECRET);
+    const requestId = `xcube-cancel-${model}`;
+    const load = request(runner).get('/cubejs-api/v1/load')
+      .query({ query: JSON.stringify({ measures: ['slow.count'] }) })
+      .set('Authorization', token)
+      .set('x-request-id', requestId)
+      .then((res) => res, (e) => e);
+    const running = () => sql(
+      'SELECT pid FROM pg_stat_activity WHERE state = \'active\' AND query LIKE $1 AND query NOT LIKE \'%pg_stat_activity%\'',
+      [`%${marker}%`],
+    );
+    for (let i = 0; i < 100 && !(await running()).length; i++) {
+      await sleep(100);
+    }
+    expect((await running()).length).toBeGreaterThan(0);
+    const cancel = async (at: http.Server) => (await request(at).delete(`/cubejs-api/v1/running-query/${requestId}`)
+      .set('Authorization', token).expect(200)).body.result;
+    const cancelled = await cancel(canceller);
+    const after = { canceller: await cancel(canceller), runner: await cancel(runner) };
+    await load;
+    return { cancelled, after, requestId };
+  };
+
+  test('a running query is cancelled by its request id from an instance that has served none of its model', async () => {
+    const canceller = await start('memory');
+    const { cancelled, after, requestId } = await cancelRequest(models.queried, server, canceller.server);
+    expect(cancelled.map((q: any) => ({ requestId: q.requestId, status: q.status }))).toEqual([{ requestId, status: ['active'] }]);
+    expect(after).toEqual({ canceller: [], runner: [] });
+  });
+
+  (CUBESTORE ? test : test.skip)('on Cube Store\'s queue, a running query is cancelled by its request id from an instance that has served none of its model', async () => {
+    const runner = await start('cubestore');
+    const canceller = await start('cubestore');
+    const { cancelled, after, requestId } = await cancelRequest(models.queriedCs, runner.server, canceller.server);
+    expect(cancelled.map((q: any) => ({ requestId: q.requestId, status: q.status }))).toEqual([{ requestId, status: ['active'] }]);
+    expect(after).toEqual({ canceller: [], runner: [] });
+  });
 
   test('a rollup in the source database: its query cancelled, no table made, failed as stopped', async () => {
     const { answer, took, entry, status, gone } = await stopBuild(models.internal, false);
