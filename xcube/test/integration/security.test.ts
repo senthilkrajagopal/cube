@@ -88,6 +88,91 @@ const viewYaml = `views:
           - region
 `;
 
+// Hierarchies under member-level policies (T2075): one per kind of grant, by group.
+const hierarchies = `    hierarchies:
+      - name: geo
+        levels:
+          - region
+          - id
+`;
+const rankedYaml = cubeYaml('ranked', `${hierarchies}      - name: secret_h
+        public: false
+        levels:
+          - region
+    access_policy:
+      - group: g_a
+        member_level:
+          includes: "*"
+      - group: g_ab
+        member_level:
+          includes: [count, region]
+      - group: g_ac
+        member_level:
+          excludes: [id]
+      - group: sa
+        member_level:
+          excludes: [geo]
+`);
+const namedYaml = cubeYaml('named', `${hierarchies}    access_policy:
+      - group: g_a
+        member_level:
+          includes: [count, region, geo]
+      - group: g_ab
+        member_level:
+          includes: [count, geo]
+      - group: g_ac
+        member_level:
+          includes: [count]
+        member_masking:
+          includes: "*"
+      - group: sa
+`);
+// A view reaching the cube through two join aliases: an instance of its hierarchy for each.
+const dealsYaml = `cubes:
+  - name: deals
+    sql_table: main.orders
+    joins:
+      - name: ranked
+        alias: seller
+        sql: "{CUBE}.id = {ranked}.id"
+        relationship: many_to_one
+      - name: ranked
+        alias: buyer
+        sql: "{CUBE}.id = {ranked}.id"
+        relationship: many_to_one
+    dimensions:
+      - name: id
+        sql: id
+        type: number
+        primary_key: true
+    measures:
+      - name: count
+        type: count
+`;
+const vDealsYaml = `views:
+  - name: v_deals
+    cubes:
+      - join_path: deals
+        includes: [count]
+      - join_path: deals.seller
+        prefix: true
+        includes: [region, id, geo]
+      - join_path: deals.buyer
+        prefix: true
+        includes: [region, geo]
+    access_policy:
+      - group: g_a
+        member_level:
+          includes: "*"
+      - group: g_ab
+        member_level:
+          excludes: [seller_geo, buyer_region, buyer_id]
+      - group: g_ac
+        member_level:
+          excludes: [seller_id]
+      - group: sa
+`;
+
 const FOLDERS = [
   { id: 'froot', parentId: null, allowedGroups: ['g_a', 'g_ab', 'g_ac', 'sa'] },
   { id: 'fa', parentId: 'froot', allowedGroups: ['g_a', 'g_ab', 'g_ac', 'sa'] },
@@ -516,5 +601,50 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
     const after = await admin('get', `/meta?revision=${revision}`).expect(200);
     expect(after.headers['x-xcube-revision']).toBe(`dev@${revision}`);
     expect(after.body.cubes.map((c: any) => c.name)).toContain('late');
+  });
+  test('a hierarchy is shown as its dimensions are, with the levels the context sees (T2075)', async () => {
+    const res = await admin('post', '/changesets', {
+      baseRevision: revision,
+      upserts: [
+        { folderId: 'fa', name: 'ranked', kind: 'cube', yaml: rankedYaml },
+        { folderId: 'fa', name: 'named', kind: 'cube', yaml: namedYaml },
+        { folderId: 'fa', name: 'deals', kind: 'cube', yaml: dealsYaml },
+        { folderId: 'fa', name: 'v_deals', kind: 'view', yaml: vDealsYaml },
+      ],
+    });
+    expect({ status: res.status, body: res.status === 201 ? undefined : res.body }).toEqual({ status: 201, body: undefined });
+    revision = res.body.revision;
+    const shown = async (group: string, cube: string) => {
+      const meta = await request(server).get('/cubejs-api/v1/meta').set('Authorization', userToken([group])).expect(200);
+      const found = meta.body.cubes.find((c: any) => c.name === cube);
+      return Object.fromEntries(found.hierarchies.map((h: any) => [h.name.split('.')[1], [h.public, h.levels]]));
+    };
+    const [region, id] = ['ranked.region', 'ranked.id'];
+    // `includes: '*'` shows it; an author's `public: false` still hides it.
+    expect(await shown('g_a', 'ranked')).toEqual({ geo: [true, [region, id]], secret_h: [false, [region]] });
+    // Includes that don't name it hide it; the levels are still those the context sees.
+    expect(await shown('g_ab', 'ranked')).toEqual({ geo: [false, [region]], secret_h: [false, [region]] });
+    // Excludes that don't name it show it, without the excluded level.
+    expect(await shown('g_ac', 'ranked')).toEqual({ geo: [true, [region]], secret_h: [false, [region]] });
+    expect(await shown('sa', 'ranked')).toEqual({ geo: [false, [region, id]], secret_h: [false, [region]] });
+    // Named, it shows with the levels granted; with none, it is hidden.
+    expect(await shown('g_a', 'named')).toEqual({ geo: [true, ['named.region']] });
+    expect(await shown('g_ab', 'named')).toEqual({ geo: [false, []] });
+    // Masked members are shown, and so is a hierarchy under masking's '*'.
+    expect(await shown('g_ac', 'named')).toEqual({ geo: [true, ['named.region', 'named.id']] });
+    expect(await shown('sa', 'named')).toEqual({ geo: [true, ['named.region', 'named.id']] });
+    // In a view, each join alias's instance on its own. Cube adds an instance's primary
+    // key to the view (buyer_id), and with it a level.
+    const [seller, sellerId] = ['v_deals.seller_region', 'v_deals.seller_id'];
+    const buyer = ['v_deals.buyer_region', 'v_deals.buyer_id'];
+    expect(await shown('g_a', 'v_deals')).toEqual({ seller_geo: [true, [seller, sellerId]], buyer_geo: [true, buyer] });
+    expect(await shown('g_ab', 'v_deals')).toEqual({ seller_geo: [false, [seller, sellerId]], buyer_geo: [false, []] });
+    expect(await shown('g_ac', 'v_deals')).toEqual({ seller_geo: [true, [seller]], buyer_geo: [true, buyer] });
+    expect(await shown('sa', 'v_deals')).toEqual({ seller_geo: [true, [seller, sellerId]], buyer_geo: [true, buyer] });
+    // The field list wechart reads for itself is the model's own.
+    const meta = await admin('get', '/meta').expect(200);
+    const ranked = meta.body.cubes.find((c: any) => c.name === 'ranked');
+    expect(ranked.hierarchies.map((h: any) => [h.name, h.public, h.levels]))
+      .toEqual([['ranked.geo', true, [region, id]], ['ranked.secret_h', false, [region]]]);
   });
 });

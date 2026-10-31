@@ -1,3 +1,5 @@
+import crypto from 'crypto';
+
 import { CompilerApi } from '@cubejs-backend/server-core';
 
 import { folderOf, isGate } from './marker';
@@ -30,6 +32,17 @@ export function passesNoRow(filter: any): boolean {
 function memberOf(filter: any): string | undefined {
   return filter?.member ?? [...(filter?.and ?? []), ...(filter?.or ?? [])]
     .map(memberOf).find((member: string | undefined) => member !== undefined);
+}
+
+/**
+ * Whether policies show a member, as Cube decides for a dimension (CompilerApi,
+ * patchVisibilityByAccessPolicy). A hierarchy is also shown by an `includes` of
+ * `'*'`, which Cube expands to measures, dimensions and segments only.
+ */
+export function policiesShow(policies: any[], member: string, hierarchy = false): boolean {
+  return policies.some((policy) => (!policy.memberLevel && !policy.memberMasking) ||
+    [policy.memberLevel, policy.memberMasking].some((rules) => rules && !rules.excludesMembers.includes(member) &&
+      (rules.includesMembers.includes(member) || (hierarchy && (rules.includes ?? '*') === '*'))));
 }
 
 /** A model's permissions: whether security is on, and each folder's allowed groups. */
@@ -120,6 +133,44 @@ export class FolderGateCompilerApi extends CompilerApi {
     return Array.isArray(values) && values.some((value: unknown) => value !== undefined)
       ? evaluated
       : noRows(filter.memberReference);
+  }
+
+  /**
+   * A hierarchy is shown as its dimensions are: under `includes: '*'`, or one that
+   * names it, and not excluded; an author's `public: false` still hides it. Its
+   * levels are the dimensions the context sees, and with none it is hidden.
+   */
+  protected override async patchVisibilityByAccessPolicy(compilers: any, context: any, cubes: any[]) {
+    const patched = await super.patchVisibilityByAccessPolicy(compilers, context, cubes);
+    const { cubeEvaluator } = compilers;
+    if (!patched.visibilityMaskHash) {
+      return patched;
+    }
+    const shown: Record<string, string[] | false> = {};
+    const patchedCubes = await Promise.all(patched.cubes.map(async (cube: any, i: number) => {
+      const { hierarchies, dimensions } = cubes[i].config;
+      const evaluated = cubeEvaluator.cubeFromPath(cube.config.name);
+      if (!hierarchies?.length || !cubeEvaluator.isRbacEnabledForCube(evaluated)) {
+        return cube;
+      }
+      const policies = await this.getApplicablePolicies(evaluated, context, compilers);
+      const seen = new Set((dimensions ?? []).map((d: any) => d.name).filter((name: string) => policiesShow(policies, name)));
+      return {
+        config: {
+          ...cube.config,
+          hierarchies: cube.config.hierarchies.map((hierarchy: any, j: number) => {
+            const levels = (hierarchy.levels ?? []).filter((level: string) => seen.has(level));
+            const visible = levels.length > 0 && policiesShow(policies, hierarchy.name, true);
+            shown[hierarchy.name] = visible && levels;
+            return { ...hierarchy, levels, public: (hierarchies[j].public ?? true) && visible };
+          }),
+        },
+      };
+    }));
+    // The compiler id a context's meta gets is told apart by what it shows.
+    const visibilityMaskHash = crypto.createHash('sha256').update(patched.visibilityMaskHash)
+      .update(JSON.stringify(shown, Object.keys(shown).sort())).digest('hex');
+    return { cubes: patchedCubes, visibilityMaskHash };
   }
 
   /** A query whose row filter passes no row is denied as Cube denies one: no rows, by `1 = 0`. */

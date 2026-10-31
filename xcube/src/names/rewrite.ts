@@ -38,6 +38,23 @@ export class Scope {
     return parent === def ? undefined : parent;
   }
 
+  /**
+   * The cube a definition, or one it extends, joins under `alias`, as Cube
+   * reads a join path's step (`CubeSymbols.joinAliasTarget`).
+   */
+  public joinAliasTarget(def: ItemDefinition, alias: string): ItemDefinition | undefined {
+    const seen = new Set<string>();
+    for (let current: ItemDefinition | undefined = def; current && !seen.has(current.name);
+      current = this.parentOf(current)) {
+      seen.add(current.name);
+      const join = Array.isArray(current.doc.joins) ? current.doc.joins.find((j: any) => j?.alias === alias) : undefined;
+      if (typeof join?.name === 'string') {
+        return this.resolve(join.name);
+      }
+    }
+    return undefined;
+  }
+
   /** Its members and every inherited one. */
   public membersOf(def: ItemDefinition): Set<string> {
     const members = new Set<string>();
@@ -106,10 +123,17 @@ export function rewriteReferences(def: ItemDefinition, scope: Scope): {
     };
 
     if (mode === 'joinPath') {
+      let current: ItemDefinition | undefined;
       chain.forEach((segment, i) => {
-        const target = bind(segment.text);
-        if (target) {
-          replace(i, target);
+        // A join alias of the cube before it is that join's cube, and no name of the model.
+        const aliased = i > 0 && current ? scope.joinAliasTarget(current, segment.text) : undefined;
+        if (aliased) {
+          current = aliased;
+          return;
+        }
+        current = bind(segment.text);
+        if (current) {
+          replace(i, current);
         } else {
           errors.push({ ...at, kind: 'reference', message: `The join path names "${segment.text}", which is no cube of the model` });
         }

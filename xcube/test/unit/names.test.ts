@@ -126,6 +126,35 @@ describe('publish', () => {
     ]);
   });
 
+  test('a join path step may be a join alias of the cube before it, which names no item', () => {
+    const deals = cube('fsales', 'deals', [
+      '    sql_table: public.deals',
+      '    joins:',
+      '      - name: customers',
+      '        alias: seller',
+      '        sql: "{CUBE}.seller_id = {customers.id}"',
+      '        relationship: many_to_one',
+      '    dimensions:',
+      '      - name: id',
+      '        sql: id',
+      '        type: number',
+      '        primary_key: true',
+      '',
+    ].join('\n'));
+    // Through `extends`, as Cube reads the joins of the cube it extends.
+    const bigDeals = cube('fsales', 'big_deals', '    extends: deals\n');
+    const through = (path: string) => view('feu', 'by_seller', `    cubes:\n      - join_path: ${path}\n        includes: [city]\n`);
+    for (const path of ['deals.seller', 'big_deals.seller']) {
+      const { items, errors } = publish({ tree, current: [], upserts: [customers, deals, bigDeals, through(path)], deletes: [] });
+      expect({ path, errors }).toEqual({ path, errors: [] });
+      expect(doc(byName(items, 'by_seller')).cubes).toEqual([{ join_path: path, includes: ['city'] }]);
+      expect(byName(items, 'by_seller').bindings).toEqual({ [path.split('.')[0]]: path.split('.')[0] });
+    }
+    // An alias the cube before it doesn't declare is no cube.
+    const { errors } = publish({ tree, current: [], upserts: [customers, deals, bigDeals, through('customers.seller')], deletes: [] });
+    expect(errors.map((e) => e.message)).toEqual(['The join path names "seller", which is no cube of the model']);
+  });
+
   test('refuses a name the model doesn\'t hold, and a removal something still refers to, naming no folder', () => {
     const lonely = publish({ tree, current: [], upserts: [orders('fops')], deletes: [] });
     expect(lonely.errors.map((e) => e.message)).toEqual(['The join to "customers" names no cube of the model']);
