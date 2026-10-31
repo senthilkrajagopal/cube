@@ -344,6 +344,29 @@ describe('ScaffoldingTemplate', () => {
       });
     });
 
+    // https://github.com/cube-js/cube/issues/6656
+    it('quotes a sql_table that starts with a backtick', () => {
+      const template = new ScaffoldingTemplate(
+        {
+          ODS: {
+            CAMPAIGN_EMAILS: [
+              { name: 'id', type: 'integer', attributes: [] },
+              { name: 'amount', type: 'integer', attributes: [] },
+            ],
+          },
+        },
+        mySqlDriver,
+        {
+          format: SchemaFormat.Yaml,
+          snakeCase: true
+        }
+      );
+
+      const [file] = template.generateFilesByTableNames(['ODS.CAMPAIGN_EMAILS']);
+
+      expect((YAML.load(file.content) as any).cubes[0].sql_table).toEqual('`ODS`.`CAMPAIGN_EMAILS`');
+    });
+
     it('generates schema with a catalog', () => {
       const template = new ScaffoldingTemplate(
         {
@@ -600,6 +623,59 @@ describe('ScaffoldingTemplate', () => {
       template.generateFilesByTableNames(['public.orders', 'public.customers']).forEach((it) => {
         expect(it.content).toMatchSnapshot(it.fileName);
       });
+    });
+  });
+
+  // https://github.com/cube-js/cube/issues/2614
+  // Table and column names may start with a digit or contain hyphens (e.g. a UUID table
+  // name in BigQuery). Scaffolding must still emit cube and member names that compile.
+  describe('identifiers that start with a digit', () => {
+    const IDENTIFIER = /^[_a-zA-Z][_a-zA-Z0-9]*$/;
+    const uuidTable = '0e4fb908-ad9a-4e3a-a21e-316ed8e72995';
+    const digitSchema = {
+      public: {
+        [uuidTable]: [
+          { name: 'id', type: 'integer', attributes: ['primaryKey'] },
+          { name: '2024_amount', type: 'integer', attributes: [] },
+          { name: '1st_seen', type: 'timestamp', attributes: [] },
+        ],
+        orders: [
+          { name: 'id', type: 'integer', attributes: ['primaryKey'] },
+          {
+            name: 'uuid_id',
+            type: 'integer',
+            attributes: [],
+            foreign_keys: [{ target_table: uuidTable, target_column: 'id' }],
+          },
+        ],
+      },
+    };
+
+    [true, false].forEach((snakeCase) => {
+      it(`gives cubes, members and joins valid names (snakeCase: ${snakeCase})`, () => {
+        const files = new ScaffoldingTemplate(digitSchema, driver, { format: SchemaFormat.Yaml, snakeCase })
+          .generateFilesByTableNames([`public.${uuidTable}`, 'public.orders']);
+        const [uuidCube, ordersCube] = files.map(file => (YAML.load(file.content) as any).cubes[0]);
+
+        expect(uuidCube.name).toMatch(IDENTIFIER);
+        expect(files[0].fileName).toEqual(`${uuidCube.name}.yml`);
+        [...uuidCube.dimensions, ...uuidCube.measures].forEach(m => expect(m.name).toMatch(IDENTIFIER));
+        // An unquoted `2024_amount` reads as the number 2024 aliased `amount` in SQL.
+        expect(uuidCube.measures.map(m => m.sql)).toContain('{CUBE}."2024_amount"');
+        expect(ordersCube.joins.map(j => j.name)).toEqual([uuidCube.name]);
+      });
+    });
+
+    it('keeps distinct file names for non-Latin table names in camelCase', () => {
+      const template = new ScaffoldingTemplate({
+        public: {
+          заказы: [{ name: 'id', type: 'integer', attributes: ['primaryKey'] }],
+          клиенты: [{ name: 'id', type: 'integer', attributes: ['primaryKey'] }],
+        },
+      }, driver, { format: SchemaFormat.JavaScript, snakeCase: false });
+
+      const fileNames = template.generateFilesByTableNames(['public.заказы', 'public.клиенты']).map((f) => f.fileName);
+      expect(fileNames).toEqual(['Заказы.js', 'Клиенты.js']);
     });
   });
 });

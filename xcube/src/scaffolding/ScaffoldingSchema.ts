@@ -1,10 +1,10 @@
-// Vendored from @cubejs-backend/schema-compiler 1.7.45 (src/scaffolding),
+// Vendored from @cubejs-backend/schema-compiler 1.8.15 (src/scaffolding),
 // Copyright Cube Dev, Inc., Apache-2.0, and changed: see ../../NOTICE.
 import inflection from 'inflection';
 import R from 'ramda';
 import { notEmpty } from '@cubejs-backend/shared';
 import { UserError } from '@cubejs-backend/schema-compiler';
-import { toSnakeCase } from './utils';
+import { toIdentifier, toSnakeCase } from './utils';
 
 export enum ColumnType {
   Time = 'time',
@@ -162,7 +162,8 @@ type ScaffoldingSchemaOptions = {
 };
 
 export class ScaffoldingSchema {
-  private tableNamesToTables: Record<string, TableData[]> = {};
+  // Table names like `constructor` or `__proto__` must not resolve to Object.prototype
+  private tableNamesToTables: Map<string, TableData[]> = new Map();
 
   public constructor(
     private readonly dbSchema: DatabaseSchema,
@@ -228,26 +229,29 @@ export class ScaffoldingSchema {
   }
 
   protected prepareTableNamesToTables(tableNames: TableName[]) {
-    this.tableNamesToTables = R.pipe(
-      // @ts-ignore
-      R.unnest,
-      R.groupBy(n => n[0]),
-      R.map(groupedNameToDef => groupedNameToDef.map(nameToDef => nameToDef[1]))
-    )(
-      // @ts-ignore
-      tableNames.map(tableName => {
-        const [schema, table] = this.parseTableName(tableName);
-        const tableDefinition = this.resolveTableDefinition(tableName);
-        const definition: TableData = {
-          schema, table, tableDefinition, tableName
-        };
-        const tableizeName = inflection.tableize(this.fixCase(table));
-        const parts = tableizeName.split('_');
-        const tableNamesFromParts = R.range(0, parts.length - 1).map(toDrop => inflection.tableize(R.drop(toDrop, parts).join('_')));
-        const names = R.uniq([table, tableizeName].concat(tableNamesFromParts));
-        return names.map(n => [n, definition]);
-      })
-    ) as any;
+    const nameToDefinitions = tableNames.flatMap(tableName => {
+      const [schema, table] = this.parseTableName(tableName);
+      const tableDefinition = this.resolveTableDefinition(tableName);
+      const definition: TableData = {
+        schema, table, tableDefinition, tableName
+      };
+      const tableizeName = inflection.tableize(this.fixCase(table));
+      const parts = tableizeName.split('_');
+      const tableNamesFromParts = R.range(0, parts.length - 1).map(toDrop => inflection.tableize(R.drop(toDrop, parts).join('_')));
+      const names = R.uniq([table, tableizeName].concat(tableNamesFromParts));
+      return names.map((n): [string, TableData] => [n, definition]);
+    });
+
+    this.tableNamesToTables = new Map();
+
+    for (const [name, definition] of nameToDefinitions) {
+      const definitions = this.tableNamesToTables.get(name);
+      if (definitions) {
+        definitions.push(definition);
+      } else {
+        this.tableNamesToTables.set(name, [definition]);
+      }
+    }
   }
 
   public resolveTableDefinition(tableName: TableName) {
@@ -354,8 +358,9 @@ export class ScaffoldingSchema {
   }
 
   protected cubeName(schema: string, table: string): string {
-    return this.options.cubeNameFor?.(schema, table) ??
-      (this.options.snakeCase ? toSnakeCase(table) : inflection.camelize(table));
+    return this.options.cubeNameFor?.(schema, table) ?? toIdentifier(
+      this.options.snakeCase ? toSnakeCase(table) : inflection.camelize(table.replace(/[^\p{L}\p{N}]+/gu, '_'))
+    );
   }
 
   /**
@@ -383,7 +388,7 @@ export class ScaffoldingSchema {
         if (column.foreign_keys?.length) {
           column.foreign_keys.forEach(fk => {
             const [targetTableDefinition] = this.preferSchema(
-              (this.tableNamesToTables[fk.target_table] || []).filter(t => t.table === fk.target_table),
+              (this.tableNamesToTables.get(fk.target_table) || []).filter(t => t.table === fk.target_table),
               fk.target_schema ?? thisSchema,
               // A key that names its target's schema means that schema's table or none.
               others => (fk.target_schema == null ? others : []),
@@ -398,10 +403,10 @@ export class ScaffoldingSchema {
           });
         } else if ((column.name.match(new RegExp(idRegex, 'i')) && this.fixCase(column.name) !== 'id')) {
           const withoutId = column.name.replace(new RegExp(idRegex, 'i'), '');
-          const tablesToJoin = this.tableNamesToTables[withoutId] ||
-          this.tableNamesToTables[inflection.tableize(withoutId)] ||
-          this.tableNamesToTables[this.fixCase(withoutId)] ||
-          this.tableNamesToTables[(inflection.tableize(this.fixCase(withoutId)))];
+          const tablesToJoin = this.tableNamesToTables.get(withoutId) ||
+          this.tableNamesToTables.get(inflection.tableize(withoutId)) ||
+          this.tableNamesToTables.get(this.fixCase(withoutId)) ||
+          this.tableNamesToTables.get(inflection.tableize(this.fixCase(withoutId)));
 
           if (!tablesToJoin) {
             return null;

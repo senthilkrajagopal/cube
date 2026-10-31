@@ -26,6 +26,7 @@ import {
   ScaffoldingTemplate,
   SchemaFormat,
   TableSchema,
+  toIdentifier,
   toSnakeCase,
 } from './scaffolding';
 import type { CatalogOperation } from './catalog/queue';
@@ -291,7 +292,7 @@ export class DataSourceIntrospection implements DataSourceIntrospectionApi {
     for (const { cube, schema, table } of defaultNamed) {
       let name = cube;
       if (counts.get(cube) !== 1) {
-        const qualified = toSnakeCase(`${schema}_${table}`);
+        const qualified = toIdentifier(toSnakeCase(`${schema}_${table}`));
 
         name = qualified;
 

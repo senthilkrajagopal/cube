@@ -7,16 +7,16 @@
 #
 # Build from this directory:
 #
-#   docker build -t xcube:v1.7.45-$(git rev-parse --short=10 HEAD) .
+#   docker build -t xcube:v1.8.15-$(git rev-parse --short=10 HEAD) .
 #
 # CUBE_VERSION must be the version the package's peerDependencies name; the
 # server refuses to start on any other.
 
-ARG CUBE_VERSION=v1.7.45
+ARG CUBE_VERSION=v1.8.15
 
 # The build only compiles TypeScript, so it runs once, on the builder's own
 # platform; the image for each platform is Cube's with the output copied in.
-FROM --platform=$BUILDPLATFORM node:24.21.0-trixie-slim AS build
+FROM --platform=$BUILDPLATFORM node:24.22.1-trixie-slim AS build
 
 WORKDIR /package
 
@@ -33,7 +33,7 @@ RUN npm run build
 # download one (`autoinstall_known_extensions` is off), and DuckDB checks each
 # one's signature as it loads it. The version is the DuckDB of the package's
 # @duckdb/node-api, the image's (`duckdb-node`).
-FROM --platform=$BUILDPLATFORM node:24.21.0-trixie-slim AS duckdb-extensions
+FROM --platform=$BUILDPLATFORM node:24.22.1-trixie-slim AS duckdb-extensions
 
 ARG TARGETARCH
 COPY package-lock.json /package/
@@ -72,7 +72,7 @@ SH
 # The package's @duckdb/node-api and its bindings, for the platform the image
 # is built for, as the lock has them: fetched from its URLs and checked
 # against its integrity, as `npm ci` would.
-FROM --platform=$BUILDPLATFORM node:24.21.0-trixie-slim AS duckdb-node
+FROM --platform=$BUILDPLATFORM node:24.22.1-trixie-slim AS duckdb-node
 
 ARG TARGETARCH
 COPY package-lock.json /package/

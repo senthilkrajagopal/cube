@@ -40,7 +40,7 @@ describe('the SQL runner: cells and caps', () => {
 
 describe('Cube Store\'s plans: which its timeout ends', () => {
   test('a query on its tables runs on a select worker, which its timeout ends; the router\'s own work, nothing', () => {
-    // As Cube Store 1.7.45 explains them.
+    // As Cube Store 1.8.15 explains them.
     expect(endsAtCubeStoreTimeout('Projection, [n]\n  Aggregate\n    ClusterSend, indices: [[26], [26]]\n      Join on: []\n        SubqueryAlias\n          Scan probe.t\n        SubqueryAlias\n          Scan probe.t')).toBe(true);
     expect(endsAtCubeStoreTimeout('Projection, [n]\n  Aggregate\n    Join on: []\n      Join on: []\n        SubqueryAlias\n          Values\n        SubqueryAlias\n          Values')).toBe(false);
     expect(endsAtCubeStoreTimeout('Projection, [n]\n  Aggregate\n    Join on: []\n      SubqueryAlias\n        Scan information_schema.columns, source: InfoSchemaTableProvider(table: Columns)')).toBe(false);

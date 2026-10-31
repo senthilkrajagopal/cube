@@ -50,7 +50,7 @@ The `Dockerfile` builds Cube's published image with the package added and
 started in place of `cubejs server`:
 
 ```sh
-docker build -t xcube:v1.7.45-$(git rev-parse --short=10 HEAD) .
+docker build -t xcube:v1.8.15-$(git rev-parse --short=10 HEAD) .
 ```
 
 It takes the same configuration, environment and mounts as `cubejs/cube`
@@ -903,7 +903,7 @@ which a SELECT-only login may not. One run per `runId` at a time.
   they hold Cube's cached results and queued queries.
 - Its cache, queue and maintenance commands are refused, as Cube Cloud's
   runner refuses them.
-- Cube Store 1.7.45 has no `SHOW TABLES`, `SHOW SCHEMAS` or `DESCRIBE`, and its
+- Cube Store 1.8.15 has no `SHOW TABLES`, `SHOW SCHEMAS` or `DESCRIBE`, and its
   `SHOW CHUNKS` and the like answer every row at once. Read
   `information_schema.tables` and `.columns`, `system.tables`,
   `system.partitions`, `system.chunks` and `system.indexes` instead.
@@ -928,7 +928,7 @@ which a SELECT-only login may not. One run per `runId` at a time.
     under a `ClusterSend`, of `VALUES`, of its catalog, or of a table with
     either. It answers `400 not_read_only` with `reason:
     "cubestore_router_join"`. Without a join, the router's work grows only
-    with what it reads (Cube Store 1.7.45 has no table functions or recursive
+    with what it reads (Cube Store 1.8.15 has no table functions or recursive
     CTEs). A huge single expression, such as `repeat('x', 2000000000)`, isn't
     caught.
   - A plan Cube Store can't make fails the run as the query would

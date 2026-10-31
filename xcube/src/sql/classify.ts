@@ -311,7 +311,8 @@ const RULES: Record<SqlDialect, Rules> = {
     hashComment: true,
     backtick: true,
     cubeStore: true,
-    // Its backslash escapes a quote, its comments don't nest, and `#` starts one (Cube Store 1.7.45).
+    // Its backslash escapes a quote and its comments don't nest (Cube Store 1.8.15). It rejects a `#`
+    // outside a string, so reading one as a comment only hides what it would refuse.
     readings: readings([true], [false]),
     deniedWords: new Set(WRITES),
   },

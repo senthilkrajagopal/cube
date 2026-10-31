@@ -1,4 +1,4 @@
-// Vendored from @cubejs-backend/schema-compiler 1.7.45 (src/scaffolding),
+// Vendored from @cubejs-backend/schema-compiler 1.8.15 (src/scaffolding),
 // Copyright Cube Dev, Inc., Apache-2.0, and changed: see ../../NOTICE.
 const PUNCTUATION = /[^\p{L}\p{N}]+/ug;
 const REGEX = /([\p{Lu}]+[\p{Ll}\p{N}]*|[\p{Ll}\p{N}]+)/gu;
@@ -39,4 +39,10 @@ export function toSnakeCase(input = '', options: Options = {}) {
   }
 
   return output;
+}
+
+// Cube and member names must match `identifierRegex` in CubeValidator, which rejects a
+// leading digit. Table and column names can start with one (e.g. a UUID table name).
+export function toIdentifier(name: string): string {
+  return /^[0-9]/.test(name) ? `_${name}` : name;
 }

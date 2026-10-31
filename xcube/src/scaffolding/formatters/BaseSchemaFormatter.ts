@@ -1,4 +1,4 @@
-// Vendored from @cubejs-backend/schema-compiler 1.7.45 (src/scaffolding),
+// Vendored from @cubejs-backend/schema-compiler 1.8.15 (src/scaffolding),
 // Copyright Cube Dev, Inc., Apache-2.0, and changed: see ../../NOTICE.
 import inflection from 'inflection';
 import { CubeMembers, SchemaContext } from '../ScaffoldingTemplate';
@@ -12,7 +12,7 @@ import {
   TableSchema,
 } from '../ScaffoldingSchema';
 import { ValueWithComments } from '../descriptors/ValueWithComments';
-import { toSnakeCase } from '../utils';
+import { toIdentifier, toSnakeCase } from '../utils';
 
 const JOIN_RELATIONSHIP_MAP = {
   hasOne: 'one_to_one',
@@ -148,11 +148,7 @@ export abstract class BaseSchemaFormatter {
   protected memberName(member: { title: string }) {
     const title = member.title.replace(/[^A-Za-z0-9]+/g, '_').toLowerCase();
 
-    if (this.options.snakeCase) {
-      return toSnakeCase(title);
-    }
-
-    return inflection.camelize(title, true);
+    return toIdentifier(this.options.snakeCase ? toSnakeCase(title) : inflection.camelize(title, true));
   }
 
   protected escapeName(name) {
@@ -163,7 +159,7 @@ export abstract class BaseSchemaFormatter {
   }
 
   protected eligibleIdentifier(name: string) {
-    return !!name.match(/^[a-z0-9_]+$/);
+    return !!name.match(/^[a-z_][a-z0-9_]*$/);
   }
 
   /**

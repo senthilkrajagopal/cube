@@ -3,7 +3,7 @@ xcube
 This package contains code from Cube (https://github.com/cube-js/cube),
 Copyright Cube Dev, Inc., licensed under the Apache License, Version 2.0.
 
-src/scaffolding/ is copied from @cubejs-backend/schema-compiler 1.7.45
+src/scaffolding/ is copied from @cubejs-backend/schema-compiler 1.8.15
 (packages/cubejs-schema-compiler/src/scaffolding) and changed:
 
 - `numeric` and `bignumeric` columns are typed as numbers.
