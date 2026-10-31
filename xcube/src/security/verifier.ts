@@ -12,6 +12,46 @@ export const ROLE_KEY = 'xcubeRole';
 
 export type Role = 'user' | 'service';
 
+/**
+ * A user token's claim, and its context's key, for the user's attributes:
+ * each a list of strings, read by a policy as `security_context.attributes.<name>`.
+ */
+export const ATTRIBUTES_KEY = 'attributes';
+
+export const ATTRIBUTE_LIMITS = { attributes: 100, values: 100, valueLength: 200 };
+
+const ATTRIBUTE_NAME = /^[a-z0-9_]{1,40}$/;
+
+/**
+ * The attributes a user token carries, as its context holds them: none for no
+ * claim. A claim that isn't an object of string lists, within the limits, is
+ * refused: a policy reading it would otherwise filter by what wechart never signed.
+ */
+export function attributesOf(claim: unknown): Record<string, string[]> {
+  if (claim === undefined) {
+    return {};
+  }
+  if (typeof claim !== 'object' || claim === null || Array.isArray(claim)) {
+    throw new TokenError(`The token's ${ATTRIBUTES_KEY} must be an object of string lists`);
+  }
+  const entries = Object.entries(claim);
+  if (entries.length > ATTRIBUTE_LIMITS.attributes) {
+    throw new TokenError(`The token has more than ${ATTRIBUTE_LIMITS.attributes} ${ATTRIBUTES_KEY}`);
+  }
+  for (const [name, values] of entries) {
+    // `__proto__` would be an object's prototype, not one of its keys, wherever the context is copied.
+    if (!ATTRIBUTE_NAME.test(name) || name === '__proto__') {
+      throw new TokenError(`The token's attribute ${JSON.stringify(name.slice(0, 64))} isn't named with 1 to 40 of a-z, 0-9 and _`);
+    }
+    if (!Array.isArray(values) || values.length > ATTRIBUTE_LIMITS.values
+      || !values.every((v) => typeof v === 'string' && v.length <= ATTRIBUTE_LIMITS.valueLength)) {
+      throw new TokenError(`The token's attribute ${name} must be a list of at most ${ATTRIBUTE_LIMITS.values} strings `
+        + `of at most ${ATTRIBUTE_LIMITS.valueLength} characters`);
+    }
+  }
+  return Object.fromEntries(entries.map(([name, values]) => [name, [...(values as string[])]]));
+}
+
 interface ModelKeys {
   version: number;
   issuer: string | null;
@@ -35,8 +75,8 @@ export interface VerifierOptions {
 /**
  * Verifies RS256 tokens: a user's against the keys pushed for the model it
  * reads, the service credential's against the keys configured for it. What
- * it builds is the whole security context: a user's model, groups and
- * revision, nothing else of the token.
+ * it builds is the whole security context: a user's model, groups,
+ * revision and attributes, nothing else of the token.
  */
 export class TokenVerifier {
   protected readonly models = new Map<string, ModelKeys>();
@@ -168,11 +208,14 @@ export class TokenVerifier {
     const revisionClaim = this.options.revisionClaim();
     const overlayClaim = this.options.overlayClaim?.();
     const groups = Array.isArray(claims.groups) ? claims.groups.filter((g): g is string => typeof g === 'string') : [];
+    const attributes = attributesOf(claims[ATTRIBUTES_KEY]);
     return {
       role: 'user',
       securityContext: {
         [modelClaim]: model,
         groups,
+        // Always there, so a policy reading one the token lacks gets no rows (gate.ts, `noRows`), not an error.
+        [ATTRIBUTES_KEY]: attributes,
         ...(claims[revisionClaim] !== undefined ? { [revisionClaim]: claims[revisionClaim] } : {}),
         // The overlay it previews: the client signs one only for those it allows (AC-323).
         ...(overlayClaim && claims[overlayClaim] !== undefined ? { [overlayClaim]: claims[overlayClaim] } : {}),

@@ -64,6 +64,21 @@ const securedYaml = cubeYaml('secured', `    access_policy:
       - group: sa
 `);
 
+// As wechart writes an attribute policy: the bare form, which passes the token's list as it is.
+const teamedYaml = cubeYaml('teamed', `    access_policy:
+      - group: g_a
+        row_level:
+          filters:
+            - or:
+                - member: region
+                  operator: equals
+                  values: security_context.attributes.team
+                - member: region
+                  operator: equals
+                  values: security_context.attributes.extra
+      - group: sa
+`);
+
 const viewYaml = `views:
   - name: v_sales
     cubes:
@@ -180,7 +195,7 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
     .set('Authorization', token);
   const countOf = async (token: string, measure: string) => {
     const res = await load(token, measure);
-    expect(res.status).toBe(200);
+    expect({ status: res.status, error: res.body.error }).toEqual({ status: 200, error: undefined });
     return Number(res.body.data[0][measure]);
   };
   // `/v1/cubesql` answers JSON lines: a schema line, then data lines (or one error line).
@@ -209,6 +224,7 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
         { folderId: 'froot', name: 'orders', kind: 'cube', yaml: cubeYaml('orders') },
         { folderId: 'fa', name: 'sales', kind: 'cube', yaml: cubeYaml('sales') },
         { folderId: 'fa', name: 'secured', kind: 'cube', yaml: securedYaml },
+        { folderId: 'fa', name: 'teamed', kind: 'cube', yaml: teamedYaml },
         { folderId: 'fab', name: 'v_sales', kind: 'view', yaml: viewYaml },
       ],
     }).expect(201);
@@ -230,6 +246,8 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
     // Its own policies are Cube's, as ever: a context in none of their groups is refused.
     expect((await load(legacyToken(), 'secured.count')).status).not.toBe(200);
     expect(await countOf(legacyToken({ groups: ['g_a'] }), 'secured.count')).toBe(2);
+    // A context with no attributes at all reads none of an attribute policy's rows.
+    expect(await countOf(legacyToken({ groups: ['g_a'] }), 'teamed.count')).toBe(0);
     expect(await metaNames(legacyToken())).toEqual(['orders', 'sales', 'v_sales']);
     // Only xcube's verifier sets a role: one in an HS256 token grants nothing.
     await request(server).get('/cubejs-api/v1/introspection/data-sources')
@@ -353,6 +371,61 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
     expect((await load(userToken(['g_ab']), 'secured.count')).status).not.toBe(200);
   });
 
+  test('a token\'s attributes reach row-level policies as lists; a missing or empty one reads no rows (AC-1102, AC-1113)', async () => {
+    const team = (attributes?: Record<string, unknown>) => userToken(['g_a'], attributes ? { attributes } : {});
+    expect(await countOf(team({ team: ['eu'] }), 'teamed.count')).toBe(2);
+    expect(await countOf(team({ team: ['eu', 'us'] }), 'teamed.count')).toBe(3);
+    // One branch of the OR missing passes nothing; the other still passes its rows.
+    expect(await countOf(team({ team: [], extra: ['us'] }), 'teamed.count')).toBe(1);
+    // Empty, missing or misspelled: no rows, not a 400 naming the member.
+    for (const attributes of [{ team: [] }, {}, undefined, { teem: ['eu'] }]) {
+      const res = await load(team(attributes), 'teamed.count');
+      expect({ attributes, status: res.status, count: Number(res.body.data?.[0]?.['teamed.count']) })
+        .toEqual({ attributes, status: 200, count: 0 });
+      expect(JSON.stringify(res.body)).not.toMatch(/Values required|region/);
+    }
+    // Denied as Cube denies a cube, whichever route plans it.
+    const sql = await request(server).get('/cubejs-api/v1/sql')
+      .query({ query: JSON.stringify({ measures: ['teamed.count'] }) })
+      .set('Authorization', team({ team: [] }));
+    expect({ status: sql.status, error: sql.body.error }).toEqual({ status: 200, error: undefined });
+    expect(sql.body.sql.sql[0]).toMatch(/1 = 0/);
+    const some = await request(server).get('/cubejs-api/v1/sql')
+      .query({ query: JSON.stringify({ measures: ['teamed.count'] }) })
+      .set('Authorization', team({ team: ['eu', 'us'] }))
+      .expect(200);
+    expect(some.body.sql.sql[0]).not.toMatch(/1 = 0/);
+    expect(some.body.sql.sql[1]).toEqual(expect.arrayContaining(['eu', 'us']));
+    const cubesqlCount = async (attributes: Record<string, unknown>) => {
+      const res = await cubesql(team(attributes), 'SELECT MEASURE(teamed.count) AS n FROM teamed');
+      expect({ attributes, status: res.status }).toEqual({ attributes, status: 200 });
+      return res.lines[1];
+    };
+    expect(await cubesqlCount({ team: ['eu'] })).toEqual({ data: [['2']] });
+    expect(await cubesqlCount({ team: ['eu', 'us'] })).toEqual({ data: [['3']] });
+    expect(await cubesqlCount({ team: [] })).toEqual({ data: [['0']] });
+    expect(await cubesqlCount({ teem: ['eu'] })).toEqual({ data: [['0']] });
+    // SQL for SQL, by GET as by POST.
+    const sql4sql = await request(server).get('/cubejs-api/v1/sql')
+      .query({ format: 'sql', query: 'SELECT MEASURE(teamed.count) FROM teamed' })
+      .set('Authorization', team({}));
+    expect({ status: sql4sql.status, error: sql4sql.body.error }).toEqual({ status: 200, error: undefined });
+    expect(JSON.stringify(sql4sql.body)).toMatch(/1 = 0/);
+    const posted = await request(server).post('/cubejs-api/v1/sql')
+      // Cube's native sql4sql takes this flag only as a boolean.
+      .send({ format: 'sql', query: 'SELECT MEASURE(teamed.count) FROM teamed', disable_post_processing: false })
+      .set('Authorization', team({ team: ['eu'] }));
+    expect({ status: posted.status, error: posted.body.error }).toEqual({ status: 200, error: undefined });
+    expect(JSON.stringify(posted.body)).not.toMatch(/1 = 0/);
+    // A group with an allow-all policy is not narrowed by attributes it lacks.
+    expect(await countOf(userToken(['sa']), 'teamed.count')).toBe(3);
+    // A malformed claim refuses the token.
+    for (const attributes of [['eu'], { team: 'eu' }, { Team: ['eu'] }, { team: [1] }, { team: ['x'.repeat(201)] }]) {
+      const res = await load(team(attributes as any), 'teamed.count');
+      expect({ attributes, status: res.status }).toEqual({ attributes, status: 403 });
+    }
+  });
+
   test('a permission change applies at once on every compiled module, with no compile', async () => {
     const compiled = [...(core as any).compilerCache.keys()].sort();
     // g_ab's grant on /A/B revoked: gone from /A/B's set, and so from its ancestors'.
@@ -392,7 +465,7 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
 
   test('wechart reads the field list for itself from the admin routes, unfiltered', async () => {
     const meta = await admin('get', '/meta').expect(200);
-    expect(meta.body.cubes.map((c: any) => c.name).sort()).toEqual(['orders', 'sales', 'secured', 'v_sales']);
+    expect(meta.body.cubes.map((c: any) => c.name).sort()).toEqual(['orders', 'sales', 'secured', 'teamed', 'v_sales']);
     expect(meta.body.compilerId).toMatch(/^[0-9a-f-]{36}$/);
     const extended = await admin('get', '/meta?extended=true').expect(200);
     const sales = extended.body.cubes.find((c: any) => c.name === 'sales');

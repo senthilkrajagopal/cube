@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import yaml from 'js-yaml';
 import jwt from 'jsonwebtoken';
 
-import { admits, type Permissions } from '../../src/security/gate';
+import { admits, noRows, passesNoRow, type Permissions } from '../../src/security/gate';
 import { GATE_GROUP, namesGateGroup, withGate } from '../../src/security/marker';
 import {
   configuredKeys,
@@ -13,7 +13,7 @@ import {
   TokenError,
   verifyRs256,
 } from '../../src/security/tokens';
-import { ROLE_KEY, TokenVerifier } from '../../src/security/verifier';
+import { ATTRIBUTE_LIMITS, attributesOf, ROLE_KEY, TokenVerifier } from '../../src/security/verifier';
 import { DEFAULT_TOKENS } from '../../src/runtime/settings';
 import { parseItem } from '../../src/names/items';
 
@@ -136,10 +136,18 @@ describe('TokenVerifier', () => {
       iss: 'wechart-dev', groups: ['a', 7, 'b'], wechartRevision: 12, sub: 'someone', email: 'x@y', wechartIntrospection: true,
     })));
     expect(role).toBe('user');
-    expect(securityContext).toEqual({ wechartModel: 'dev', groups: ['a', 'b'], wechartRevision: 12, [ROLE_KEY]: 'user' });
+    expect(securityContext).toEqual({ wechartModel: 'dev', groups: ['a', 'b'], attributes: {}, wechartRevision: 12, [ROLE_KEY]: 'user' });
     // The overlay it previews, signed in for those the client allows.
     const preview = await verifier.verify(sign(user.privateKey, 'u1', claims({ iss: 'wechart-dev', wechartOverlay: 'ws-1' })));
     expect(preview.securityContext.wechartOverlay).toBe('ws-1');
+  });
+
+  test('a user\'s attributes: string lists under `attributes`; a malformed claim refuses the token', async () => {
+    const attributes = { team: ['eu', 'us'], cost_center_2: [], region: ['é'.repeat(ATTRIBUTE_LIMITS.valueLength)] };
+    const { securityContext } = await verifier.verify(sign(user.privateKey, 'u1', claims({ iss: 'wechart-dev', attributes })));
+    expect(securityContext.attributes).toEqual(attributes);
+    await expect(verifier.verify(sign(user.privateKey, 'u1', claims({ iss: 'wechart-dev', attributes: { team: 'eu' } }))))
+      .rejects.toThrow(new TokenError('The token\'s attribute team must be a list of at most 100 strings of at most 200 characters'));
   });
 
   test('a token is bound to the model whose key signed it', async () => {
@@ -234,5 +242,54 @@ describe('the folder gate', () => {
       folderId: 'fa', name: 'x', kind: 'cube', yaml: `cubes:\n  - name: x\n    sql_table: t\n    access_policy:\n      - group: ${GATE_GROUP}\n`,
     });
     expect(errors[0].message).toMatch(/may not name the group xcube.folder-gate/);
+  });
+});
+
+describe('attributes', () => {
+  test('none for no claim; each a copy of its list', () => {
+    expect(attributesOf(undefined)).toEqual({});
+    const claim = { team: ['eu'] };
+    const read = attributesOf(claim);
+    expect(read).toEqual(claim);
+    expect(read.team).not.toBe(claim.team);
+    expect(attributesOf(JSON.parse('{"a": [], "b_2": ["x", ""]}'))).toEqual({ a: [], b_2: ['x', ''] });
+  });
+
+  test('refuses what isn\'t an object of string lists within the limits, naming why', () => {
+    const many = <T>(n: number, f: (i: number) => T): T[] => Array.from({ length: n }, (_, i) => f(i));
+    for (const [claim, message] of [
+      [null, /must be an object of string lists/],
+      [['eu'], /must be an object of string lists/],
+      ['eu', /must be an object of string lists/],
+      [Object.fromEntries(many(101, (i): [string, string[]] => [`a${i}`, []])), /more than 100 attributes/],
+      [{ Team: [] }, /"Team" isn't named/],
+      [{ '': [] }, /"" isn't named/],
+      [{ ['a'.repeat(41)]: [] }, /isn't named/],
+      [{ 'team-x': [] }, /isn't named/],
+      [JSON.parse('{"__proto__": []}'), /"__proto__" isn't named/],
+      [{ team: 'eu' }, /attribute team must be a list/],
+      [{ team: [1] }, /attribute team must be a list/],
+      [{ team: [null] }, /attribute team must be a list/],
+      [{ team: many(101, String) }, /attribute team must be a list/],
+      [{ team: ['x'.repeat(201)] }, /attribute team must be a list/],
+    ] as [unknown, RegExp][]) {
+      expect(() => attributesOf(claim)).toThrow(TokenError);
+      expect(() => attributesOf(claim)).toThrow(message);
+    }
+    expect(Object.keys(attributesOf(Object.fromEntries(many(100, (i): [string, string[]] => [`a${i}`, many(100, String)]))))).toHaveLength(100);
+    expect(attributesOf({ ['a'.repeat(40)]: ['x'.repeat(200)] })).toEqual({ ['a'.repeat(40)]: ['x'.repeat(200)] });
+  });
+
+  test('a row filter that passes no row: one holding `noRows` that no OR branch undoes', () => {
+    const eu = { member: 'c.region', operator: 'equals', values: ['eu'] };
+    expect(noRows('c.region')).toEqual({ and: [{ member: 'c.region', operator: 'set' }, { member: 'c.region', operator: 'notSet' }] });
+    expect(passesNoRow(noRows('c.region'))).toBe(true);
+    expect(passesNoRow({ and: [eu, noRows('c.region')] })).toBe(true);
+    expect(passesNoRow({ or: [noRows('c.region'), { and: [eu, noRows('c.id')] }] })).toBe(true);
+    expect(passesNoRow({ or: [noRows('c.region'), eu] })).toBe(false);
+    expect(passesNoRow({ and: [{ member: 'c.a', operator: 'set' }, { member: 'c.b', operator: 'notSet' }] })).toBe(false);
+    for (const filter of [undefined, null, eu, { and: [] }, { or: [] }]) {
+      expect(passesNoRow(filter)).toBe(false);
+    }
   });
 });
