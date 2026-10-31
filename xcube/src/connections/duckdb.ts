@@ -369,6 +369,7 @@ export function readbackProblem(actual: Map<string, string>, expected: Record<st
 /** What a run holds: a connection of its own on the instance, and the hold to let go. */
 export interface DuckdbLease {
   connection: DuckDBConnection;
+  /** Closes the connection: only once its calls have settled (see `closeInstance`). */
   done(): void;
 }
 
@@ -402,6 +403,9 @@ function duckdbDriverClass() {
       protected tempDir: string | undefined;
 
       protected expiresAt: number | undefined;
+
+      /** Its uses of the default connection under way (`held`), each settled, never rejected. */
+      protected readonly uses = new Set<Promise<void>>();
 
       public constructor(config: Record<string, any>) {
         super(config);
@@ -554,15 +558,25 @@ function duckdbDriverClass() {
         }
       }
 
-      /** Closes the instance and wipes its temp directory; set up again on its next use. */
+      /**
+       * Closes the instance and wipes its temp directory; set up again on its next use.
+       * A use of its default connection still under way is interrupted, and waited for:
+       * closed under a query, DuckDB frees the query's statement, its worker deadlocks
+       * on the query's own context, and the pod never exits.
+       */
       public async closeInstance() {
         const { initPromise } = this;
         this.initPromise = null;
         this.expiresAt = undefined;
+        const uses = [...this.uses];
         if (initPromise) {
           try {
             const { defaultConnection, instance } = await initPromise;
             try {
+              if (uses.length) {
+                defaultConnection.interrupt();
+                await Promise.all(uses);
+              }
               defaultConnection.closeSync();
             } finally {
               instance.closeSync();
@@ -576,9 +590,13 @@ function duckdbDriverClass() {
 
       protected async held<T>(waitMs: number, use: () => Promise<T>): Promise<T> {
         const done = await duckdbPool().hold(this, waitMs);
+        const using = use();
+        const settled = using.then(() => undefined, () => undefined);
+        this.uses.add(settled);
         try {
-          return await use();
+          return await using;
         } finally {
+          this.uses.delete(settled);
           done();
         }
       }

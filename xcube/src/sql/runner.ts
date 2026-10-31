@@ -981,28 +981,40 @@ async function duckdbSession(driver: any, caps: SqlCaps): Promise<SqlSession> {
   const lease = await driver.lease(caps.timeoutMs);
   const { connection } = lease;
   let stopping = false;
-  return {
-    async run(sql, rows, binds = []) {
-      const result = await connection.stream(sql, binds.map((b) => b.value));
-      const types = result.columnTypes();
-      rows.setColumns(result.columnNames().map((name: string, i: number) => ({ name, type: String(types[i]) })));
-      while (!stopping) {
-        const chunk = await result.fetchChunk();
-        if (!chunk || chunk.rowCount === 0) {
+  // The last run, settled: never rejected.
+  let running: Promise<void> = Promise.resolve();
+  const read = async (sql: string, rows: RowCollector, binds: SqlBind[]) => {
+    const result = await connection.stream(sql, binds.map((b) => b.value));
+    const types = result.columnTypes();
+    rows.setColumns(result.columnNames().map((name: string, i: number) => ({ name, type: String(types[i]) })));
+    while (!stopping) {
+      const chunk = await result.fetchChunk();
+      if (!chunk || chunk.rowCount === 0) {
+        return;
+      }
+      for (const row of chunk.convertRows(JsonDuckDBValueConverter)) {
+        if (stopping || !rows.add(row)) {
           return;
         }
-        for (const row of chunk.convertRows(JsonDuckDBValueConverter)) {
-          if (stopping || !rows.add(row)) {
-            return;
-          }
-        }
       }
+    }
+  };
+  return {
+    run(sql, rows, binds = []) {
+      const run = read(sql, rows, binds);
+      running = run.then(() => undefined, () => undefined);
+      return run;
     },
     async cancel() {
       stopping = true;
       await quietly(() => connection.interrupt());
     },
     async close() {
+      // Closed under a fetch, DuckDB frees the statement its worker runs, which then
+      // deadlocks (and the pod's exit with it): a run is stopped, and waited for, first.
+      stopping = true;
+      await quietly(() => connection.interrupt());
+      await running;
       await quietly(() => lease.done());
     },
   };

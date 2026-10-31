@@ -277,6 +277,35 @@ describe('xcube\'s DuckDB driver, in process', () => {
     expect(duckdbPool().stats()).toMatchObject({ busy: 0 });
   });
 
+  // Closed under a query, DuckDB's worker deadlocks: the query never settles, nor the process exits.
+  const slow = 'SELECT a.range * b.range AS n FROM range(30000) a, range(30000) b ORDER BY n DESC';
+
+  test('the SQL runner: a close under a fetch stops the run first', async () => {
+    const caps: SqlCaps = { maxRows: 10, timeoutMs: 30000, maxBytes: 1024 * 1024 };
+    const session = await openSession('duckdb', driver, caps, (m: string): never => {
+      throw new Error(m);
+    });
+    const running = session.run(slow, new RowCollector(10, caps.maxBytes));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 300);
+    });
+    await session.close();
+    await expect(running).rejects.toThrow(/Interrupted/);
+    expect(duckdbPool().stats()).toMatchObject({ busy: 0 });
+  });
+
+  test('a release under a query interrupts it, and closes once it has stopped', async () => {
+    const other = makeDuckdbDriver(DRIVERS.duckdb.config({ kind: 'volume', path: file }, 'none', {}));
+    await other.testConnection();
+    const stopped = expect(other.query(slow, [])).rejects.toThrow(/Interrupted/);
+    await new Promise((resolve) => {
+      setTimeout(resolve, 300);
+    });
+    await other.release();
+    await stopped;
+    expect(duckdbPool().stats()).toMatchObject({ open: 1, busy: 0 });
+  });
+
   test('the SQL runner: a file outside the source refused by DuckDB, as a query_failed with reason outside_source', async () => {
     const target: SqlTarget = {
       dialect: 'duckdb',
