@@ -177,3 +177,25 @@ describe('settingsFromEnv', () => {
     expect(() => settingsFromEnv({ ...env, XCUBE_DUCKDB_THREADS: '0' })).toThrow(/XCUBE_DUCKDB_THREADS must be a whole number from 1 to 256/);
   });
 });
+
+describe('admin routes: a SQL run\'s state', () => {
+  test('a run this instance holds answers without the store; one it doesn\'t asks it; both behind the credential', async () => {
+    const status = jest.fn(async (model: string) => (model === 'dev' ? { model } : null));
+    const { app: a } = app({
+      status,
+      verifier: { serviceConfigured: true, verifyServiceToken: () => ({ model: 'other' }) },
+      sqlRunStateHere: (model: string, runId: string) => (model === 'dev' && runId === 'here' ? { state: 'stopping', endsBy: '2026-01-01T00:00:00.000Z' } : null),
+      sqlRunState: async () => ({ state: 'ended' }),
+    });
+    const url = (model: string, runId: string) => `/cubejs-api/v1/semantic/models/${model}/sql/runs/${runId}`;
+    const here = await request(a).get(url('dev', 'here')).set('Authorization', `Bearer ${TOKEN}`).expect(200);
+    expect(here.body).toEqual({ model: 'dev', runId: 'here', state: 'stopping', endsBy: '2026-01-01T00:00:00.000Z' });
+    expect(status).not.toHaveBeenCalled();
+    // The credential first: none, or a service token for another model, sees no run held here.
+    await request(a).get(url('dev', 'here')).expect(401);
+    expect((await request(a).get(url('dev', 'here')).set('Authorization', 'Bearer a.b.c').expect(403)).body.code).toBe('forbidden');
+    expect((await request(a).get(url('dev', 'gone')).set('Authorization', `Bearer ${TOKEN}`).expect(200)).body).toEqual({ model: 'dev', runId: 'gone', state: 'ended' });
+    expect(status).toHaveBeenCalledWith('dev');
+    expect((await request(a).get(url('nope', 'here')).set('Authorization', `Bearer ${TOKEN}`).expect(404)).body.code).toBe('unknown_model');
+  });
+});

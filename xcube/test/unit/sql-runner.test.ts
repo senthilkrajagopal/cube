@@ -539,6 +539,33 @@ describe('the SQL runner: runs', () => {
     expect(target.released).toHaveBeenCalled();
   });
 
+  test('a store that doesn\'t answer never holds an answer: its notes are waited on so long, then logged', async () => {
+    class QuickNotes extends SqlRuns {
+      protected override readonly noteMs = 50;
+    }
+    const logs: [string, any][] = [];
+    const registry = { ...memoryRegistry(), stopSqlRun: () => new Promise<void>(() => undefined), endSqlRun: () => new Promise<void>(() => undefined) };
+    const runs = new QuickNotes('here', () => registry, (m, p) => logs.push([m, p]), 60000);
+    let finish: () => void = () => undefined;
+    const target = cubeStoreTarget(() => new Promise((resolve) => {
+      finish = () => resolve([]);
+    }));
+    const started = Date.now();
+    await expect(runs.run('m', target, request({ runId: 's1', timeoutMs: 10 }))).rejects.toMatchObject({ code: 'timeout', runsOn: { endsBy: expect.any(Date) } });
+    expect(Date.now() - started).toBeLessThan(4000);
+    expect(logs).toContainEqual(['xcube: could not note a SQL run as stopping', { runId: 's1', error: 'Noting it as stopping took longer than 0.05 s' }]);
+    // Known here as stopping, without the store.
+    expect(runs.stateHere('m', 's1')).toMatchObject({ state: 'stopping' });
+    expect(runs.stateHere('other', 's1')).toBeNull();
+    finish();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(runs.stateHere('m', 's1')).toBeNull();
+    expect(logs).toContainEqual(['xcube: could not note a SQL run\'s end', { runId: 's1', error: 'Noting its end took longer than 0.05 s' }]);
+    // A run that answers isn't held by its end's note either.
+    const quick = await runs.run('m', cubeStoreTarget(async () => [{ a: '1' }]), request({ runId: 'q1' }));
+    expect(quick).toMatchObject({ rowCount: 1 });
+  });
+
   test('a query its router runs isn\'t bounded by Cube Store\'s timeout: stopping, with no endsBy, until Cube Store answers', async () => {
     let finish: () => void = () => undefined;
     const target = cubeStoreTarget(() => new Promise((resolve) => {

@@ -803,6 +803,13 @@ export function initAdminRoutes(
     if (!RUN_ID.test(runId)) {
       throw new AdminError(400, 'bad_request', 'A run id is 1 to 64 of A-Z, a-z, 0-9, _ and -');
     }
+    // A run this instance runs, or follows stopped, answers without the store, which a long query can leave slow:
+    // its model was there when it started, and the credential was checked already.
+    const here = runtime.sqlRunStateHere(model, runId);
+    if (here) {
+      res.json({ model, runId, ...here });
+      return;
+    }
     await requireModel(model);
     res.json({ model, runId, ...await runtime.sqlRunState(model, runId) });
   }));

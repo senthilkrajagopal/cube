@@ -60,6 +60,9 @@ const CANCEL_GRACE_MS = 5000;
 /** How long letting a run's connection go may take before the answer goes without it. */
 const CLOSE_MS = 10000;
 
+/** How long a run's note in the store may hold its answer: past it, the note lands, or fails, after the answer. */
+const NOTE_MS = 5000;
+
 /** How long past its expected end a stopped Cube Store run is waited on. */
 const ENDS_GRACE_MS = 5000;
 
@@ -94,6 +97,9 @@ export class SqlRuns {
 
   /** Runs answered as stopped that Cube Store runs on, until each ends: by run id. */
   protected readonly stopping = new Map<string, { model: string; endsBy: Date | null }>();
+
+  /** How long a note in the store may hold a run's answer. */
+  protected readonly noteMs: number = NOTE_MS;
 
   public constructor(
     protected readonly instanceId: string,
@@ -294,10 +300,13 @@ export class SqlRuns {
     if (built) {
       built.secrets.length = 0;
     }
-    const registry = this.registry();
-    if (registry) {
-      await registry.endSqlRun(runId, this.instanceId)
-        .catch((e) => this.log('xcube: could not note a SQL run\'s end', { runId, error: e.message }));
+    await this.note(runId, this.registry()?.endSqlRun(runId, this.instanceId), 'Noting its end', 'xcube: could not note a SQL run\'s end');
+  }
+
+  /** A note in the store, waited on for `noteMs` at most: a store that doesn't answer never holds a run's answer. */
+  protected async note(runId: string, write: Promise<void> | undefined, what: string, failed: string) {
+    if (write) {
+      await withTimeout(write, this.noteMs, what).catch((e) => this.log(failed, { runId, error: e.message }));
     }
   }
 
@@ -309,8 +318,7 @@ export class SqlRuns {
   protected async runOn(model: string, runId: string, session: SqlSession, built: { driver: any; secrets: string[] } | null, endsBy: Date | null) {
     this.stopping.set(runId, { model, endsBy });
     const registry = this.registry();
-    await registry?.stopSqlRun(runId, this.instanceId, endsBy)
-      .catch((e) => this.log('xcube: could not note a SQL run as stopping', { runId, error: e.message }));
+    await this.note(runId, registry?.stopSqlRun(runId, this.instanceId, endsBy), 'Noting it as stopping', 'xcube: could not note a SQL run as stopping');
     (async () => {
       let timer: NodeJS.Timeout | undefined;
       // Kept while followed: a stopped instance's note lapses within minutes, as it no longer knows.
@@ -333,18 +341,27 @@ export class SqlRuns {
     })().catch((e) => this.log('xcube: a stopped SQL run could not be followed to its end', { runId, error: e.message }));
   }
 
-  /** Where a model's run is: running, stopped but run on by the database, or ended (or never was). */
-  public async state(model: string, runId: string): Promise<SqlRunState> {
-    const here = this.local.get(runId);
-    if (here) {
-      return here.model === model ? { state: 'running' } : { state: 'ended' };
+  /** Where a model's run is when it runs, or runs on stopped, on this instance: `null` when neither, without asking the store. */
+  public stateHere(model: string, runId: string): SqlRunState | null {
+    if (this.local.get(runId)?.model === model) {
+      return { state: 'running' };
     }
     const onward = this.stopping.get(runId);
-    if (onward) {
-      if (onward.model !== model) {
-        return { state: 'ended' };
-      }
+    if (onward?.model === model) {
       return { state: 'stopping', ...(onward.endsBy ? { endsBy: onward.endsBy.toISOString() } : {}) };
+    }
+    return null;
+  }
+
+  /** Where a model's run is: running, stopped but run on by the database, or ended (or never was). */
+  public async state(model: string, runId: string): Promise<SqlRunState> {
+    const here = this.stateHere(model, runId);
+    if (here) {
+      return here;
+    }
+    if (this.local.has(runId) || this.stopping.has(runId)) {
+      // Another model's run of that id: this one's has ended, or never was.
+      return { state: 'ended' };
     }
     const found = await this.registry()?.sqlRunState(runId, model);
     if (!found) {

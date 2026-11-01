@@ -2095,6 +2095,11 @@ export class XcubeRuntime {
     return this.sqlRuns.state(model, runId);
   }
 
+  /** Where a model's SQL run is when this instance runs it, or follows it stopped: `null` otherwise, without asking the store. */
+  public sqlRunStateHere(model: string, runId: string) {
+    return this.sqlRuns.stateHere(model, runId);
+  }
+
   protected async sqlTargetOf(model: string, on: { connection: string; overlay?: string } | { cubeStore: true }, request: SqlRunRequest): Promise<SqlTarget> {
     if ('cubeStore' in on) {
       const core = this.requireCore();
