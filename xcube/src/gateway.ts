@@ -198,6 +198,27 @@ function asyncHandler(handler: Handler): RequestHandler {
   };
 }
 
+/** The row security Cube applied to a query: a cube denied it outright, and the members it masks. */
+export interface QuerySecurity {
+  denied: boolean;
+  masked: { member: string; conditional: boolean }[];
+}
+
+/** Cube's name for the segment that denies a query a cube (`CompilerApi.applyRowLevelSecurity`). */
+const DENIED_SEGMENT = 'rlsAccessDenied';
+
+/**
+ * The row security of a query as Cube rewrote it for its context. A
+ * conditional mask's row filter is the policy's, values and all: only that
+ * there is one is told.
+ */
+export function securityOf(query: any): QuerySecurity {
+  return {
+    denied: (query?.segments ?? []).some((s: any) => s && typeof s === 'object' && s.name === DENIED_SEGMENT),
+    masked: (query?.maskedMembers ?? []).map(({ member, filter }: any) => ({ member, conditional: filter !== undefined })),
+  };
+}
+
 /**
  * Cube's API gateway with the data source introspection routes added, under
  * `{basePath}/v1/introspection/data-sources`, in the `introspection` API
@@ -264,16 +285,60 @@ export class XcubeApiGateway extends ApiGateway {
     };
   }
 
+  /** The queries Cube rewrote for a dry run in progress, by its context (`dryRun`). */
+  protected readonly dryRunQueries = new WeakMap<object, { queries?: any[] }>();
+
   /**
-   * A query naming a cube or view in a folder the context's groups don't
-   * reach is refused plainly, naming the folder (403), before Cube's own
-   * refusal: a hidden member, answered 500.
+   * A dry run also answers `security`, for each of its `normalizedQueries` in
+   * order: the row security Cube applies to it for this context, as
+   * `/v1/load` would run it (`securityOf`). Cube's `normalizedQueries` are
+   * the queries as asked, before it. A masked member is named as Cube masks
+   * it: through a view, the cube's member the view's reads.
    */
+  protected override async dryRun(args: Parameters<ApiGateway['dryRun']>[0]) {
+    const { context, res } = args;
+    const held: { queries?: any[] } = {};
+    this.dryRunQueries.set(context, held);
+    try {
+      await super.dryRun({
+        ...args,
+        res: (message: any, extra?: { status: number }) => res(
+          (extra?.status ?? 200) < 400 && Array.isArray(message?.normalizedQueries) && held.queries
+            ? { ...message, security: held.queries.map(securityOf) }
+            : message,
+          extra,
+        ),
+      });
+    } finally {
+      this.dryRunQueries.delete(context);
+    }
+  }
+
   protected override async getNormalizedQueries(
     inputQuery: Parameters<ApiGateway['getNormalizedQueries']>[0],
     context: RequestContext,
     persistent = false,
     memberExpressions = false,
+    cacheMode?: Parameters<ApiGateway['getNormalizedQueries']>[4],
+  ) {
+    const normalized = await this.gatedNormalizedQueries(inputQuery, context, persistent, memberExpressions, cacheMode);
+    const held = this.dryRunQueries.get(context);
+    if (held) {
+      held.queries = normalized[1];
+    }
+    return normalized;
+  }
+
+  /**
+   * A query naming a cube or view in a folder the context's groups don't
+   * reach is refused plainly, naming the folder (403), before Cube's own
+   * refusal: a hidden member, answered 500.
+   */
+  protected async gatedNormalizedQueries(
+    inputQuery: Parameters<ApiGateway['getNormalizedQueries']>[0],
+    context: RequestContext,
+    persistent: boolean,
+    memberExpressions: boolean,
     cacheMode?: Parameters<ApiGateway['getNormalizedQueries']>[4],
   ) {
     const runtime = this.xcubeRuntime();

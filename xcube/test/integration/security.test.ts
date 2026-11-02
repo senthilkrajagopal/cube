@@ -173,6 +173,71 @@ const vDealsYaml = `views:
       - group: sa
 `;
 
+// Masks by group: g_a sees all, g_ab masked, g_ac masked outside eu. No policy names sa: denied.
+const maskedYaml = `cubes:
+  - name: masked
+    sql_table: main.orders
+    dimensions:
+      - name: id
+        sql: id
+        type: number
+        primary_key: true
+      - name: region
+        sql: region
+        type: string
+      - name: label
+        sql: region
+        type: string
+        mask: "'***'"
+      - name: at
+        sql: "TIMESTAMP '2024-01-01'"
+        type: time
+    measures:
+      - name: count
+        type: count
+      - name: total
+        sql: id
+        type: sum
+        mask: -1
+    access_policy:
+      - group: g_a
+        member_level:
+          includes: "*"
+      - group: g_ab
+        member_level:
+          includes: [id, region, at, count]
+        member_masking:
+          includes: "*"
+      - group: g_ac
+        member_level:
+          includes: "*"
+        row_level:
+          filters:
+            - member: region
+              operator: equals
+              values: ["eu"]
+      - group: g_ac
+        member_level:
+          includes: [id, region, at, count]
+        member_masking:
+          includes: "*"
+`;
+// The view's own policy: it reads the cube for g_ab, and no policy names g_ac.
+const vMaskedYaml = `views:
+  - name: v_masked
+    cubes:
+      - join_path: masked
+        includes: [region, label, at, count, total]
+    access_policy:
+      - group: g_a
+        member_level:
+          includes: "*"
+      - group: g_ab
+        member_level:
+          includes: "*"
+      - group: sa
+`;
+
 const FOLDERS = [
   { id: 'froot', parentId: null, allowedGroups: ['g_a', 'g_ab', 'g_ac', 'sa'] },
   { id: 'fa', parentId: 'froot', allowedGroups: ['g_a', 'g_ab', 'g_ac', 'sa'] },
@@ -646,5 +711,82 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
     const ranked = meta.body.cubes.find((c: any) => c.name === 'ranked');
     expect(ranked.hierarchies.map((h: any) => [h.name, h.public, h.levels]))
       .toEqual([['ranked.geo', true, [region, id]], ['ranked.secret_h', false, [region]]]);
+  });
+  test('a dry run answers the row security each query gets: denied, and the members masked', async () => {
+    const res = await admin('post', '/changesets', {
+      baseRevision: revision,
+      upserts: [
+        { folderId: 'fa', name: 'masked', kind: 'cube', yaml: maskedYaml },
+        { folderId: 'fa', name: 'v_masked', kind: 'view', yaml: vMaskedYaml },
+      ],
+    });
+    expect({ status: res.status, body: res.status === 201 ? undefined : res.body }).toEqual({ status: 201, body: undefined });
+    revision = res.body.revision;
+    const queryOf = (cube: string, filters: object[] = []) => ({
+      measures: [`${cube}.total`],
+      dimensions: [`${cube}.region`, `${cube}.label`],
+      filters,
+      order: { [`${cube}.region`]: 'asc' },
+    });
+    const dryRun = async (group: string, query: object) => {
+      const got = await request(server).get('/cubejs-api/v1/dry-run')
+        .query({ query: JSON.stringify(query) })
+        .set('Authorization', userToken([group]));
+      expect({ status: got.status, error: got.body.error }).toEqual({ status: 200, error: undefined });
+      expect(got.body.security).toHaveLength(got.body.normalizedQueries.length);
+      return got.body.security.map((s: any) => ({ ...s, masked: [...s.masked].sort((a: any, b: any) => a.member.localeCompare(b.member)) }));
+    };
+    // What /v1/load answers the same query, for the masks to be told by.
+    const rows = async (group: string, query: any) => {
+      const got = await request(server).get('/cubejs-api/v1/load')
+        .query({ query: JSON.stringify(query) })
+        .set('Authorization', userToken([group]));
+      expect({ status: got.status, error: got.body.error }).toEqual({ status: 200, error: undefined });
+      const [region, label] = query.dimensions;
+      return got.body.data.map((row: any) => [row[region], row[label], Number(row[query.measures[0]])]);
+    };
+    const masks = (conditional: boolean) => [{ member: 'masked.label', conditional }, { member: 'masked.total', conditional }];
+    const eu = [{ member: 'masked.region', operator: 'equals', values: ['eu'] }];
+
+    // Granted every member: nothing masked.
+    expect(await dryRun('g_a', queryOf('masked'))).toEqual([{ denied: false, masked: [] }]);
+    expect(await rows('g_a', queryOf('masked'))).toEqual([['eu', 'eu', 4], ['us', 'us', 2]]);
+    // Masked on every row.
+    expect(await dryRun('g_ab', queryOf('masked'))).toEqual([{ denied: false, masked: masks(false) }]);
+    expect(await rows('g_ab', queryOf('masked'))).toEqual([['eu', '***', -1], ['us', '***', -1]]);
+    // Masked outside the rows a policy's filter grants unmasked; the filter itself isn't told.
+    expect(await dryRun('g_ac', queryOf('masked'))).toEqual([{ denied: false, masked: masks(true) }]);
+    expect(await rows('g_ac', queryOf('masked'))).toEqual([['eu', 'eu', 4], ['us', '***', -1]]);
+    // A query whose own filter implies that one reads no masked row.
+    expect(await dryRun('g_ac', queryOf('masked', eu))).toEqual([{ denied: false, masked: [] }]);
+    expect(await rows('g_ac', queryOf('masked', eu))).toEqual([['eu', 'eu', 4]]);
+    // Only the members the query asks for.
+    expect(await dryRun('g_ab', { dimensions: ['masked.region'] })).toEqual([{ denied: false, masked: [] }]);
+    // No policy for the context: denied, as the SQL says.
+    expect(await dryRun('sa', queryOf('masked'))).toEqual([{ denied: true, masked: [] }]);
+    const sql = await request(server).get('/cubejs-api/v1/sql')
+      .query({ query: JSON.stringify(queryOf('masked')) })
+      .set('Authorization', userToken(['sa']))
+      .expect(200);
+    expect(sql.body.sql.sql[0]).toMatch(/1 = 0/);
+    // Through a view, the view's policy decides what is read, and the cube's still masks:
+    // named as the cube's members, as Cube masks them.
+    expect(await dryRun('g_ab', queryOf('v_masked'))).toEqual([{ denied: false, masked: masks(false) }]);
+    expect(await rows('g_ab', queryOf('v_masked'))).toEqual([['eu', '***', -1], ['us', '***', -1]]);
+    expect(await dryRun('g_ac', queryOf('v_masked'))).toEqual([{ denied: true, masked: [] }]);
+
+    // By POST too, one entry for each of the normalized queries, in their order.
+    const byDay = (cube: string) => ({ measures: [`${cube}.total`], timeDimensions: [{ dimension: `${cube}.at`, granularity: 'day' }] });
+    const posted = async (query: object) => {
+      const got = await request(server).post('/cubejs-api/v1/dry-run').send({ query }).set('Authorization', userToken(['g_ac']));
+      expect({ status: got.status, error: got.body.error }).toEqual({ status: 200, error: undefined });
+      expect(got.body.normalizedQueries.map((q: any) => q.measures)).toEqual((Array.isArray(query) ? query : [query]).map((q: any) => q.measures));
+      return got.body.security;
+    };
+    const total = { denied: false, masked: [{ member: 'masked.total', conditional: true }] };
+    const denied = { denied: true, masked: [] };
+    expect(await posted(queryOf('masked'))).toEqual([{ denied: false, masked: expect.arrayContaining(masks(true)) }]);
+    expect(await posted([byDay('masked'), byDay('v_masked')])).toEqual([total, denied]);
+    expect(await posted([byDay('v_masked'), byDay('masked')])).toEqual([denied, total]);
   });
 });
