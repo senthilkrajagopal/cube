@@ -534,6 +534,20 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
         .toEqual({ attributes, status: 200, count: 0 });
       expect(JSON.stringify(res.body)).not.toMatch(/Values required|region/);
     }
+    // A dry run tells it as denied; one branch of the OR left passes rows, and isn't.
+    const securityFor = async (attributes?: Record<string, unknown>) => {
+      const res = await request(server).get('/cubejs-api/v1/dry-run')
+        .query({ query: JSON.stringify({ measures: ['teamed.count'] }) })
+        .set('Authorization', team(attributes));
+      expect({ attributes, status: res.status, error: res.body.error }).toEqual({ attributes, status: 200, error: undefined });
+      return res.body.security;
+    };
+    for (const attributes of [{ team: [] }, {}, undefined, { teem: ['eu'] }]) {
+      expect({ attributes, security: await securityFor(attributes) }).toEqual({ attributes, security: [{ denied: true, masked: [] }] });
+    }
+    for (const attributes of [{ team: ['eu'] }, { team: [], extra: ['us'] }]) {
+      expect({ attributes, security: await securityFor(attributes) }).toEqual({ attributes, security: [{ denied: false, masked: [] }] });
+    }
     // Denied as Cube denies a cube, whichever route plans it.
     const sql = await request(server).get('/cubejs-api/v1/sql')
       .query({ query: JSON.stringify({ measures: ['teamed.count'] }) })
