@@ -84,6 +84,24 @@ describe('compileErrors', () => {
     expect(errors.some(({ message }) => /dup/.test(message))).toBe(true);
   });
 
+  test('keeps the reasons Cube gives below a message with its message, for each cube', async () => {
+    // Cube's own schema, unpatched here, refuses a pre-aggregation meta with a reason per alternative.
+    const cube = (name: string) => `cubes:\n  - name: ${name}\n    sql_table: t\n`
+      + '    dimensions:\n      - { name: k, sql: k, type: string, primary_key: true }\n'
+      + '    measures:\n      - { name: count, type: count }\n'
+      + '    pre_aggregations:\n      - name: r\n        measures: [count]\n        meta: { by: x }\n';
+    const files = [{ path: 'cubes/a.yml', content: cube('a') }, { path: 'cubes/b.yml', content: cube('b') }];
+    const e = await cubeError(files);
+    expect(e.message).toContain('Possible reasons (one of):\n\t* ');
+
+    const errors = placeByName(compileErrors(e.message, new Set(files.map(({ path }) => path))), files);
+    expect(errors.map(({ path }) => path)).toEqual(['cubes/a.yml', 'cubes/b.yml']);
+    for (const [error, name] of [[errors[0], 'a'], [errors[1], 'b']] as const) {
+      expect(error.message).toMatch(new RegExp(`^${name} cube: .*\nPossible reasons \\(one of\\):\n\t\\* `));
+      expect(error.message).toContain('(preAggregations.r.meta = [object Object]) is not allowed');
+    }
+  });
+
   test('reads the grouped format', () => {
     const message = [
       'Compile errors:',
@@ -98,6 +116,12 @@ describe('compileErrors', () => {
       '',
       'Errors:',
       'nope is not defined',
+      'c cube: "x" does not match any of the allowed types',
+      'Possible reasons (one of):',
+      '\t* (x.y = 1) is not allowed',
+      '\t* "x.z" is required',
+      '',
+      'Possible reasons (one of):',
       '',
       'elsewhere.yml Errors:',
       'from a file the snapshot does not have',
@@ -107,6 +131,9 @@ describe('compileErrors', () => {
       { path: 'cubes/a.yml', kind: 'compile', message: 'a cube: measure c: type must be one of …' },
       { path: 'cubes/b.js', kind: 'compile', message: 'Syntax Error: Unexpected token (4:0)', line: 4, column: 1 },
       { path: null, kind: 'compile', message: 'nope is not defined' },
+      { path: null, kind: 'compile', message: 'c cube: "x" does not match any of the allowed types\nPossible reasons (one of):\n\t* (x.y = 1) is not allowed\n\t* "x.z" is required' },
+      // Reasons with no message above them are kept, as a message of their own.
+      { path: null, kind: 'compile', message: 'Possible reasons (one of):' },
       { path: null, kind: 'compile', message: 'from a file the snapshot does not have' },
     ]);
   });

@@ -101,10 +101,18 @@ const FRAME_LINE = /^\s*>\s*(\d+)\s*\|/;
 const FRAME_CARET = /^(\s*\|)(\s*)\^/;
 
 /**
+ * The lines Cube's schema check adds below its first message when Joi gives
+ * more than one: `Possible reasons (one of):`, then each `\t* …`.
+ */
+const REASONS = /^Possible reasons \(one of\):$/;
+const REASON = /^\t\* /;
+
+/**
  * Cube's compile errors, one per message, from the text of its
  * `CompileError`: errors grouped under a line naming their file, each group
  * ending in a blank line. Lines come from a message's code frame, when it
- * has one. The paths are the snapshot's own, so only those are trusted.
+ * has one, and its reasons follow it as Cube wrote them. The paths are the
+ * snapshot's own, so only those are trusted.
  */
 export function compileErrors(message: string, paths: ReadonlySet<string>): ModelError[] {
   const lines = message.replace(ANSI, '').split('\n');
@@ -126,6 +134,8 @@ export function compileErrors(message: string, paths: ReadonlySet<string>): Mode
       // Before the first group.
     } else if (!line.trim()) {
       last = null;
+    } else if (last && (REASONS.test(line) || REASON.test(line))) {
+      last.message += `\n${line.trimEnd()}`;
     } else if (frame) {
       if (last && last.line === undefined) {
         last.line = Number(frame[1]);
