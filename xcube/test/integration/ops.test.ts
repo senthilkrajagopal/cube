@@ -33,6 +33,12 @@ class TestRuntime extends XcubeRuntime {
   public async writeTicksNow() {
     await this.writeTicks();
   }
+
+  // A jobs request's tokens are stored a second after its answer, as a loaded store might store them.
+  public override async recordBuildJobs(jobs: Parameters<XcubeRuntime['recordBuildJobs']>[0]) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    await super.recordBuildJobs(jobs);
+  }
 }
 
 describeWithDatabase('operations: the build queue, hidden cubes and the refresh worker', () => {

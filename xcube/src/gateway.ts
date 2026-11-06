@@ -453,6 +453,9 @@ export class XcubeApiGateway extends ApiGateway {
     });
   }
 
+  /** The jobs requests' tokens still being recorded, by model: the build queue waits for them (`ownQueue`). */
+  protected readonly recordingJobs = new Map<string, Set<Promise<void>>>();
+
   /**
    * The tokens a jobs `post` answers are recorded by the version of a table
    * each builds, for the build queue to name them: read from Cube's own job
@@ -471,8 +474,21 @@ export class XcubeApiGateway extends ApiGateway {
     const json = res.json.bind(res);
     res.json = (body: any) => {
       if (res.statusCode < 400 && Array.isArray(body) && body.length) {
-        this.recordJobs(runtime, models, body.filter((t: unknown): t is string => typeof t === 'string')).catch((e: any) => {
+        const recording = this.recordJobs(runtime, models, body.filter((t: unknown): t is string => typeof t === 'string')).catch((e: any) => {
           this.log({ type: 'xcube: a jobs request\'s tokens could not be recorded', error: e?.message ?? String(e) } as any);
+        });
+        for (const model of models) {
+          const pending = this.recordingJobs.get(model) ?? new Set();
+          this.recordingJobs.set(model, pending.add(recording));
+        }
+        recording.finally(() => {
+          for (const model of models) {
+            const pending = this.recordingJobs.get(model);
+            pending?.delete(recording);
+            if (!pending?.size) {
+              this.recordingJobs.delete(model);
+            }
+          }
         });
       }
       return json(body);
@@ -569,7 +585,9 @@ export class XcubeApiGateway extends ApiGateway {
         }
       }
     }
-    // The jobs requests' tokens, by the version each asked for: its own request's first.
+    // The jobs requests' tokens, by the version each asked for: its own request's first. A request this
+    // instance answered is named once its tokens are recorded, which its answer doesn't wait for.
+    await Promise.all(this.recordingJobs.get(model) ?? []);
     const jobs = await runtime.buildJobsFor(model, [...new Set(entries.map((e) => e.targetTable).filter((t): t is string => t !== null))]);
     for (const entry of entries) {
       const asked = entry.targetTable ? jobs.get(entry.targetTable) ?? [] : [];

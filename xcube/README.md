@@ -1276,7 +1276,8 @@ queue with others). Oldest first:
 - **`startedBy`**: `scheduler` (the refresh worker, `requestId` `scheduler-…`),
   `jobs` (the jobs API), or `query`. **`job`** is the jobs request's token
   for it: xcube records each `post`'s tokens by the version of a table each
-  builds.
+  builds. The instance that answered the `post` names them from its first
+  read of the queue; another instance, once they're recorded, a moment after.
 - With Cube Store as the queue (production), every instance's builds; with
   the memory queue, this instance's.
 
