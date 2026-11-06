@@ -19,11 +19,13 @@ import { XcubeApiGateway } from './gateway';
 import { DataSourceIntrospection } from './introspection';
 import { FolderGateCompilerApi } from './security/gate';
 import { installKeylessJoins } from './model/joins';
+import { installPreAggregationMeta } from './model/meta';
 import type { ServingCore, XcubeRuntime } from './runtime/runtime';
 import { markedDataSources, MAX_OVERLAY_ORCHESTRATORS } from './overlays/connections';
 
-// Before any model compiles: every compile builds its join graph from Cube's export.
+// Before any model compiles: every compile builds its join graph and validator from Cube's exports.
 installKeylessJoins();
+installPreAggregationMeta();
 
 /**
  * Drops an entry of Cube's orchestrator cache, from a subclass so the compiler

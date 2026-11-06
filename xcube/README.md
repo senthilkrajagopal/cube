@@ -42,7 +42,9 @@ Cube's own code is unchanged. The package:
 - lets a cube with no primary key opt in to many_to_one and one_to_one
   joins, in a subclass of Cube's `JoinGraph` (its protected
   `buildJoinEdges`), which it sets as that module's export, where
-  `prepareCompiler` reads it on each compile.
+  `prepareCompiler` reads it on each compile;
+- lets every pre-aggregation carry a `meta`, in a subclass of Cube's
+  `CubeValidator`, set as that module's export in the same way.
 
 Everything is built for one Cube version, the one `peerDependencies` names,
 and the server refuses to start on any other: the protected methods it uses
@@ -126,6 +128,12 @@ In both modes:
   is the model when a join beyond the cube it joins can repeat its rows (a
   one_to_many join from that cube, say): Cube's legacy planner would refuse
   the query, and Tesseract would answer it with wrong numbers.
+- **Pre-aggregation `meta`.** Any pre-aggregation, of any type, takes a
+  `meta` of any shape, as a cube and its members do; Cube's schema refuses
+  one. Cube neither reads it nor builds from it: a rollup's table name, its
+  structure version and the queries it matches are the same with or without
+  it. It stays on the pre-aggregation's definition. As in a cube's `meta`, a
+  YAML string with `{...}` in it is a template.
 
 ### Setting it up
 
@@ -1868,6 +1876,7 @@ that fails when it changes:
 | The environment variable names behind `getEnv` keys xcube sets or reads | `test/unit/cube-contract.test.ts` |
 | The text of Cube's compile errors, which xcube places by file and line | `test/unit/errors.test.ts`, on a live compile |
 | `prepareCompiler` building its join graph from the `JoinGraph` module's export; which measures make Cube refuse a keyless cube's joins (`buildJoinEdges`) and when it counts a cube's rows repeated (`findMultiplicationFactorFor`), both mirrored in `src/model/joins.ts` | `test/unit/joins.test.ts`, on live compiles, and `test/integration/keyless-joins.test.ts` on both planners |
+| `prepareCompiler` building its validator from the `CubeValidator` module's export, which checks each pre-aggregation with its `meta` set aside | `test/unit/meta.test.ts`, on live compiles and both planners |
 | The queue options Cube builds, with xcube's heartbeat | `test/unit/config.test.ts`, through Cube's own `OptsHandler` |
 | A running query's cancel from an instance that hasn't opened its queues | `test/integration/builds.test.ts`, on the memory queue and Cube Store |
 | Each driver's option names: every connection field reaches the driver, and no `CUBEJS_DB_*` or `PG*` value does | `test/image/drivers-env.js`, in the image (CI) |

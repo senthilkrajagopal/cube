@@ -17,6 +17,7 @@ export * from './model/snapshot';
 export * from './model/errors';
 export * from './model/validate';
 export * from './model/joins';
+export * from './model/meta';
 export * from './names/items';
 export { publish, filesOf, itemsHash, titleOf, aliasOf } from './names/publish';
 export { Scope, rewriteReferences } from './names/rewrite';
