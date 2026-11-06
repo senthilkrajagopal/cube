@@ -38,7 +38,11 @@ Cube's own code is unchanged. The package:
   foreign keys with their target's schema), in a queue beside Cube's for
   that data source;
 - generates cubes with a copy of Cube's scaffolder (`src/scaffolding`, see
-  `NOTICE`).
+  `NOTICE`);
+- lets a cube with no primary key opt in to many_to_one and one_to_one
+  joins, in a subclass of Cube's `JoinGraph` (its protected
+  `buildJoinEdges`), which it sets as that module's export, where
+  `prepareCompiler` reads it on each compile.
 
 Everything is built for one Cube version, the one `peerDependencies` names,
 and the server refuses to start on any other: the protected methods it uses
@@ -112,6 +116,16 @@ In both modes:
   `/v1/load` queries).
 - **Without a model.** A token that names no model is served Cube's own data
   model directory (`schemaPath`), unless `withoutModel: 'refuse'`.
+- **Cubes with no primary key.** Cube refuses every join of a cube that has
+  no primary key and has a `count`, `sum`, `avg` or `number` measure. With
+  `meta: { xcube_keyless_joins: true }`, the cube keeps its many_to_one and
+  one_to_one joins, and its measures count each of its rows once through
+  them, on both planners and from rollups. The joined cube must be unique on
+  the join's keys: xcube can't check that, and a duplicate there counts a row
+  twice. The cube's other joins, and joins to it, are still refused, and so
+  is the model when a join beyond the cube it joins can repeat its rows (a
+  one_to_many join from that cube, say): Cube's legacy planner would refuse
+  the query, and Tesseract would answer it with wrong numbers.
 
 ### Setting it up
 
@@ -1853,6 +1867,7 @@ that fails when it changes:
 | One Cube version everywhere: `peerDependencies`, `devDependencies`, what is installed, the `Dockerfile` | `test/unit/cube-contract.test.ts` |
 | The environment variable names behind `getEnv` keys xcube sets or reads | `test/unit/cube-contract.test.ts` |
 | The text of Cube's compile errors, which xcube places by file and line | `test/unit/errors.test.ts`, on a live compile |
+| `prepareCompiler` building its join graph from the `JoinGraph` module's export; which measures make Cube refuse a keyless cube's joins (`buildJoinEdges`) and when it counts a cube's rows repeated (`findMultiplicationFactorFor`), both mirrored in `src/model/joins.ts` | `test/unit/joins.test.ts`, on live compiles, and `test/integration/keyless-joins.test.ts` on both planners |
 | The queue options Cube builds, with xcube's heartbeat | `test/unit/config.test.ts`, through Cube's own `OptsHandler` |
 | A running query's cancel from an instance that hasn't opened its queues | `test/integration/builds.test.ts`, on the memory queue and Cube Store |
 | Each driver's option names: every connection field reaches the driver, and no `CUBEJS_DB_*` or `PG*` value does | `test/image/drivers-env.js`, in the image (CI) |
