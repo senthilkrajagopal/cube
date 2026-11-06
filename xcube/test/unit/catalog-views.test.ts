@@ -175,6 +175,21 @@ describe('catalogView', () => {
       expect(view.primaryKeysQuery()).toContain('con.contype = \'p\'');
     });
 
+    test('lists tables with their types and materialized views through a stored connection too', async () => {
+      const driver = new PostgresDriver((sql) => (sql.includes('pg_matviews')
+        ? [{ schema_name: 'public', table_name: 'orders', table_type: 'BASE TABLE' }, { schema_name: 'public', table_name: 'totals', table_type: 'MATERIALIZED VIEW' }]
+        : [{ schema_name: 'public', table_name: 'orders' }]));
+
+      // A stored connection's driver runs each method on the real driver, past the view.
+      for (const source of [driver, new SwitchableDriver('warehouse', driver).proxy]) {
+        await expect(catalogView(source).getTablesForSpecificSchemas([{ schema_name: 'public' }])).resolves.toEqual([
+          { schema_name: 'public', table_name: 'orders', table_type: 'BASE TABLE' },
+          { schema_name: 'public', table_name: 'totals', table_type: 'MATERIALIZED VIEW' },
+        ]);
+      }
+      expect(driver.queries.map(([, values]) => values)).toEqual([['public'], ['public']]);
+    });
+
     test('leaves drivers built on it without pg_matviews, and their own key queries, alone', () => {
       const view: any = catalogView(new RedshiftDriver());
 

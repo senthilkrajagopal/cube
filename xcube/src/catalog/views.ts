@@ -72,6 +72,16 @@ const baseTablesQuery: Method = function (schemasPlaceholders: string) {
 };
 
 /**
+ * BaseDriver's, run on the view: a stored connection's driver runs its own
+ * on the real driver (`SwitchableDriver`), with the driver's tables query,
+ * never the view's.
+ */
+const baseTables: Method = function (schemas: QuerySchemasResult[]) {
+  const placeholders = schemas.map((_, idx) => this.param(idx)).join(', ');
+  return this.query(this.getTablesForSpecificSchemasQuery(placeholders), schemas.map(s => s.schema_name));
+};
+
+/**
  * BaseDriver's `primaryKeys` and `foreignKeys`, run on the view. A stored
  * connection's driver is a proxy that runs each method on the real driver
  * (`SwitchableDriver`): its own `foreignKeys` would ask the driver's own
@@ -395,6 +405,7 @@ export function catalogView(driver: BaseDriver): CatalogDriver {
   const original = (method: string): Method => (driver as any)[method];
 
   replace('BaseDriver', 'getTablesForSpecificSchemasQuery', baseTablesQuery);
+  replace('BaseDriver', 'getTablesForSpecificSchemas', baseTables);
   replace('BaseDriver', 'getColumnsForSpecificTables', baseColumnsForSpecificTables);
 
   // Redshift, Crate and Materialize speak Postgres but have no pg_matviews.
