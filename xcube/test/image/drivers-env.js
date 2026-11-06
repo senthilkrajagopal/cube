@@ -135,6 +135,10 @@ const POISONED = [...Object.values(POISON), ...Object.values(AWS_POISON)].filter
         parts.push(await driver.credentials.getCredentials());
         parts.push({ provider: driver.credentials.constructor.name });
       }
+      if (driver.credentials && typeof driver.credentials.getDbName === 'function') {
+        // Redshift's database for SHOW SCHEMAS, SHOW TABLES and SHOW COLUMNS.
+        parts.push({ database: driver.credentials.getDbName() });
+      }
       const leaked = seen(parts, POISONED);
       if (driverType === 'redshift' && driver.credentials?.constructor.name !== 'RedshiftPlainCredentialsProvider') {
         leaked.push(`credentials from ${driver.credentials?.constructor.name}`);

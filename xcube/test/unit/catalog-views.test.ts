@@ -44,10 +44,18 @@ class RedshiftDriver extends PostgresDriver {
     return null;
   }
 
+  // As Cube's: SHOW TABLES for a schema information_schema has no tables of.
   public override async getTablesForSpecificSchemas(schemas: { schema_name: string }[]) {
     const tables: any[] = await super.getTablesForSpecificSchemas(schemas);
-    tables.push({ schema_name: 'spectrum', table_name: 'events' });
+    for (const { schema_name } of schemas.filter(s => !tables.some(t => t.schema_name === s.schema_name))) {
+      const rows: any[] = await this.tablesForExternalSchema(schema_name);
+      rows.forEach(t => tables.push({ schema_name, table_name: t.table_name }));
+    }
     return tables;
+  }
+
+  public async tablesForExternalSchema(schema: string) {
+    return this.query(`SHOW TABLES FROM SCHEMA dev.${schema}`);
   }
 }
 
@@ -175,13 +183,22 @@ describe('catalogView', () => {
       expect(view.foreignKeysQuery()).toBeNull();
     });
 
-    test('calls Redshift\'s external tables external', async () => {
-      const driver = new RedshiftDriver(() => [{ schema_name: 'public', table_name: 'orders', table_type: 'BASE TABLE' }]);
+    test('calls Redshift\'s external tables external, and keeps the others\' types through a stored connection', async () => {
+      const driver = new RedshiftDriver((sql) => {
+        if (sql.startsWith('SHOW TABLES FROM SCHEMA dev.spectrum')) {
+          return [{ schema_name: 'spectrum', table_name: 'events', table_type: 'EXTERNAL TABLE' }, { schema_name: 'spectrum', table_name: 'clicks' }];
+        }
+        return sql.includes('information_schema.tables') ? [{ schema_name: 'qda', table_name: 'radix', table_type: 'VIEW' }] : [];
+      });
 
-      await expect(catalogView(driver).getTablesForSpecificSchemas([{ schema_name: 'public' }])).resolves.toEqual([
-        { schema_name: 'public', table_name: 'orders', table_type: 'BASE TABLE' },
-        { schema_name: 'spectrum', table_name: 'events', table_type: 'EXTERNAL TABLE' },
-      ]);
+      // A stored connection's driver runs each method on the real driver, past the view.
+      for (const source of [driver, new SwitchableDriver('warehouse', driver).proxy]) {
+        await expect(catalogView(source).getTablesForSpecificSchemas([{ schema_name: 'qda' }, { schema_name: 'spectrum' }])).resolves.toEqual([
+          { schema_name: 'qda', table_name: 'radix', table_type: 'VIEW' },
+          { schema_name: 'spectrum', table_name: 'events', table_type: 'EXTERNAL TABLE' },
+          { schema_name: 'spectrum', table_name: 'clicks', table_type: 'EXTERNAL TABLE' },
+        ]);
+      }
     });
   });
 

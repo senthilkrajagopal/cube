@@ -9,6 +9,7 @@
  * of them reaches a connection.
  */
 import { CubejsServerCore } from '@cubejs-backend/server-core';
+import { keyByDataSource } from '@cubejs-backend/shared';
 
 import { makeAthenaDriver } from './athena';
 import { makeClickHouseDriver } from './clickhouse';
@@ -98,11 +99,26 @@ const CUBE_TLS = /^CUBEJS_(DS_.+_)?DB_SSL/;
  * constructor reads them (`getSslOptions`) before the config's `ssl` replaces
  * them, and reads, or fails on, the files they name.
  */
-const withoutCubeTls = (cubeType: string) => (config: Record<string, unknown>) => withoutEnv(
-  [CUBE_TLS],
-  {},
-  () => CubejsServerCore.createDriver(cubeType as any, config as any),
-);
+const withoutCubeTls = (
+  cubeType: string,
+  standIns: (config: Record<string, unknown>) => Record<string, string> = () => ({}),
+) => (config: Record<string, unknown>) => {
+  const env = standIns(config);
+  return withoutEnv(
+    [CUBE_TLS, ...Object.keys(env).map(key => new RegExp(`^${key}$`))],
+    env,
+    () => CubejsServerCore.createDriver(cubeType as any, config as any),
+  );
+};
+
+/**
+ * Cube's Redshift driver names its database in SHOW SCHEMAS, SHOW TABLES and
+ * SHOW COLUMNS from its environment only (`CUBEJS_DB_NAME`, under the data
+ * source's name): the connection's, in its place.
+ */
+const redshiftDatabase = (config: Record<string, unknown>) => ({
+  [keyByDataSource('CUBEJS_DB_NAME', config.dataSource as string | undefined, Boolean(config.preAggregations))]: String(config.database),
+});
 
 const tlsFields = [
   text('ssl', { kind: 'boolean' }),
@@ -268,7 +284,7 @@ export const DRIVERS: Record<DriverType, DriverSpec> = {
       // Its export bucket is the environment's, with AWS keys it would send to this host in an UNLOAD.
       exportBucket: undefined,
     }),
-    make: withoutCubeTls('redshift'),
+    make: withoutCubeTls('redshift', redshiftDatabase),
   },
   mysql: {
     cubeType: 'mysql',

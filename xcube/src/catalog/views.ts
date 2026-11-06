@@ -365,6 +365,25 @@ const databricksTables: Method = async function (schemas: QuerySchemasResult[]):
   return tables.flat();
 };
 
+/**
+ * Redshift's, each table with its type: information_schema's, and for a
+ * schema it has none of, as an external one's, SHOW TABLES' (as upstream),
+ * external where it doesn't say. Run on the view, not by calling the
+ * driver's own: a stored connection runs that on the driver
+ * (`SwitchableDriver`), where the view's query isn't seen.
+ */
+const redshiftTables: Method = async function (schemas: QuerySchemasResult[]): Promise<CatalogTableRow[]> {
+  const placeholders = schemas.map((_, idx) => this.param(idx)).join(', ');
+  const tables: CatalogTableRow[] = await this.query(baseTablesQuery.call(this, placeholders), schemas.map(s => s.schema_name));
+
+  for (const { schema_name } of schemas.filter(s => !tables.some(t => t.schema_name === s.schema_name))) {
+    const rows = await this.tablesForExternalSchema(schema_name);
+    rows.forEach(({ table_name, table_type }: any) => tables.push({ schema_name, table_name, table_type: table_type || 'EXTERNAL TABLE' }));
+  }
+
+  return tables;
+};
+
 export function catalogView(driver: BaseDriver): CatalogDriver {
   const classes = driverClasses(driver);
   const overrides: Record<string, Method> = {};
@@ -402,14 +421,7 @@ export function catalogView(driver: BaseDriver): CatalogDriver {
 
   replace('DatabricksDriver', 'getTablesForSpecificSchemas', databricksTables);
 
-  // Its tables of external schemas, listed apart, are the ones without a type.
-  if (definerOf(driver, 'getTablesForSpecificSchemas') === 'RedshiftDriver') {
-    const tables = original('getTablesForSpecificSchemas');
-    overrides.getTablesForSpecificSchemas = async function (schemas: QuerySchemasResult[]) {
-      const rows: CatalogTableRow[] = await tables.call(this, schemas);
-      return rows.map(row => (row.table_type ? row : { ...row, table_type: 'EXTERNAL TABLE' }));
-    };
-  }
+  replace('RedshiftDriver', 'getTablesForSpecificSchemas', redshiftTables);
 
   // DuckDB keeps to its configured catalog, as its schemas query does.
   if (classes.includes('DuckDBDriver')) {
