@@ -23,6 +23,8 @@ Cube's own code is unchanged. The package:
 - subclasses Cube's server container, server, server core and API gateway,
   through their protected factory methods, to add the introspection routes
   in a new `introspection` API scope and the admin routes;
+- adds `POST /v1/row-set` (see [Row-sets](#row-sets)), whose SQL Cube's
+  legacy planner builds in a subclass of each dialect;
 - serves models through Cube's public configuration hooks
   (`contextToAppId`, `repositoryFactory`, `extendContext`,
   `scheduledRefreshContexts`, `contextToGroups`), set by
@@ -530,6 +532,50 @@ and the client's drift check never see it).
   the admin meta, and no authored member may hold `__xc_` (`422`).
 - **Rollups.** A companion reads its cube's rollups for its measure where
   Tesseract can (a moving average of a sum does); nothing is rebuilt.
+
+### Row-sets
+
+`POST /cubejs-api/v1/row-set` `{ query }` answers a query's rows before Cube
+aggregates them, as SQL for its data source to run, with each measure's
+aggregate over them (`src/rowset.ts`). wechart's engine computes over them
+what Cube can't (its Spotfire stages); Cube still evaluates every policy.
+- **As `/v1/load`.** The same token, context, folder gate, access policies
+  and `queryRewrite`; it needs the `data` and `sql` scopes. The query is
+  `/v1/load`'s, without `limit`, `offset`, `order`, `total`, `ungrouped`,
+  `calculations` or `compareDateRange` (`400 invalid_row_set`).
+- **A row-set** is the query's join ungrouped, with no `GROUP BY`, `ORDER BY` or
+  `LIMIT`: one row per joined row. Its columns are the query's dimensions and
+  time dimensions (by granularity), every joined cube's primary keys, and the
+  value each of its measures' leaves aggregates: a sum's or an avg's column, a
+  count's primary key or `sql`, a count_distinct's value, a filtered measure's
+  value where its filters hold. A calculated (`number`) measure is its leaves.
+  It is built with Cube's legacy planner, in a subclass of the data source's
+  dialect: Cube's ungrouped queries give a count as `1`, which loses a
+  distinct count.
+- **Policies.** Where a policy (or `queryRewrite`) filters the query's rows,
+  `policyRowSet` holds the rows it alone lets through: the same columns and
+  keys, without the query's filters, segments and date ranges. The query's
+  rows are among them, by their keys. With no such filter, it is left out.
+  `security` is `{ denied, masked }`, as a dry run reports it; a masked key
+  is refused (`masked_key`).
+- **Measures.** Each requested measure is `{ sql, overLeaves, multiplied, key?,
+  leaves }`:
+  - `sql` is its aggregate over the row-set's columns, Cube's own where no leaf
+    is `multiplied`;
+  - each leaf is `{ member, alias, sql, multiplied, key? }`. A leaf is
+    `multiplied` where the join repeats its cube's rows and its aggregate
+    would count them again (a sum, an avg, a count of values): aggregate it
+    over its rows with each `key` once;
+  - `overLeaves` is the measure over its leaves' aggregates, each a column
+    named by its leaf's alias.
+  - Refused with their reasons (`unsupported_measure`, `refusals`): multi-stage,
+    rolling window, running total, count_distinct_approx and rank measures,
+    and a measure that reads one.
+- **Refused too:** a cube with no primary key in the join (`no_primary_key`),
+  and a query that would read a pre-aggregation (`pre_aggregation`).
+- **Answer:** `{ dataSource, dialect, rowSet: { sql, params }, policyRowSet?,
+  aliasToMember, keys: { cube: [alias] }, measures, security }`. Through a view,
+  keys and leaves are the view's members where it includes them.
 
 ### Connections
 
@@ -1919,6 +1965,7 @@ that fails when it changes:
 | `prepareCompiler` building its join graph from the `JoinGraph` module's export; which measures make Cube refuse a keyless cube's joins (`buildJoinEdges`) and when it counts a cube's rows repeated (`findMultiplicationFactorFor`), both mirrored in `src/model/joins.ts` | `test/unit/joins.test.ts`, on live compiles, and `test/integration/keyless-joins.test.ts` on both planners |
 | `prepareCompiler` building its validator from the `CubeValidator` module's export, which checks each pre-aggregation with its `meta` set aside | `test/unit/meta.test.ts`, on live compiles and both planners |
 | Tesseract building a time series from the data with the DuckDB dialect's `generated_time_series_*` templates | `test/integration/duckdb-series.test.ts`, on an in-process DuckDB |
+| Cube's legacy planner rendering measures (`renderSqlMeasure`), leaf measures (`collectLeafMeasures`) and multiplied cubes (`multipliedJoinRowResult`), which row-sets build on | `test/integration/rowset.test.ts`: aggregates over a row-set equal `/v1/load`'s, fan-out, policies and views included |
 | Cube's DuckDB cell encoding, which wechart's engine copies | `test/integration/engine.test.ts`, whose stand-in engine encodes with Cube's `Transform.ts` |
 | The queue options Cube builds, with xcube's heartbeat | `test/unit/config.test.ts`, through Cube's own `OptsHandler` |
 | A running query's cancel from an instance that hasn't opened its queues | `test/integration/builds.test.ts`, on the memory queue and Cube Store |

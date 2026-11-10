@@ -52,6 +52,9 @@ import {
 } from './runtime/runtime';
 import { relationNames } from './sql/classify';
 import { ROLE_KEY } from './security/verifier';
+import {
+  definitionOf, joinedCubes, keysOf, measuresOver, rowSetDialect, rowSetQuery, RowSetError, unsupportedMeasure, viewMemberFor,
+} from './rowset';
 
 /** A UUID derived from text, for the compiler id of a merged meta (the SQL API wants a UUID). */
 function uuidOf(text: string): string {
@@ -374,9 +377,14 @@ export class XcubeApiGateway extends ApiGateway {
     return super.getNormalizedQueries(inputQuery, context, persistent, memberExpressions, cacheMode);
   }
 
-  /** A query's calculations that can't be computed are answered `400`, each with its reason. */
+  /** A query's calculations that can't be computed are answered `400`, each with its reason; so is a row-set Cube can't build. */
   public override handleError(options: Parameters<ApiGateway['handleError']>[0]) {
     const { e, context, res, requestStarted } = options;
+    if (e instanceof RowSetError) {
+      this.log({ type: 'Invalid row-set', error: e.message, duration: this.duration(requestStarted) } as any, context);
+      res({ error: e.message, code: e.code, ...(e.refusals ? { refusals: e.refusals } : {}) }, { status: 400 });
+      return;
+    }
     if (e instanceof CalculationError) {
       this.log({ type: 'Invalid calculations', error: e.message, duration: this.duration(requestStarted) } as any, context);
       res({ error: e.message, code: 'invalid_calculation', calculations: e.refusals }, { status: 400 });
@@ -389,6 +397,7 @@ export class XcubeApiGateway extends ApiGateway {
     // Before Cube's routes, so that Cube's error middleware, which it adds
     // last, also answers for these.
     this.initIntrospectionRoutes(app);
+    this.initRowSetRoute(app);
     const runtime = this.xcubeRuntime();
     if (runtime) {
       initAdminRoutes(app, this.basePath, runtime, (type, params) => this.log({ type, ...params }), {
@@ -925,6 +934,158 @@ export class XcubeApiGateway extends ApiGateway {
       });
     });
     return answer;
+  }
+
+  /** `POST /v1/row-set`, as `/v1/load` is reached: the same token, context and policies (`rowSet`). */
+  protected initRowSetRoute(app: ExpressApplication) {
+    const userMiddlewares: RequestHandler[] = [
+      this.checkAuth,
+      this.requestContextMiddleware,
+      this.contextRejectionMiddleware,
+      this.logNetworkUsage,
+      this.requestLoggerMiddleware,
+    ];
+    const jsonParser = bodyParser.json({ limit: getEnv('maxRequestSize') });
+    app.post(`${this.basePath}/v1/row-set`, jsonParser, userMiddlewares, asyncHandler(async (req, res) => {
+      await this.rowSet({ query: (req.body as any)?.query, context: (req as any).context, res: this.resToResultFn(res) });
+    }));
+  }
+
+  /**
+   * A query's row-set (`src/rowset.ts`): its rows before Cube aggregates
+   * them, as SQL for its data source, with each measure's aggregate over
+   * them. Policies apply as on `/v1/load`; with any, the rows they alone let
+   * through are answered too (`policyRowSet`), over the same columns. Needs
+   * the `data` and `sql` scopes: it reads rows, as SQL.
+   */
+  public async rowSet({ query, context, res }: { query: unknown; context: RequestContext; res: (message: any, extra?: any) => any }) {
+    const requestStarted = new Date();
+    try {
+      await this.assertApiScope('data', context.securityContext);
+      await this.assertApiScope('sql', context.securityContext);
+      const asked = rowSetQuery(query);
+      const compilerApi = await this.getCompilerApi(context);
+      const normalized = async (q: any) => {
+        const [, queries] = await this.getNormalizedQueries(q, context, true) as any;
+        return queries[0];
+      };
+      const generatorOf = (n: any) => compilerApi.getSqlGenerator(this.coerceForSqlQuery({ ...n, disableExternalPreAggregations: true }, context));
+
+      // The query as Cube answers it, policies on: what it joins, and how its measures aggregate.
+      const asCube = await normalized(asked);
+      const measures: unknown[] = asCube.measures ?? [];
+      if (measures.some((m) => typeof m !== 'string')) {
+        throw new RowSetError('A row-set\'s measures are members of the model, not expressions');
+      }
+      const { sqlGenerator, compilers } = await generatorOf(asCube);
+      const grouped = sqlGenerator.newQueryWithoutNative();
+      const plan = compilers.compiler.withQuery(grouped, () => {
+        const evaluator = grouped.cubeEvaluator;
+        const refusals: { member: string; reason: string }[] = [];
+        const leavesOf: Record<string, string[]> = {};
+        for (const measure of measures as string[]) {
+          const reason = unsupportedMeasure(definitionOf(evaluator, 'measures', measure));
+          if (reason) {
+            refusals.push({ member: measure, reason });
+          } else {
+            const leaves: string[] = grouped.collectLeafMeasures(() => grouped.newMeasure(measure).measureSql());
+            leavesOf[measure] = leaves.length ? leaves : [measure];
+            for (const leaf of leavesOf[measure].filter((l) => l !== measure)) {
+              const through = unsupportedMeasure(definitionOf(evaluator, 'measures', leaf));
+              if (through) {
+                refusals.push({ member: measure, reason: `it reads ${leaf}: ${through}` });
+              }
+            }
+          }
+        }
+        if (refusals.length) {
+          throw new RowSetError(
+            `These measures can't be aggregated over a row-set: ${refusals.map((r) => r.member).join(', ')}`,
+            'unsupported_measure',
+            refusals,
+          );
+        }
+        const cubes = joinedCubes(grouped);
+        const keys = keysOf(grouped, cubes);
+        const queried = [...(asked.dimensions ?? []), ...(asked.measures ?? []), ...(asked.timeDimensions ?? []).map((td: any) => td?.dimension)]
+          .filter((m): m is string => typeof m === 'string');
+        const views = [...new Set(queried.map((m) => m.split('.')[0]))].filter((c) => evaluator.evaluatedCubes?.[c]?.isView);
+        const keyMembers: Record<string, string[]> = Object.fromEntries(Object.entries(keys)
+          .map(([cube, paths]) => [cube, paths.map((p) => viewMemberFor(evaluator, views, 'dimensions', p))]));
+        const leafMember: Record<string, string> = {};
+        for (const leaf of new Set(Object.values(leavesOf).flat())) {
+          leafMember[leaf] = viewMemberFor(evaluator, views, 'measures', leaf);
+        }
+        return { leavesOf, keyMembers, leafMember };
+      });
+
+      const unique = (list: string[]) => [...new Set(list)];
+      const rowQuery = {
+        ...asked,
+        dimensions: unique([...(asked.dimensions ?? []), ...Object.values(plan.keyMembers).flat()]),
+        measures: unique(Object.values(plan.leafMember)),
+        ungrouped: true,
+        order: [],
+      };
+      const policyQuery = {
+        ...rowQuery,
+        filters: [],
+        segments: [],
+        timeDimensions: (asked.timeDimensions ?? [])
+          .filter((td: any) => td?.granularity)
+          .map(({ dateRange: _dateRange, ...td }: any) => td),
+      };
+      const build = async (n: any) => {
+        const { sqlGenerator: generator, compilers: built } = await generatorOf({ ...n, xcubeRowSet: true });
+        const rows = built.createQuery(rowSetDialect(generator.constructor), {
+          ...generator.options, useNativeSqlPlanner: false, plan: undefined, xcubeRowSet: true,
+        });
+        return built.compiler.withQuery(rows, () => {
+          const [sql, params] = rows.buildSqlAndParams();
+          if (rows.preAggregations.preAggregationsDescription().length) {
+            throw new RowSetError('This query would read a pre-aggregation: a row-set reads its cubes\' own tables', 'pre_aggregation');
+          }
+          return { sql, params, aliasNameToMember: rows.aliasNameToMember as Record<string, string>, dataSource: rows.dataSource as string };
+        });
+      };
+
+      const full = await normalized(rowQuery);
+      const security = securityOf(full);
+      const keyPaths = new Set(Object.values(plan.keyMembers).flat());
+      const maskedKeys = security.masked.map((m) => m.member).filter((m) => keyPaths.has(m));
+      if (maskedKeys.length) {
+        throw new RowSetError(`A policy masks ${maskedKeys.join(', ')}: a row-set's keys must be their values`, 'masked_key');
+      }
+      const rowSet = await build(full);
+      const policyOnly = await normalized(policyQuery);
+      const policed = Boolean(policyOnly.filters?.length || policyOnly.segments?.length);
+      const policyRowSet = policed ? await build(policyOnly) : undefined;
+      if (policyRowSet && Object.keys(policyRowSet.aliasNameToMember).sort().join() !== Object.keys(rowSet.aliasNameToMember).sort().join()) {
+        throw new Error('A row-set and its policy row-set have other columns');
+      }
+
+      const aliasOfMember = Object.fromEntries(Object.entries(rowSet.aliasNameToMember).map(([alias, member]) => [member, alias]));
+      const keyAliases: Record<string, string[]> = Object.fromEntries(Object.entries(plan.keyMembers as Record<string, string[]>).map(([cube, paths]) => [cube, paths.map((p) => aliasOfMember[p])]));
+      const measuresSql = compilers.compiler.withQuery(grouped, () => measuresOver(
+        grouped,
+        measures as string[],
+        plan.leavesOf,
+        (leaf) => aliasOfMember[plan.leafMember[leaf]],
+        keyAliases,
+      ));
+      res({
+        dataSource: rowSet.dataSource,
+        dialect: await compilerApi.getDbType(rowSet.dataSource),
+        rowSet: { sql: rowSet.sql, params: rowSet.params },
+        ...(policyRowSet ? { policyRowSet: { sql: policyRowSet.sql, params: policyRowSet.params } } : {}),
+        aliasToMember: rowSet.aliasNameToMember,
+        keys: keyAliases,
+        measures: measuresSql,
+        security,
+      });
+    } catch (e: any) {
+      this.handleError({ e, context, query, res, requestStarted } as any);
+    }
   }
 
   protected initIntrospectionRoutes(app: ExpressApplication) {
