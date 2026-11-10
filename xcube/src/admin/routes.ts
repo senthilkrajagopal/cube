@@ -1,3 +1,4 @@
+import zlib from 'zlib';
 import bodyParser from 'body-parser';
 import Joi from 'joi';
 import type {
@@ -34,6 +35,9 @@ import { checkDataSourceName } from '../names/items';
 import { PARAMETER_NAME } from '../sql/classify';
 import type { QueueEntry } from '../gateway';
 import { SqlRunError, type SqlFailure } from '../sql/runner';
+import {
+  EXPORT_MAX_BUFFERED, EXPORT_MAX_TIMEOUT_MS, EXPORT_TIMEOUT_MS, ExportError, ExportRows,
+} from '../sql/export';
 import { adminAuth } from './auth';
 
 const file = Joi.object({
@@ -213,6 +217,15 @@ const sqlSchema = Joi.object({
       value: Joi.alternatives(Joi.string().max(100000), Joi.boolean()).required(),
     }),
   ).max(100),
+});
+
+const exportSchema = Joi.object({
+  runId: Joi.string().pattern(RUN_ID).required(),
+  schema: Joi.string().min(1).max(256),
+  table: Joi.string().min(1).max(256).required(),
+  columns: Joi.array().items(Joi.string().min(1).max(256)).min(1).max(4096),
+  timeoutMs: Joi.number().integer().min(1000).max(EXPORT_MAX_TIMEOUT_MS)
+    .default(EXPORT_TIMEOUT_MS),
 });
 
 const sqlCancelSchema = Joi.object({
@@ -796,6 +809,91 @@ export function initAdminRoutes(
   }));
 
   app.post(`${base}/cubestore/sql`, auth, json, runSql('cubestore-sql', () => ({ cubeStore: true })));
+
+  /**
+   * Streams a table of a stored connection as NDJSON (`sql/export.ts`):
+   * gzipped where the client accepts it. A failure before the first line is
+   * answered as a SQL run's is; one after, as the last line.
+   */
+  app.post(`${base}/connections/:name/export`, auth, json, handle('export', async (req, res) => {
+    const model = modelOf(req);
+    const name = connectionNameOf(req);
+    const body = valid<any>(exportSchema, req.body);
+    await requireModel(model);
+    const gzip = /\bgzip\b/.test(String(req.headers['accept-encoding'] ?? ''));
+    let out: (NodeJS.WritableStream & { writableLength: number }) | null = null;
+    const start = () => {
+      if (!out) {
+        res.status(200);
+        res.set('Content-Type', 'application/x-ndjson; charset=utf-8');
+        res.set('Cache-Control', 'no-store');
+        res.on('error', () => undefined);
+        if (gzip) {
+          res.set('Content-Encoding', 'gzip');
+          const zipped = zlib.createGzip();
+          zipped.on('error', () => undefined);
+          zipped.pipe(res);
+          out = zipped;
+        } else {
+          out = res;
+        }
+      }
+      return out;
+    };
+    // `false` once more waits unsent than the cap: the client doesn't keep up.
+    const rows = new ExportRows((line) => {
+      const to = start();
+      to.write(`${line}\n`);
+      return to.writableLength + (to === res ? 0 : res.writableLength) < EXPORT_MAX_BUFFERED;
+    });
+    let finished = false;
+    // The client gone: its run stops.
+    res.on('close', () => {
+      if (!finished) {
+        runtime.cancelSql(model, body.runId).catch(() => undefined);
+      }
+    });
+    const started = Date.now();
+    const logged = { model, target: name, runId: body.runId };
+    const last = (line: object) => {
+      finished = true;
+      start().end(`${JSON.stringify(line)}\n`);
+    };
+    try {
+      const answer = await runtime.exportTable(model, name, body, rows);
+      if (rows.slow) {
+        logger('xcube: export', { ...logged, outcome: 'client_too_slow', rows: rows.count, durationMs: Date.now() - started });
+        last({ error: { code: 'client_too_slow', message: `The client read too slowly: over ${EXPORT_MAX_BUFFERED} bytes waited unsent` } });
+        return;
+      }
+      rows.finishColumns();
+      logger('xcube: export', { ...logged, outcome: 'ok', rows: rows.count, durationMs: answer.durationMs });
+      last({ end: { rows: rows.count, durationMs: answer.durationMs } });
+    } catch (e) {
+      if (e instanceof ExportError && !out) {
+        throw new AdminError(400, e.code, e.message);
+      }
+      if (!(e instanceof SqlRunError)) {
+        if (out) {
+          last({ error: { code: 'internal', message: 'The export failed' } });
+          logger('xcube: export', { ...logged, outcome: 'internal', rows: rows.count, error: String((e as any)?.message ?? e) });
+          return;
+        }
+        throw e;
+      }
+      logger('xcube: export', { ...logged, outcome: e.code, rows: rows.count, durationMs: Date.now() - started });
+      if (out) {
+        last({ error: { code: e.code, message: e.message, rows: rows.count } });
+        return;
+      }
+      finished = true;
+      const status = SQL_STATUS[e.code];
+      if (status === 503) {
+        res.set('Retry-After', '5');
+      }
+      res.status(status).json({ error: e.message, code: e.code, ...(e.reason ? { reason: e.reason } : {}) });
+    }
+  }));
 
   app.get(`${base}/sql/runs/:runId`, auth, handle('sql-run', async (req, res) => {
     const model = modelOf(req);

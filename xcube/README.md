@@ -1574,6 +1574,32 @@ none were known yet):
 | 502 | `connect_failed` | |
 | 503 | `busy` | `Retry-After` |
 
+#### `POST …/connections/{name}/export`
+
+Streams a whole table of a stored connection, for wechart's engine to load,
+through the connection's own credentials: `{ runId, schema?, table, columns?,
+timeoutMs? }` (`src/sql/export.ts`).
+- **Its statement is xcube's own:** `SELECT <columns, or *> FROM
+  <schema>.<table>`, each name quoted for the database. A name holding a quote,
+  bracket, backslash or control character is refused (`400 invalid_export`).
+- **It is a SQL run** (see SQL runner), with no row or byte cap: the same
+  read-only layers, a connection of its own, the database's own statement
+  timeout from `timeoutMs` (30 minutes by default, at most 6 hours), and a
+  cancel by its `runId` from any instance (`POST …/sql/cancel`). A client that
+  goes away cancels it. It counts among an instance's 16 runs.
+- **The answer is NDJSON** (`application/x-ndjson`), gzipped where the
+  request accepts it (`Accept-Encoding: gzip`): a `{"columns":[{name,type}]}`
+  line, a JSON array per row, each cell as the SQL runner gives it, and a last
+  line `{"end":{"rows","durationMs"}}`. An answer whose last line isn't `end`
+  is incomplete.
+- **A failure before the first line** is answered as a SQL run's is (status
+  and `{ error, code }`). One after it ends the stream with
+  `{"error":{"code","message","rows"}}` as the last line: `timeout`,
+  `cancelled`, `query_failed`, or `client_too_slow` once more than 256 MB wait
+  unsent.
+- Rows are read as the database sends them, a page or a cursor's batch at a
+  time, and written as they come: nothing holds the table.
+
 #### `POST …/cubestore/sql`
 
 The same, on Cube Store.

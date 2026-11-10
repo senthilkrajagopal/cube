@@ -39,6 +39,7 @@ import { dataSourcesOf, epochOf, targetOf, withIdentityAliases } from '../connec
 import { calcVersion, specKey, withCompanions, type CalcSpec } from '../calcs/companions';
 import { CalculationError, planCalculations, type CalcPlan } from '../calcs/requests';
 import { SqlRunError, type SessionDialect, type SqlAnswer } from '../sql/runner';
+import { EXPORT_ROWS, exportStatement, type ExportRows } from '../sql/export';
 import { SqlRuns, type SqlRunRequest, type SqlTarget } from '../sql/runs';
 import { createListenClient, createPool, type Logger } from '../store/db';
 import { PgOpsStore, type RefreshTick } from '../store/ops';
@@ -2060,6 +2061,25 @@ export class XcubeRuntime {
    */
   public async runSql(model: string, on: { connection: string; overlay?: string } | { cubeStore: true }, request: SqlRunRequest): Promise<SqlAnswer> {
     return this.sqlRuns.run(model, await this.sqlTargetOf(model, on, request), request);
+  }
+
+  /**
+   * Exports a table of a model's data source (`sql/export.ts`): the run's
+   * rows go to `rows` as they come. `prepared` is told the statement once it
+   * is written, before it runs.
+   */
+  public async exportTable(
+    model: string,
+    connection: string,
+    request: { runId: string; schema?: string; table: string; columns?: string[]; timeoutMs: number },
+    rows: ExportRows,
+  ): Promise<SqlAnswer> {
+    const run: SqlRunRequest = {
+      runId: request.runId, sql: '', timeoutMs: request.timeoutMs, maxRows: EXPORT_ROWS, maxBytes: Number.MAX_SAFE_INTEGER,
+    };
+    const target = await this.sqlTargetOf(model, { connection }, run);
+    run.sql = exportStatement(target.dialect, request);
+    return this.sqlRuns.run(model, target, run, rows);
   }
 
   /**

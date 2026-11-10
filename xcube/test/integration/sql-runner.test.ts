@@ -382,6 +382,82 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
     expect((await introspect('scratch/schemas?overlay=ws-1', undefined, token({}))).body).toMatchObject({ code: 'bad_request' });
   });
 
+  describe('exports: a whole table streamed as NDJSON, through the connection\'s own credentials', () => {
+    const exportOf = (body: object, encoding?: string) => {
+      const req = request(server).post(`${base}/connections/default/export`)
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`)
+        .buffer(true)
+        .parse((res, done) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (c: Buffer) => chunks.push(c));
+          res.on('end', () => done(null, Buffer.concat(chunks).toString('utf8')));
+        });
+      if (encoding) {
+        req.set('Accept-Encoding', encoding);
+      }
+      return req.send({ runId: crypto.randomUUID(), ...body });
+    };
+    const lines = (text: string) => text.trim().split('\n').map((l) => JSON.parse(l));
+
+    test('the columns, each row as the SQL runner gives it, then the end with the row count', async () => {
+      const res = await exportOf({ schema: warehouse, table: 'orders', columns: ['id', 'customer', 'amount', 'placed_at'] });
+      expect({ status: res.status, body: res.status === 200 ? undefined : res.body }).toEqual({ status: 200, body: undefined });
+      expect(res.headers['content-type']).toMatch(/application\/x-ndjson/);
+      const [head, ...rest] = lines(res.body);
+      expect(head.columns.map((c: any) => c.name)).toEqual(['id', 'customer', 'amount', 'placed_at']);
+      expect(rest.at(-1)).toEqual({ end: { rows: 50, durationMs: expect.any(Number) } });
+      const rows = rest.slice(0, -1);
+      expect(rows).toHaveLength(50);
+      // As the SQL runner gives them: Cube's Postgres driver reads a timestamptz as UTC, with no zone.
+      expect(rows[0]).toEqual([1, 'c1', '1.50', '2024-01-02T00:00:00.000']);
+    });
+
+    test('every column, gzipped where the client takes it', async () => {
+      const res = await exportOf({ schema: warehouse, table: 'orders' }, 'gzip').expect(200);
+      expect(res.headers['content-encoding']).toBe('gzip');
+      const all = lines(res.body);
+      expect(all[0].columns).toHaveLength(4);
+      expect(all.at(-1).end.rows).toBe(50);
+    });
+
+    test('a big table streams in full, with no row or byte cap', async () => {
+      await sql(`CREATE TABLE ${warehouse}.big AS SELECT n, repeat('x', 50) AS pad FROM generate_series(1, 300000) n`);
+      const res = await exportOf({ schema: warehouse, table: 'big' }, 'gzip').expect(200);
+      const all = lines(res.body);
+      expect(all.at(-1).end.rows).toBe(300000);
+      expect(all).toHaveLength(300002);
+    });
+
+    test('a name it can\'t quote is refused; a table that isn\'t there fails as a SQL run does, before any line', async () => {
+      const quoted = await exportOf({ schema: warehouse, table: 'orders"; DROP TABLE x; --' }).expect(400);
+      expect(JSON.parse(quoted.body).code).toBe('invalid_export');
+      const missing = await exportOf({ schema: warehouse, table: 'nope' }).expect(422);
+      expect(JSON.parse(missing.body)).toMatchObject({ code: 'query_failed' });
+      await exportOf({ table: 'orders', limit: 5 }).expect(400);
+    });
+
+    test('a cancel by its run id stops it on the database, and its last line says so', async () => {
+      const runId = crypto.randomUUID();
+      const slow = `${warehouse}.slow`;
+      await sql(`CREATE VIEW ${slow} AS SELECT n, length(pg_sleep(0.001)::text) AS z FROM generate_series(1, 100000) n`);
+      const running = request(server).post(`${base}/connections/default/export`)
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`)
+        .buffer(true)
+        .parse((res, done) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (c: Buffer) => chunks.push(c));
+          res.on('end', () => done(null, Buffer.concat(chunks).toString('utf8')));
+        })
+        .send({ runId, schema: warehouse, table: 'slow' })
+        .then((r) => r);
+      await sleep(1500);
+      await admin('post', '/sql/cancel', { runId }).expect(200);
+      const res = await running;
+      const last = lines(res.body).at(-1);
+      expect(last.error).toMatchObject({ code: 'cancelled' });
+    });
+  });
+
   test('the logs name the run and how it ended, never its SQL', () => {
     const runs = logs.filter((l) => l.message === 'xcube: SQL run');
     expect(runs.length).toBeGreaterThan(5);

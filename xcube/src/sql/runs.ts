@@ -113,7 +113,11 @@ export class SqlRuns {
     return this.local.size;
   }
 
-  public async run(model: string, target: SqlTarget, request: SqlRunRequest): Promise<SqlAnswer> {
+  /**
+   * Runs a statement read-only, its rows to its caps. `collect` takes the
+   * rows instead, as they come (an export, `export.ts`).
+   */
+  public async run(model: string, target: SqlTarget, request: SqlRunRequest, collect?: RowCollector): Promise<SqlAnswer> {
     const { dialect } = target;
     const caps: SqlCaps = {
       maxRows: request.maxRows, timeoutMs: request.timeoutMs, maxBytes: request.maxBytes, maxBytesBilled: request.maxBytesBilled,
@@ -243,7 +247,7 @@ export class SqlRuns {
       const ranAt = Date.now();
       const clock = setTimeout(() => stop('timeout'), request.timeoutMs + CLOCK_GRACE_MS);
       clock.unref?.();
-      const rows = new RowCollector(request.maxRows, request.maxBytes);
+      const rows = collect ?? new RowCollector(request.maxRows, request.maxBytes);
       try {
         await Promise.race([session.run(sql, rows, binds), abandoned]);
       } catch (e: any) {
