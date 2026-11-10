@@ -1,4 +1,4 @@
-// Vendored from @cubejs-backend/schema-compiler 1.8.15 (src/scaffolding),
+// Vendored from @cubejs-backend/schema-compiler 1.8.21 (src/scaffolding),
 // Copyright Cube Dev, Inc., Apache-2.0, and changed: see ../../NOTICE.
 const PUNCTUATION = /[^\p{L}\p{N}]+/ug;
 const REGEX = /([\p{Lu}]+[\p{Ll}\p{N}]*|[\p{Ll}\p{N}]+)/gu;

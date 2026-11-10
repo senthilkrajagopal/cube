@@ -62,7 +62,7 @@ jobs:
           --health-retries 30
       # Cube Store, for its rollups and its SQL runner; its query timeout short, as the tests take it.
       cubestore:
-        image: cubejs/cubestore:v1.8.15
+        image: cubejs/cubestore:v1.8.21
         env:
           CUBESTORE_QUERY_TIMEOUT: '10'
         ports:

@@ -7,12 +7,12 @@
 #
 # Build from this directory:
 #
-#   docker build -t xcube:v1.8.15-$(git rev-parse --short=10 HEAD) .
+#   docker build -t xcube:v1.8.21-$(git rev-parse --short=10 HEAD) .
 #
 # CUBE_VERSION must be the version the package's peerDependencies name; the
 # server refuses to start on any other.
 
-ARG CUBE_VERSION=v1.8.15
+ARG CUBE_VERSION=v1.8.21
 
 # The build only compiles TypeScript, so it runs once, on the builder's own
 # platform; the image for each platform is Cube's with the output copied in.

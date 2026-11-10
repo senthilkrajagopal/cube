@@ -61,7 +61,7 @@ The `Dockerfile` builds Cube's published image with the package added and
 started in place of `cubejs server`:
 
 ```sh
-docker build -t xcube:v1.8.15-$(git rev-parse --short=10 HEAD) .
+docker build -t xcube:v1.8.21-$(git rev-parse --short=10 HEAD) .
 ```
 
 It takes the same configuration, environment and mounts as `cubejs/cube`
