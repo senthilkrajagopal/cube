@@ -44,7 +44,10 @@ Cube's own code is unchanged. The package:
   `buildJoinEdges`), which it sets as that module's export, where
   `prepareCompiler` reads it on each compile;
 - lets every pre-aggregation carry a `meta`, in a subclass of Cube's
-  `CubeValidator`, set as that module's export in the same way.
+  `CubeValidator`, set as that module's export in the same way;
+- compiles DuckDB with a subclass of Cube's DuckDB dialect, through Cube's
+  `dialectFactory`, so a time series can come from the data (see
+  [Connections](#connections)).
 
 Everything is built for one Cube version, the one `peerDependencies` names,
 and the server refuses to start on any other: the protected methods it uses
@@ -602,6 +605,16 @@ DuckDB, ClickHouse, Trino and Athena connections are read-only:
   accepted gap.
 - **`pod-role` credentials** are taken when an instance opens. One within
   10 minutes of their expiry is closed when idle, and opened again.
+
+**A time series from the data, on DuckDB.** A rolling window or a time shift
+with no date range is answered over the periods from the data's first to its
+last, as Cube does on Postgres, on `duckdb` connections and a `duckdb` data
+source of Cube's environment. Cube's own DuckDB dialect refuses it ("Date
+range is required for time series"): it has neither of the templates
+Tesseract builds a series with. xcube's subclass adds them
+(`src/model/dialects.ts`), set through `dialectFactory`; a `dialectFactory`
+in cube.js comes first. Only Tesseract, Cube's default planner, plans this;
+custom granularities still need a date range, as on Cube's base dialect.
 
 A target includes how the driver checks the server, so a secret must be
 entered again to turn verification off, as to change the host. Snowflake,
@@ -1878,6 +1891,7 @@ that fails when it changes:
 | The text of Cube's compile errors, which xcube places by file and line | `test/unit/errors.test.ts`, on a live compile |
 | `prepareCompiler` building its join graph from the `JoinGraph` module's export; which measures make Cube refuse a keyless cube's joins (`buildJoinEdges`) and when it counts a cube's rows repeated (`findMultiplicationFactorFor`), both mirrored in `src/model/joins.ts` | `test/unit/joins.test.ts`, on live compiles, and `test/integration/keyless-joins.test.ts` on both planners |
 | `prepareCompiler` building its validator from the `CubeValidator` module's export, which checks each pre-aggregation with its `meta` set aside | `test/unit/meta.test.ts`, on live compiles and both planners |
+| Tesseract building a time series from the data with the DuckDB dialect's `generated_time_series_*` templates | `test/integration/duckdb-series.test.ts`, on an in-process DuckDB |
 | The queue options Cube builds, with xcube's heartbeat | `test/unit/config.test.ts`, through Cube's own `OptsHandler` |
 | A running query's cancel from an instance that hasn't opened its queues | `test/integration/builds.test.ts`, on the memory queue and Cube Store |
 | Each driver's option names: every connection field reaches the driver, and no `CUBEJS_DB_*` or `PG*` value does | `test/image/drivers-env.js`, in the image (CI) |

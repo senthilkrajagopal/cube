@@ -5,6 +5,7 @@ import { assertDataSource, getEnv } from '@cubejs-backend/shared';
 
 import { environmentTargetOf } from './connections/aliases';
 import { DRIVERS, isDriverType } from './connections/drivers';
+import { dialectFactory } from './model/dialects';
 import { XcubeRuntime, type ServingOptions } from './runtime/runtime';
 import { GATE_GROUP } from './security/marker';
 
@@ -171,6 +172,8 @@ export function createConfig(
       return { ...rest, ...await runtime.pinFor(req) };
     },
     scheduledRefreshContexts: () => runtime.refreshContexts(cube.scheduledRefreshContexts),
+    // DuckDB's with a time series derived from the data (`src/model/dialects.ts`).
+    dialectFactory: dialectFactory(cube.dialectFactory),
     // A model with connections has data sources of its own: its own
     // orchestrator (drivers, queues, caches). Every model has its own
     // pre-aggregation schema, fixed whatever its connections, as a compiled
