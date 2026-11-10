@@ -14,11 +14,12 @@ import { keyByDataSource } from '@cubejs-backend/shared';
 import { makeAthenaDriver } from './athena';
 import { makeClickHouseDriver } from './clickhouse';
 import { makeDuckdbDriver } from './duckdb';
+import { baseUrlProblems, makeEngineDriver } from './engine';
 import { withoutEnv } from './env';
 import { makeTrinoDriver } from './trino';
 
 export const DRIVER_TYPES = [
-  'postgres', 'redshift', 'mysql', 'snowflake', 'bigquery', 'mssql', 'oracle', 'dremio', 'duckdb', 'clickhouse', 'trino', 'athena',
+  'postgres', 'redshift', 'mysql', 'snowflake', 'bigquery', 'mssql', 'oracle', 'dremio', 'duckdb', 'clickhouse', 'trino', 'athena', 'engine',
 ] as const;
 
 export type DriverType = (typeof DRIVER_TYPES)[number];
@@ -193,6 +194,8 @@ const DUCKDB_KINDS: Record<string, { fields: string[]; required: string[]; auth:
 };
 
 const awsAccessKey = [text('accessKeyId', { required: true }), secret('secretAccessKey')];
+
+const engineCheck = (f: Fields) => baseUrlProblems(f.baseUrl);
 
 const clickhouseCheck = (f: Fields) => [...hostProblems(f), ...unsafeNames(f, ['database'])];
 
@@ -583,6 +586,27 @@ export const DRIVERS: Record<DriverType, DriverSpec> = {
       };
     },
     make: makeAthenaDriver,
+  },
+  /**
+   * wechart's in-memory engine: a service that runs Cube's DuckDB-dialect SQL
+   * (`src/connections/engine.ts`), signed in to with a service token.
+   */
+  engine: {
+    cubeType: 'duckdb',
+    connection: [text('baseUrl', { required: true }), text('sslRejectUnauthorized', { kind: 'boolean' }), text('sslCa', { kind: 'multiline' })],
+    auth: { 'service-token': [secret('token')] },
+    target: ['baseUrl', 'sslRejectUnauthorized', 'sslCa'],
+    check: engineCheck,
+    config(f, auth, s) {
+      checked(this, f, auth);
+      return {
+        baseUrl: str(f.baseUrl),
+        token: s.token,
+        sslRejectUnauthorized: bool(f.sslRejectUnauthorized, true),
+        sslCa: str(f.sslCa),
+      };
+    },
+    make: makeEngineDriver,
   },
 };
 

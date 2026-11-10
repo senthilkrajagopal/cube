@@ -84,6 +84,7 @@ const cases = {
   clickhouse: [{ host: 'xc-host', port: 8443, database: 'xc-db', user: 'xc-user', ssl: true }, 'password', { password: 'xc-password' }],
   trino: [{ host: 'xc-host', port: 443, catalog: 'xc-catalog', schema: 'xc-schema', user: 'xc-user' }, 'password', { password: 'xc-password' }],
   'trino (jwt)': [{ host: 'xc-host', port: 443, catalog: 'xc-catalog', schema: 'xc-schema', user: 'xc-user' }, 'jwt', { token: 'xc-token' }, 'trino'],
+  engine: [{ baseUrl: 'https://xc-engine.example:8443' }, 'service-token', { token: 'xc-token' }],
   athena: [{ region: 'eu-west-1', workGroup: 'xc-workgroup', s3OutputLocation: 's3://xc-results/', catalog: 'xc-catalog', database: 'xc-db', accessKeyId: 'AKIAXCXCXCXCXCXCXCXC' }, 'access-key', { secretAccessKey: 'xc-secret' }],
 };
 

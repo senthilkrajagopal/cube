@@ -45,9 +45,9 @@ Cube's own code is unchanged. The package:
   `prepareCompiler` reads it on each compile;
 - lets every pre-aggregation carry a `meta`, in a subclass of Cube's
   `CubeValidator`, set as that module's export in the same way;
-- compiles DuckDB with a subclass of Cube's DuckDB dialect, through Cube's
-  `dialectFactory`, so a time series can come from the data (see
-  [Connections](#connections)).
+- compiles DuckDB, and wechart's engine, with a subclass of Cube's DuckDB
+  dialect, through Cube's `dialectFactory`, so a time series can come from
+  the data (see [Connections](#connections)).
 
 Everything is built for one Cube version, the one `peerDependencies` names,
 and the server refuses to start on any other: the protected methods it uses
@@ -214,6 +214,7 @@ In both modes:
 | `XCUBE_CATCH_UP_MS` | `10000` | How long a request naming a newer revision waits for it |
 | `XCUBE_CUBESTORE_QUERY_TIMEOUT` | `120` | Cube Store's own query timeout in seconds, as set on it (`CUBESTORE_QUERY_TIMEOUT`): when a stopped SQL run that Cube Store runs on ends at the latest |
 | `XCUBE_ALLOW_POD_ROLE` | unset | `true` lets Athena and DuckDB S3 connections sign in as the Cube pods' own AWS role (`pod-role`). Unset, they must carry an access key |
+| `XCUBE_ENGINE_ALLOW_HTTP` | unset | `true` lets an `engine` connection's `baseUrl` be `http://`, its token sent in the clear. Unset, it must be `https://` |
 | `XCUBE_DUCKDB_MEMORY_LIMIT` | `2GiB` | Each DuckDB instance's `memory_limit` (`KB` to `TB`, `KiB` to `TiB`) |
 | `XCUBE_DUCKDB_THREADS` | `2` | Each DuckDB instance's `threads` (1 to 256) |
 | `XCUBE_DUCKDB_MAX_TEMP_DIRECTORY_SIZE` | `10GiB` | How much each DuckDB instance may spill to its temp directory (a spill only: not what a `COPY … TO` writes there) |
@@ -537,7 +538,8 @@ Cube without a restart. Their secrets are sealed by the client's browser to
 xcube's credential key, so the client stores them and can't open them.
 
 **Drivers.** `postgres`, `redshift`, `mysql`, `snowflake`, `bigquery`, `mssql`,
-`oracle`, `dremio`, `duckdb`, `clickhouse`, `trino` and `athena`, through Cube's own drivers:
+`oracle`, `dremio`, `duckdb`, `clickhouse`, `trino` and `athena`, through Cube's own drivers,
+and `engine`, wechart's in-memory engine, through xcube's:
 
 | Driver | Auth methods | Target (what a secret is bound to) |
 | --- | --- | --- |
@@ -553,6 +555,7 @@ xcube's credential key, so the client stores them and can't open them.
 | `clickhouse` | `password` | host, port, ssl |
 | `trino` | `password`, `jwt` | host, port, sslRejectUnauthorized, sslCa |
 | `athena` | `access-key`, `pod-role` | region, workGroup |
+| `engine` | `service-token` | baseUrl, sslRejectUnauthorized, sslCa |
 
 DuckDB, ClickHouse, Trino and Athena connections are read-only:
 - **Rollups are built in Cube Store only.** A publish refuses a cube on one
@@ -560,6 +563,8 @@ DuckDB, ClickHouse, Trino and Athena connections are read-only:
   `original_sql`).
 - **A ClickHouse rollup must name an index.** Cube builds its table there
   too, sorted by its first index.
+- **Cubes on an `engine` connection take no pre-aggregation at all**, in Cube
+  Store or anywhere: the engine is the fast path.
 - **`pod-role` is off by default.** It signs in as the Cube pods' own AWS role,
   and needs `XCUBE_ALLOW_POD_ROLE=true`.
 
@@ -606,11 +611,33 @@ DuckDB, ClickHouse, Trino and Athena connections are read-only:
 - **`pod-role` credentials** are taken when an instance opens. One within
   10 minutes of their expiry is closed when idle, and opened again.
 
+**wechart's engine** is a service of its own (`src/connections/engine.ts`),
+holding wechart's tables in DuckDB. Cube compiles for it with its DuckDB
+dialect; xcube's driver carries one statement and its values per call, with
+the connection's service token as `Authorization: Bearer …`, under its
+`baseUrl`:
+- `POST /v1/query` `{ sql, params, queryId, timeoutMs, requestId?, maxRows? }`
+  answers `{ columns: [{ name, type }], rows: [[…]] }`, each cell as Cube's
+  DuckDB driver gives it (numbers as strings, dates and timestamps as ISO 8601
+  UTC), and rows as objects by column name to Cube. An error is non-2xx
+  `{ error, code }`, which reaches Cube with its message and code. The Cube
+  request id goes as `requestId` and `X-Request-Id`. Only the SQL runner sends
+  `maxRows`, one past its cap.
+- `DELETE /v1/query/{queryId}` stops a query: on Cube's cancel, on a SQL
+  run's, and when no answer has come 5 s past its `timeoutMs` (ten minutes
+  unless a SQL run sets its own).
+- `GET /v1/health` answers 2xx when it serves. The connection test's `connect`
+  asks it, then runs `SELECT 1 AS ok` with the token.
+- The catalog (introspection, the connection test's `schemas`) is read with
+  `information_schema` statements through `/v1/query`.
+- An answer over 512 MB is refused. `baseUrl` is `https://`; `http://` only
+  with `XCUBE_ENGINE_ALLOW_HTTP=true`, as the token would cross in the clear.
+
 **A time series from the data, on DuckDB.** A rolling window or a time shift
 with no date range is answered over the periods from the data's first to its
-last, as Cube does on Postgres, on `duckdb` connections and a `duckdb` data
-source of Cube's environment. Cube's own DuckDB dialect refuses it ("Date
-range is required for time series"): it has neither of the templates
+last, as Cube does on Postgres, on `duckdb` and `engine` connections and a
+`duckdb` data source of Cube's environment. Cube's own DuckDB dialect refuses
+it ("Date range is required for time series"): it has neither of the templates
 Tesseract builds a series with. xcube's subclass adds them
 (`src/model/dialects.ts`), set through `dialectFactory`; a `dialectFactory`
 in cube.js comes first. Only Tesseract, Cube's default planner, plans this;
@@ -1892,6 +1919,7 @@ that fails when it changes:
 | `prepareCompiler` building its join graph from the `JoinGraph` module's export; which measures make Cube refuse a keyless cube's joins (`buildJoinEdges`) and when it counts a cube's rows repeated (`findMultiplicationFactorFor`), both mirrored in `src/model/joins.ts` | `test/unit/joins.test.ts`, on live compiles, and `test/integration/keyless-joins.test.ts` on both planners |
 | `prepareCompiler` building its validator from the `CubeValidator` module's export, which checks each pre-aggregation with its `meta` set aside | `test/unit/meta.test.ts`, on live compiles and both planners |
 | Tesseract building a time series from the data with the DuckDB dialect's `generated_time_series_*` templates | `test/integration/duckdb-series.test.ts`, on an in-process DuckDB |
+| Cube's DuckDB cell encoding, which wechart's engine copies | `test/integration/engine.test.ts`, whose stand-in engine encodes with Cube's `Transform.ts` |
 | The queue options Cube builds, with xcube's heartbeat | `test/unit/config.test.ts`, through Cube's own `OptsHandler` |
 | A running query's cancel from an instance that hasn't opened its queues | `test/integration/builds.test.ts`, on the memory queue and Cube Store |
 | Each driver's option names: every connection field reaches the driver, and no `CUBEJS_DB_*` or `PG*` value does | `test/image/drivers-env.js`, in the image (CI) |

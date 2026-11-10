@@ -18,6 +18,7 @@
  */
 import { randomUUID } from 'crypto';
 import { duckdbApi } from '../connections/duckdb';
+import { EngineDriver } from '../connections/engine';
 import { trinoError } from '../connections/trino';
 import type { Refused, StatementKind } from './classify';
 import type { SqlBind } from './parameters';
@@ -976,6 +977,33 @@ async function athenaSession(driver: any, caps: SqlCaps): Promise<SqlSession> {
  * (`classify.ts`). Values come as DuckDB's JSON: big numbers and decimals as
  * strings, times as text.
  */
+/**
+ * wechart's engine: one call per statement, asked for one row past the cap,
+ * with the run's time cap as the engine's own; a cancel stops it there by its id.
+ */
+async function engineSession(driver: EngineDriver, caps: SqlCaps): Promise<SqlSession> {
+  let running: ReturnType<EngineDriver['run']> | null = null;
+  return {
+    async run(sql, rows, binds = []) {
+      running = driver.run(sql, binds.map((b) => b.value), { timeoutMs: caps.timeoutMs, maxRows: caps.maxRows + 1 });
+      const answer = await running;
+      rows.setColumns(answer.columns.map((c) => ({ name: c.name, type: c.type || null })));
+      for (const row of answer.rows) {
+        if (!rows.add(row)) {
+          return;
+        }
+      }
+    },
+    async cancel() {
+      await quietly(() => running?.cancel());
+    },
+    async close() {
+      await quietly(() => running?.cancel());
+      await quietly(() => driver.release());
+    },
+  };
+}
+
 async function duckdbSession(driver: any, caps: SqlCaps): Promise<SqlSession> {
   const { JsonDuckDBValueConverter } = duckdbApi();
   const lease = await driver.lease(caps.timeoutMs);
@@ -1144,7 +1172,8 @@ export function openSession(
     case 'athena':
       return athenaSession(driver, caps);
     case 'duckdb':
-      return duckdbSession(driver, caps);
+      // wechart's engine speaks DuckDB's SQL, from a service of its own.
+      return driver instanceof EngineDriver ? engineSession(driver, caps) : duckdbSession(driver, caps);
     case 'cubestore':
       return cubeStoreSession(driver, refuse);
     default:

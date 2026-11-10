@@ -98,6 +98,9 @@ export interface DataSourceRef {
 /** The drivers whose rollups xcube builds only in Cube Store: their sources are read, never written (AC-1048). */
 const READ_ONLY_DRIVERS = new Set(['duckdb', 'clickhouse', 'trino', 'athena']);
 
+/** The drivers whose cubes take no pre-aggregation at all: wechart's engine holds its tables in memory, and is the fast path itself. */
+const NO_ROLLUP_DRIVERS = new Set(['engine']);
+
 export interface PublishResult {
   items: PublishedItem[];
   /** Items resolved in this publish, by `itemKey`. */
@@ -473,8 +476,8 @@ function checkDataSource(def: ItemDefinition, doc: Record<string, any>, dataSour
 
 /**
  * The cubes whose rollups their data source can't take (AC-1042, AC-1048),
- * inherited ones included: on a read-only driver, a pre-aggregation built in
- * the source; on ClickHouse, one with no index, as Cube builds even a Cube
+ * inherited ones included: on wechart's engine, any pre-aggregation; on a
+ * read-only driver, a pre-aggregation built in the source; on ClickHouse, one with no index, as Cube builds even a Cube
  * Store rollup's table there with its first index as the sort key
  * (`ClickHouseQuery.preAggregationLoadSql`). A lambda has no table.
  */
@@ -489,14 +492,16 @@ function checkRollups(
   for (const entry of entries.filter((e) => e.def.kind === 'cube' && checked(e))) {
     const { name: source } = usedDataSource(entry, byName);
     const driver = driverOf.get(source);
-    if (!driver || !READ_ONLY_DRIVERS.has(driver)) {
+    if (!driver || !(READ_ONLY_DRIVERS.has(driver) || NO_ROLLUP_DRIVERS.has(driver))) {
       continue;
     }
     const at = { folderId: entry.def.folderId, name: entry.def.name, kind: 'compile' as const };
     for (const { pa, from } of rollupsOf(entry, byName)) {
       const through = from === entry ? '' : ` (from ${from.def.name}, which it extends)`;
       const type = inflection.camelize(String(pa.type ?? 'rollup'), true);
-      if (inSource(pa)) {
+      if (NO_ROLLUP_DRIVERS.has(driver)) {
+        errors.push({ ...at, message: `Pre-aggregation ${pa.name}${through}: cubes on "${source}", an ${driver} connection, take no pre-aggregations` });
+      } else if (inSource(pa)) {
         errors.push({ ...at, message: `Pre-aggregation ${pa.name}${through} would be built in "${source}": rollups on ${source} are built in Cube Store only` });
       } else if (driver === 'clickhouse' && type !== 'rollupLambda' && !indexNamesOf(pa).length) {
         errors.push({ ...at, message: `Pre-aggregation ${pa.name}${through} names no index: a ClickHouse rollup must name an index` });

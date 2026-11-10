@@ -665,6 +665,28 @@ describe('data sources', () => {
     expect(run([cubeWith('froot', 'a', rollups('- name: r', '  external: false'))]).errors).toEqual([]);
   });
 
+  test('cubes on wechart\'s engine take no pre-aggregation, in Cube Store or anywhere', () => {
+    const drivers = [
+      { folderId: 'froot', name: 'default' },
+      { folderId: 'froot', name: 'mem', driver: 'engine' },
+    ];
+    const rollups = (...lines: string[]) => `    pre_aggregations:\n${lines.map((l) => `      ${l}\n`).join('')}`;
+    const messages = (upserts: AuthoredItem[]) => publish({ tree, current: [], deletes: [], dataSources: drivers, upserts }).errors
+      .map((e) => [e.name, e.kind, e.message]);
+
+    expect(messages([cubeWith('froot', 'a', `    data_source: mem\n${rollups('- name: r', '- name: lam', '  type: rollup_lambda', '- name: o', '  type: original_sql')}`)])).toEqual([
+      ['a', 'compile', 'Pre-aggregation r: cubes on "mem", an engine connection, take no pre-aggregations'],
+      ['a', 'compile', 'Pre-aggregation lam: cubes on "mem", an engine connection, take no pre-aggregations'],
+      ['a', 'compile', 'Pre-aggregation o: cubes on "mem", an engine connection, take no pre-aggregations'],
+    ]);
+    // Inherited through extends too; a cube on the engine with none publishes.
+    expect(messages([
+      cubeWith('froot', 'base', rollups('- name: one')),
+      cube('froot', 'kid', '    extends: base\n    data_source: mem\n'),
+    ])).toEqual([['kid', 'compile', 'Pre-aggregation one (from base, which it extends): cubes on "mem", an engine connection, take no pre-aggregations']]);
+    expect(messages([cubeWith('froot', 'plain', '    data_source: mem\n')])).toEqual([]);
+  });
+
   test('without connections, data_source is left as written', () => {
     const { items } = publish({ tree, current: [], deletes: [], upserts: [cubeWith('feu', 'a', '    data_source: anything\n')] });
     expect(dataSourceOf(items, 'a')).toBe('anything');
