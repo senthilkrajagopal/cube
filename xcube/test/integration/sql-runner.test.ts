@@ -458,6 +458,98 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
     });
   });
 
+  describe('exports of a statement: a caller\'s SELECT, its parameters bound, lists among them (X1)', () => {
+    const exportOf = (body: object, connection = 'default') => request(server).post(`${base}/connections/${connection}/export`)
+      .set('Authorization', `Bearer ${ADMIN_TOKEN}`)
+      .buffer(true)
+      .parse((res, done) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => done(null, Buffer.concat(chunks).toString('utf8')));
+      })
+      .send({ runId: crypto.randomUUID(), ...body });
+    const lines = (text: string) => text.trim().split('\n').map((l) => JSON.parse(l));
+    const MARK = 'c3-list-value-never-logged';
+
+    test('a scalar and a list bound: the rows the statement gives in the database, then the end', async () => {
+      const statement = `SELECT id, customer, amount FROM ${warehouse}.orders WHERE amount > {{min}} AND customer IN ({{who}}) ORDER BY id`;
+      const res = await exportOf({
+        sql: statement,
+        parameters: { min: { type: 'number', value: '10' }, who: { type: 'text', value: ['c3', 'c5', MARK] } },
+      }, 'default');
+      expect({ status: res.status, body: res.status === 200 ? undefined : res.body }).toEqual({ status: 200, body: undefined });
+      const [head, ...rest] = lines(res.body);
+      expect(head.columns.map((c: any) => c.name)).toEqual(['id', 'customer', 'amount']);
+      const expected = await sql(`SELECT id, customer, amount::text AS amount FROM ${warehouse}.orders WHERE amount > 10 AND customer IN ('c3', 'c5') ORDER BY id`);
+      expect(rest.slice(0, -1)).toEqual(expected.map((r: any) => [r.id, r.customer, r.amount]));
+      expect(rest.at(-1)).toEqual({ end: { rows: expected.length, durationMs: expect.any(Number) } });
+    });
+
+    test('a list of 10,000 values; no rows gives the columns line and an end of 0', async () => {
+      const ids = Array.from({ length: 10000 }, (_v, i) => String(i + 1));
+      const res = await exportOf({ sql: `SELECT id FROM ${warehouse}.orders WHERE id IN ({{ids}})`, parameters: { ids: { type: 'number', value: ids } } }).expect(200);
+      const all = lines(res.body);
+      expect(all.at(-1).end.rows).toBe(50);
+      const none = await exportOf({ sql: `SELECT id, customer FROM ${warehouse}.orders WHERE customer IN ({{who}})`, parameters: { who: { type: 'text', value: ['nobody'] } } })
+        .expect(200);
+      expect(lines(none.body)).toEqual([
+        { columns: [{ name: 'id', type: expect.any(String) }, { name: 'customer', type: expect.any(String) }] },
+        { end: { rows: 0, durationMs: expect.any(Number) } },
+      ]);
+    });
+
+    test('refused before any line, as a SQL run is: an empty list, a list out of a parenthesis, too many values, an EXPLAIN, a write', async () => {
+      const at = `SELECT id FROM ${warehouse}.orders WHERE id IN ({{ids}})`;
+      const empty = await exportOf({ sql: at, parameters: { ids: { type: 'number', value: [] } } }).expect(400);
+      expect(JSON.parse(empty.body)).toMatchObject({ code: 'invalid_parameters', reason: 'empty_list', statement: null });
+      const outside = await exportOf({ sql: `SELECT id FROM ${warehouse}.orders WHERE id = {{ids}}`, parameters: { ids: { type: 'number', value: ['1'] } } }).expect(400);
+      expect(JSON.parse(outside.body)).toMatchObject({ code: 'invalid_parameters', reason: 'list_outside_parentheses' });
+      const many = await exportOf({ sql: at, parameters: { ids: { type: 'number', value: Array.from({ length: 32768 }, (_v, i) => String(i)) } } }).expect(400);
+      expect(JSON.parse(many.body)).toMatchObject({ code: 'invalid_parameters', reason: 'too_many_values', error: expect.stringContaining('at most 32767') });
+      const explain = await exportOf({ sql: `EXPLAIN SELECT id FROM ${warehouse}.orders` }).expect(400);
+      expect(JSON.parse(explain.body)).toMatchObject({ code: 'not_select', statement: 'explain', redactedSql: expect.any(String) });
+      expect(JSON.parse((await exportOf({ sql: `DELETE FROM ${warehouse}.orders` }).expect(400)).body).code).toBe('not_read_only');
+      // A table and a statement at once, or a table's parameters, aren't an export.
+      await exportOf({ table: 'orders', sql: 'SELECT 1' }).expect(400);
+      await exportOf({ table: 'orders', parameters: {} }).expect(400);
+      expect((await sql(`SELECT count(*)::int AS n FROM ${warehouse}.orders`))[0].n).toBe(50);
+    });
+
+    test('a cancel by its run id stops it on the database', async () => {
+      const runId = crypto.randomUUID();
+      const running = request(server).post(`${base}/connections/default/export`)
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`)
+        .buffer(true)
+        .parse((res, done) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (c: Buffer) => chunks.push(c));
+          res.on('end', () => done(null, Buffer.concat(chunks).toString('utf8')));
+        })
+        .send({
+          runId,
+          sql: 'SELECT n, length(pg_sleep(0.001)::text) AS z FROM generate_series(1, 100000) n WHERE n NOT IN ({{skip}})',
+          parameters: { skip: { type: 'number', value: ['0', '-1'] } },
+        })
+        .then((r) => r);
+      await sleep(1500);
+      await admin('post', '/sql/cancel', { runId }).expect(200);
+      const res = await running;
+      expect(lines(res.body).at(-1).error).toMatchObject({ code: 'cancelled' });
+      await sleep(500);
+      const left = await sql('SELECT count(*)::int AS n FROM pg_stat_activity WHERE query LIKE \'%pg_sleep(0.001)%\' AND state = \'active\' AND pid <> pg_backend_pid()');
+      expect(left[0].n).toBe(0);
+    });
+
+    test('a caller tells the statement form is there: a probe on no connection is 404, where an older image says 400', async () => {
+      const probe = await exportOf({ sql: 'SELECT 1' }, 'xcube_probe');
+      expect({ status: probe.status, code: JSON.parse(probe.body).code }).toEqual({ status: 404, code: 'unknown_connection' });
+    });
+
+    test('its values are never logged', () => {
+      expect(JSON.stringify(logs)).not.toContain(MARK);
+    });
+  });
+
   test('the logs name the run and how it ended, never its SQL', () => {
     const runs = logs.filter((l) => l.message === 'xcube: SQL run');
     expect(runs.length).toBeGreaterThan(5);

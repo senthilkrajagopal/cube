@@ -219,14 +219,36 @@ const sqlSchema = Joi.object({
   ).max(100),
 });
 
+/** The most items a list parameter may hold, of any dialect: each dialect's own is less or equal (`MAX_BOUND`). */
+const MAX_LIST = 65535;
+
+/**
+ * An export: a table (`table`, with `schema` and `columns`), or a caller's
+ * SELECT (`sql`, with `parameters`, whose values may be lists), never both.
+ */
 const exportSchema = Joi.object({
   runId: Joi.string().pattern(RUN_ID).required(),
   schema: Joi.string().min(1).max(256),
-  table: Joi.string().min(1).max(256).required(),
+  table: Joi.string().min(1).max(256),
   columns: Joi.array().items(Joi.string().min(1).max(256)).min(1).max(4096),
+  sql: Joi.string().min(1).max(100000),
+  parameters: Joi.object().pattern(
+    Joi.string().pattern(PARAMETER_NAME).max(64),
+    Joi.object({
+      type: Joi.string().valid('text', 'number', 'date', 'boolean').required(),
+      value: Joi.alternatives(
+        Joi.string().max(100000),
+        Joi.boolean(),
+        // Empty is refused when bound (`empty_list`), with its own reason.
+        Joi.array().items(Joi.alternatives(Joi.string().max(100000), Joi.boolean())).max(MAX_LIST),
+      ).required(),
+    }),
+  ).max(100),
   timeoutMs: Joi.number().integer().min(1000).max(EXPORT_MAX_TIMEOUT_MS)
     .default(EXPORT_TIMEOUT_MS),
-});
+}).xor('table', 'sql')
+  .without('sql', ['schema', 'columns'])
+  .without('table', ['parameters']);
 
 const sqlCancelSchema = Joi.object({
   runId: Joi.string().pattern(RUN_ID).required(),
@@ -239,6 +261,7 @@ const SQL_STATUS: Record<SqlFailure, number> = {
   invalid_parameters: 400,
   parameters_unsupported: 400,
   cap_unsupported: 400,
+  not_select: 400,
   unknown_connection: 404,
   unknown_overlay: 404,
   run_in_progress: 409,
@@ -811,7 +834,8 @@ export function initAdminRoutes(
   app.post(`${base}/cubestore/sql`, auth, json, runSql('cubestore-sql', () => ({ cubeStore: true })));
 
   /**
-   * Streams a table of a stored connection as NDJSON (`sql/export.ts`):
+   * Streams a table of a stored connection, or the rows of a caller's
+   * SELECT (`sql`, its parameters bound), as NDJSON (`sql/export.ts`):
    * gzipped where the client accepts it. A failure before the first line is
    * answered as a SQL run's is; one after, as the last line.
    */
@@ -860,7 +884,9 @@ export function initAdminRoutes(
       start().end(`${JSON.stringify(line)}\n`);
     };
     try {
-      const answer = await runtime.exportTable(model, name, body, rows);
+      const answer = body.sql === undefined
+        ? await runtime.exportTable(model, name, body, rows)
+        : await runtime.exportStatement(model, name, body, rows);
       if (rows.slow) {
         logger('xcube: export', { ...logged, outcome: 'client_too_slow', rows: rows.count, durationMs: Date.now() - started });
         last({ error: { code: 'client_too_slow', message: `The client read too slowly: over ${EXPORT_MAX_BUFFERED} bytes waited unsent` } });
@@ -891,7 +917,17 @@ export function initAdminRoutes(
       if (status === 503) {
         res.set('Retry-After', '5');
       }
-      res.status(status).json({ error: e.message, code: e.code, ...(e.reason ? { reason: e.reason } : {}) });
+      res.status(status).json({
+        error: e.message,
+        code: e.code,
+        ...(e.reason ? { reason: e.reason } : {}),
+        // A statement's export: what its SQL run would say of it, its values never among it.
+        ...(body.sql === undefined ? {} : {
+          ...(e.refused ? { refused: e.refused } : {}),
+          statement: e.statement,
+          redactedSql: e.redactedSql,
+        }),
+      });
     }
   }));
 

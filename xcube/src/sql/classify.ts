@@ -864,7 +864,8 @@ export interface Placeholder {
 }
 
 /** Why a statement's parameters can't be taken: what the client can show. */
-export type ParameterRefusal = 'missing_value' | 'unused_value' | 'malformed_placeholder' | 'placeholder_written' | 'invalid_value';
+export type ParameterRefusal = 'missing_value' | 'unused_value' | 'malformed_placeholder' | 'placeholder_written' | 'invalid_value'
+  | 'empty_list' | 'too_many_values' | 'list_outside_parentheses';
 
 /** A statement whose parameters can't be taken, and why. */
 export class ParameterError extends Error {

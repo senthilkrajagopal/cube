@@ -54,7 +54,7 @@ export interface SqlAnswer extends SqlRows {
 /** How a run failed: refused, stopped, or failed on the database. */
 export type SqlFailure = 'not_read_only' | 'several_statements' | 'timeout' | 'cancelled' | 'connect_failed' | 'query_failed'
   | 'unknown_connection' | 'unknown_overlay' | 'run_in_progress' | 'busy' | 'invalid_parameters' | 'parameters_unsupported'
-  | 'cap_unsupported';
+  | 'cap_unsupported' | 'not_select';
 
 export class SqlRunError extends Error {
   public constructor(

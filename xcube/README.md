@@ -1628,6 +1628,38 @@ timeoutMs? }` (`src/sql/export.ts`).
   unsent.
 - Rows are read as the database sends them, a page or a cursor's batch at a
   time, and written as they come: nothing holds the table.
+- **Or a statement:** `{ runId, sql, parameters?, timeoutMs? }` in place of
+  `table` (never both, and `schema` and `columns` only with `table`) exports
+  the rows of a caller's SELECT, answered as a table's is. It runs under the
+  SQL runner's rules (one statement, read-only, `{{name}}` parameters bound
+  with the database's own placeholders, never written into the SQL, never
+  logged), and an EXPLAIN is refused (`400 not_select`). A refusal before the
+  first line carries `statement` and `redactedSql` too.
+- **A parameter's value may be a list** of its type: one placeholder per item,
+  bound where `{{name}}` is all a parenthesis holds, as in `IN ({{name}})`
+  (elsewhere, `list_outside_parentheses`). An empty list is refused
+  (`empty_list`): `IN ()` is no database's SQL. So are more values than the
+  database binds (`too_many_values`), counted per list and per statement (a
+  list repeated on MySQL or Snowflake binds each time):
+
+  | Dialect | Values in a statement | In one list | Whose limit |
+  |---|---|---|---|
+  | PostgreSQL, Redshift | 32,767 | 32,767 | The protocol's 16-bit count, as clients keep to it |
+  | MySQL | 65,535 | 65,535 | A prepared statement's placeholders |
+  | Snowflake | 16,384 | 16,384 | Expressions in a list |
+  | BigQuery | 10,000 | 10,000 | Query parameters in a query |
+  | SQL Server | 2,098 | 2,098 | 2,100 parameters in a request, two of them `sp_executesql`'s |
+  | Oracle | 65,535 | 1,000 | ORA-01795: expressions in a list |
+  | ClickHouse | 10,000 | 10,000 | xcube's: its parameters go in the URL, which the server caps (`http_max_uri_size`, 1 MiB by default) |
+  | DuckDB, wechart's engine | 65,535 | 65,535 | xcube's |
+
+  The refusals above are `400 invalid_parameters` with the reason, before
+  anything connects. Dremio, Trino and Athena take no bound values, nor
+  Oracle a Boolean before 23ai: `400 parameters_unsupported`.
+- **Whether a deployment has the statement form:** `{ runId, sql: "SELECT 1" }`
+  to a connection name that is valid but not there (`xcube_probe`) is
+  `404 unknown_connection` here, and `400 bad_request` (its body invalid)
+  on an image without it; nothing runs either way.
 
 #### `POST …/cubestore/sql`
 

@@ -40,6 +40,7 @@ import { calcVersion, specKey, withCompanions, type CalcSpec } from '../calcs/co
 import { CalculationError, planCalculations, type CalcPlan } from '../calcs/requests';
 import { SqlRunError, type SessionDialect, type SqlAnswer } from '../sql/runner';
 import { EXPORT_ROWS, exportStatement, type ExportRows } from '../sql/export';
+import type { SqlParameter } from '../sql/parameters';
 import { SqlRuns, type SqlRunRequest, type SqlTarget } from '../sql/runs';
 import { createListenClient, createPool, type Logger } from '../store/db';
 import { PgOpsStore, type RefreshTick } from '../store/ops';
@@ -2080,6 +2081,30 @@ export class XcubeRuntime {
     const target = await this.sqlTargetOf(model, { connection }, run);
     run.sql = exportStatement(target.dialect, request);
     return this.sqlRuns.run(model, target, run, rows);
+  }
+
+  /**
+   * Streams the rows of a caller's SELECT on a stored connection, as an
+   * export (`exportTable`) streams a table's: a SQL run with no row or byte
+   * cap, its `{{name}}` values bound, lists among them (`parameters.ts`).
+   */
+  public async exportStatement(
+    model: string,
+    connection: string,
+    request: { runId: string; sql: string; parameters?: Record<string, SqlParameter>; timeoutMs: number },
+    rows: ExportRows,
+  ): Promise<SqlAnswer> {
+    const run: SqlRunRequest = {
+      runId: request.runId,
+      sql: request.sql,
+      ...(request.parameters ? { parameters: request.parameters } : {}),
+      lists: true,
+      selectOnly: true,
+      timeoutMs: request.timeoutMs,
+      maxRows: EXPORT_ROWS,
+      maxBytes: Number.MAX_SAFE_INTEGER,
+    };
+    return this.sqlRuns.run(model, await this.sqlTargetOf(model, { connection }, run), run, rows);
   }
 
   /**

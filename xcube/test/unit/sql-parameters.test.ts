@@ -289,3 +289,42 @@ describe('a run with parameters', () => {
     expect(sent).toEqual(['SELECT \'{{a}}\'']);
   });
 });
+
+describe('list parameters (an export\'s statement): one placeholder per item, where {{name}} is all a parenthesis holds', () => {
+  const list = (type: SqlParameter['type'], value: (string | boolean)[]): SqlParameter => ({ type, value });
+
+  test('each item a placeholder of its own, typed, reused where the list recurs; positional dialects bind each place', () => {
+    const sql = 'SELECT * FROM t WHERE region = {{r}} AND id IN ({{ids}}) OR alt IN ( {{ids}} )';
+    const pg = bindParameters(sql, 'postgres', { r: text('east'), ids: list('number', ['1', '2.5', '3']) }, { lists: true });
+    expect(pg.sql).toBe('SELECT * FROM t WHERE region =  $1::text  AND id IN ( $2::numeric , $3::numeric , $4::numeric ) OR alt IN (  $2::numeric , $3::numeric , $4::numeric  )');
+    expect(pg.binds.map((b) => b.value)).toEqual(['east', '1', '2.5', '3']);
+    const my = bindParameters(sql, 'mysql', { r: text('east'), ids: list('text', ['a', 'b']) }, { lists: true });
+    expect(my.sql).toBe('SELECT * FROM t WHERE region =  ?  AND id IN ( ? , ? ) OR alt IN (  ? , ?  )');
+    expect(my.binds.map((b) => b.value)).toEqual(['east', 'a', 'b', 'a', 'b']);
+    const ora = bindParameters('SELECT 1 FROM dual WHERE d IN ({{d}})', 'oracle', { d: list('date', ['2024-01-01', '2024-02-01']) }, { lists: true });
+    expect(ora.sql).toBe('SELECT 1 FROM dual WHERE d IN ( TO_DATE(:p1, \'YYYY-MM-DD\') , TO_DATE(:p2, \'YYYY-MM-DD\') )');
+  });
+
+  test('refused: a list where the run takes none, an empty one, one outside a parenthesis, a bad item, and past a dialect\'s cap', () => {
+    const sql = 'SELECT * FROM t WHERE id IN ({{ids}})';
+    expect(reasonOf(() => bindParameters(sql, 'postgres', { ids: list('text', ['a']) }))?.[0]).toBe('invalid_value');
+    expect(reasonOf(() => bindParameters(sql, 'postgres', { ids: list('text', []) }, { lists: true }))?.[0]).toBe('empty_list');
+    expect(reasonOf(() => bindParameters('SELECT * FROM t WHERE id = {{ids}}', 'postgres', { ids: list('text', ['a']) }, { lists: true }))?.[0])
+      .toBe('list_outside_parentheses');
+    expect(reasonOf(() => bindParameters('SELECT * FROM t WHERE id IN ({{ids}}, 4)', 'postgres', { ids: list('text', ['a']) }, { lists: true }))?.[0])
+      .toBe('list_outside_parentheses');
+    expect(reasonOf(() => bindParameters(sql, 'postgres', { ids: list('number', ['1', 'x']) }, { lists: true })))
+      .toEqual(['invalid_value', expect.stringContaining('each item of the list')]);
+    const many = (n: number) => list('number', Array.from({ length: n }, (_v, i) => String(i)));
+    expect(bindParameters(sql, 'oracle', { ids: many(1000) }, { lists: true }).binds).toHaveLength(1000);
+    expect(reasonOf(() => bindParameters(sql, 'oracle', { ids: many(1001) }, { lists: true })))
+      .toEqual(['too_many_values', '"ids" has 1001 values: Oracle takes at most 1000 in a list']);
+    expect(bindParameters(sql, 'mssql', { ids: many(2098) }, { lists: true }).binds).toHaveLength(2098);
+    expect(reasonOf(() => bindParameters(sql, 'mssql', { ids: many(2099) }, { lists: true }))?.[0]).toBe('too_many_values');
+    // The statement's total: a list repeated on a positional dialect binds each time.
+    expect(reasonOf(() => bindParameters('SELECT 1 WHERE a IN ({{ids}}) AND b IN ({{ids}})', 'mysql', { ids: many(40000) }, { lists: true })))
+      .toEqual(['too_many_values', 'The statement binds 80000 values: MySQL takes at most 65535 in a statement']);
+    expect(bindParameters(sql, 'postgres', { ids: many(32767) }, { lists: true }).binds).toHaveLength(32767);
+    expect(reasonOf(() => bindParameters(sql, 'postgres', { ids: many(32768) }, { lists: true }))?.[0]).toBe('too_many_values');
+  });
+});

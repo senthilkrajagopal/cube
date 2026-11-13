@@ -23,6 +23,10 @@ export interface SqlRunRequest extends SqlCaps {
   runId: string;
   /** `{{name}}`'s values, bound, never written into the SQL (`parameters.ts`); absent, `{{…}}` is the SQL's own text. */
   parameters?: Record<string, SqlParameter>;
+  /** A parameter's value may be a list, bound as one value per item (an export's statement). */
+  lists?: boolean;
+  /** Only a SELECT runs (an export's statement): an EXPLAIN is refused, `not_select`. */
+  selectOnly?: boolean;
 }
 
 /** Where runs are noted while they run, so that a cancel reaches the instance running one. */
@@ -147,9 +151,17 @@ export class SqlRuns {
           );
         }
         // The statement as it runs, xcube's placeholders in its {{name}}s' places: what the check reads.
-        ({ sql: text, binds } = bindParameters(request.sql, dialect as SqlDialect, request.parameters));
+        ({ sql: text, binds } = bindParameters(request.sql, dialect as SqlDialect, request.parameters, { lists: request.lists }));
       }
       classified = classifySql(text, dialect as SqlDialect);
+      if (request.selectOnly && classified.statement !== 'select') {
+        throw new SqlRunError(
+          'not_select',
+          `An export runs a SELECT; this statement is ${classified.statement === 'explain' ? 'an EXPLAIN' : `a ${classified.statement}`}`,
+          classified.redactedSql,
+          classified.statement,
+        );
+      }
       // Cube Store answers every row at once: asked for one more than the cap.
       sql = dialect === 'cubestore' && classified.statement === 'select'
         ? withRowCap(classified.sql, 'cubestore', request.maxRows + 1)
