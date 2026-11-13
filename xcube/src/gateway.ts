@@ -47,13 +47,14 @@ import { CalculationError } from './calcs/requests';
 import { modelSchemaSuffix, QUEUE_HEART_BEAT_S } from './config';
 import { STOPPED } from './builds/stop';
 import { Connections } from './connections/connections';
+import { engineCodeOf } from './connections/engine';
 import {
   MODULE_KEY, OVERLAY_ID, OverlaySourceError, type XcubeRuntime,
 } from './runtime/runtime';
 import { relationNames } from './sql/classify';
 import { ROLE_KEY } from './security/verifier';
 import {
-  definitionOf, joinedCubes, keysOf, measuresOver, rowSetDialect, rowSetQuery, RowSetError, unsupportedMeasure, viewMemberFor,
+  definitionOf, joinedCubes, keysOf, measuresOver, rowSetDialect, rowSetQuery, RowSetError, selfAggregating, unsupportedMeasure, viewMemberFor,
 } from './rowset';
 
 /** A UUID derived from text, for the compiler id of a merged meta (the SQL API wants a UUID). */
@@ -377,9 +378,22 @@ export class XcubeApiGateway extends ApiGateway {
     return super.getNormalizedQueries(inputQuery, context, persistent, memberExpressions, cacheMode);
   }
 
-  /** A query's calculations that can't be computed are answered `400`, each with its reason; so is a row-set Cube can't build. */
+  /**
+   * A query's calculations that can't be computed are answered `400`, each
+   * with its reason; so is a row-set Cube can't build. An engine error keeps
+   * its code, as `engineCode` beside its message (`engineCodeOf`).
+   */
   public override handleError(options: Parameters<ApiGateway['handleError']>[0]) {
-    const { e, context, res, requestStarted } = options;
+    const { e, context, requestStarted } = options;
+    const res: typeof options.res = (message: any, extra?: any) => {
+      if (message && typeof message === 'object' && typeof message.error === 'string') {
+        const { message: error, code } = engineCodeOf(message.error);
+        if (code) {
+          return options.res({ ...message, error, engineCode: code }, extra);
+        }
+      }
+      return options.res(message, extra);
+    };
     if (e instanceof RowSetError) {
       this.log({ type: 'Invalid row-set', error: e.message, duration: this.duration(requestStarted) } as any, context);
       res({ error: e.message, code: e.code, ...(e.refusals ? { refusals: e.refusals } : {}) }, { status: 400 });
@@ -390,7 +404,7 @@ export class XcubeApiGateway extends ApiGateway {
       res({ error: e.message, code: 'invalid_calculation', calculations: e.refusals }, { status: 400 });
       return;
     }
-    super.handleError(options);
+    super.handleError({ ...options, res });
   }
 
   public override initApp(app: ExpressApplication) {
@@ -990,10 +1004,11 @@ export class XcubeApiGateway extends ApiGateway {
           } else {
             const leaves: string[] = grouped.collectLeafMeasures(() => grouped.newMeasure(measure).measureSql());
             leavesOf[measure] = leaves.length ? leaves : [measure];
-            for (const leaf of leavesOf[measure].filter((l) => l !== measure)) {
-              const through = unsupportedMeasure(definitionOf(evaluator, 'measures', leaf));
+            for (const leaf of leavesOf[measure]) {
+              const definition = definitionOf(evaluator, 'measures', leaf);
+              const through = (leaf !== measure && unsupportedMeasure(definition)) || selfAggregating(definition);
               if (through) {
-                refusals.push({ member: measure, reason: `it reads ${leaf}: ${through}` });
+                refusals.push({ member: measure, reason: leaf === measure ? through : `it reads ${leaf}: ${through}` });
               }
             }
           }

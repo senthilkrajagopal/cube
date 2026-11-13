@@ -82,6 +82,21 @@ export function unsupportedMeasure(definition: any): string | null {
   }
 }
 
+/**
+ * Measure types whose own SQL is the aggregate: one of them that reads no
+ * other measure (a leaf) has no value per row to put in a row-set, only
+ * its aggregate, which an ungrouped select can't hold.
+ */
+const SELF_AGGREGATING = ['number', 'numberAgg', 'string', 'time', 'boolean'];
+
+/** Why a leaf measure can't be taken apart into rows: its reason, or null. */
+export function selfAggregating(definition: any): string | null {
+  if (!definition || !SELF_AGGREGATING.includes(definition.type)) {
+    return null;
+  }
+  return `a measure of type ${definition.type} that reads no other measure aggregates in its own SQL, which has no value per row`;
+}
+
 const dialects = new WeakMap<object, any>();
 
 /**

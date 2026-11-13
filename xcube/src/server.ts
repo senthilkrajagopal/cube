@@ -14,6 +14,7 @@ import { OrchestratorStorage } from '@cubejs-backend/server-core/dist/src/core/O
 import { stoppableExternal, stoppableSource } from './builds/stop';
 import { CatalogQueues } from './catalog/queue';
 import { Connections } from './connections/connections';
+import { EngineDriver } from './connections/engine';
 import { globalRuntime, runtimeOf } from './config';
 import { XcubeApiGateway } from './gateway';
 import { DataSourceIntrospection } from './introspection';
@@ -36,6 +37,25 @@ class OrchestratorStorageInternals extends OrchestratorStorage {
   public static drop(storage: OrchestratorStorage, orchestratorId: string) {
     (storage as OrchestratorStorageInternals).storage.delete(orchestratorId);
   }
+}
+
+/**
+ * A refresh key on wechart's engine, once expired, is read again before the
+ * query it keys is answered: Cube's default path otherwise answers one
+ * request on the old value while it renews (`skipRefreshKeyWaitForRenew`).
+ * The engine answers its refresh keys from its catalog, without a table, so
+ * waiting costs one short call per key and expiry; a request past a key's
+ * `every` is never answered on its old value. Other data sources keep
+ * Cube's way.
+ */
+export function waitForEngineRefreshKeys(orchestratorApi: OrchestratorApi, engines: Set<string>) {
+  const cache = orchestratorApi.getQueryOrchestrator().getQueryCache();
+  const cacheRefreshKeyResult = cache.cacheRefreshKeyResult.bind(cache);
+  cache.cacheRefreshKeyResult = (sqlQuery, expiration, options) => cacheRefreshKeyResult(
+    sqlQuery,
+    expiration,
+    engines.has(options?.dataSource || 'default') ? { ...options, waitForRenew: true } : options,
+  );
 }
 
 /**
@@ -116,10 +136,15 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
     // A build the queue's cancel takes out while it builds is stopped: its source query
     // cancelled, and none of its tables committed (`builds/stop.ts`).
     const log = (message: string, params?: object) => this.logger(message, params || {});
+    // The data sources on wechart's engine, as their drivers are first asked for.
+    const engines = new Set<string>();
     const tracked: DriverFactoryByDataSource = async (dataSource, preAggregations) => {
       const driver: any = await getDriver(dataSource, preAggregations);
       if (driver?.__xcubeConnection) {
         connections.add(driver);
+      }
+      if (driver instanceof EngineDriver) {
+        engines.add(dataSource || 'default');
       }
       return stoppableSource(guarded(driver), log);
     };
@@ -127,6 +152,7 @@ export class XcubeServerCore extends CubejsServerCore implements ServingCore {
     const orchestratorApi = super.createOrchestratorApi(tracked, external
       ? { ...options, externalDriverFactory: async () => stoppableExternal(guarded(await external())) } as OrchestratorApiOptions
       : options);
+    waitForEngineRefreshKeys(orchestratorApi, engines);
     const release = orchestratorApi.release.bind(orchestratorApi);
     orchestratorApi.release = async () => {
       const released = await release();

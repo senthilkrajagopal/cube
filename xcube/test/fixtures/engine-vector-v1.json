@@ -1,0 +1,41 @@
+{
+  "about": "The engine driver's token, scheme v1 (wechart sub-phase 1j, C9), in golden-v1.json's form: `aad` and `envelopes` entries, sealed to the same development key (dev-credential-key.pub.jwk). Development values only.",
+  "aad": [
+    {
+      "driver": "engine",
+      "field": "token",
+      "fields": {
+        "baseUrl": "https://wechart-engine:8443"
+      },
+      "aad": "[\"wechart/data-source-secret/v1\",\"engine\",\"token\",[[\"baseUrl\",\"https://wechart-engine:8443\"],[\"sslCa\",\"\"],[\"sslRejectUnauthorized\",\"\"]]]"
+    },
+    {
+      "driver": "engine",
+      "field": "token",
+      "fields": {
+        "baseUrl": "https://engine.example:8443",
+        "sslRejectUnauthorized": true,
+        "sslCa": "-----BEGIN CERTIFICATE-----\nMIIgolden\n-----END CERTIFICATE-----"
+      },
+      "aad": "[\"wechart/data-source-secret/v1\",\"engine\",\"token\",[[\"baseUrl\",\"https://engine.example:8443\"],[\"sslCa\",\"-----BEGIN CERTIFICATE-----\\nMIIgolden\\n-----END CERTIFICATE-----\"],[\"sslRejectUnauthorized\",\"true\"]]]"
+    }
+  ],
+  "envelopes": [
+    {
+      "driver": "engine",
+      "field": "token",
+      "fields": {
+        "baseUrl": "https://engine.example:8443",
+        "sslRejectUnauthorized": true,
+        "sslCa": "-----BEGIN CERTIFICATE-----\nMIIgolden\n-----END CERTIFICATE-----"
+      },
+      "secret": "golden-engine-service-token-0123456789abcdef",
+      "envelope": {
+        "v": 1,
+        "kid": "uYWeMx6i173fsiolFp1xi-qiav50k52AGinM56Y8JEw",
+        "enc": "yNAhAycHhdzdKFEhvgRPyv4eQG9Q5KR4P5WyRM2ljwM",
+        "ct": "_S553JdJJvo_j5sXYhlTxu4vwQFjG7DlfsQCZrkg2n4_qsGO_pz5hPaSIn_ulJnoESaOQhzXVX8S9J2EJ_9jPHBroWaJ9hU-qGl4z-KYepQw0JQudn2wQ1u21fVH2iZEBgc4TRDkOkg_9LsqDzYLNRR1ZYG2kwlqnvcjBobiNvbFz5nAtkFjF8gA14bRWyVReJwkAET7oTW8CCiC5jAgKLGTgfrJ4ewfpqMzshu73x-EdUA1GtlL2uSyGCVyNTv2Co4Dmfc_PR0wkwWVjLOXH7v2h4BBYXoOtswhDpi_4AO3p6tvVbxlSXwvoPmTU1Ht8FoFKPjr35OjO1wX60qOBRd5XFD5A0pH0_01_nL8MCo"
+      }
+    }
+  ]
+}

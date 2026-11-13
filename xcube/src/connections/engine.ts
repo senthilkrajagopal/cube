@@ -62,6 +62,23 @@ export class EngineError extends Error {
   }
 }
 
+/**
+ * How an engine error's code rides on its message through Cube's query
+ * queue, which keeps an error's message alone (`QueryQueue`): appended by
+ * the driver on Cube's path (`query`), and taken off again by xcube's gateway
+ * as the answer's `engineCode` (`engineCodeOf`).
+ */
+const CODE_TAG = /\s\[engine code: ([a-z][a-z0-9_]*)\]$/;
+
+/** A message, its engine code tagged on. */
+export const withEngineCode = (message: string, code: string) => `${message} [engine code: ${code}]`;
+
+/** An error message's engine code, and the message without it: `undefined` code when it has none. */
+export function engineCodeOf(message: string): { message: string; code?: string } {
+  const match = CODE_TAG.exec(message);
+  return match ? { message: message.slice(0, match.index), code: match[1] } : { message };
+}
+
 /** A promise Cube's queue can stop: it reads `cancel` off what `query` returns. */
 export type CancelablePromise<T> = Promise<T> & { cancel: () => Promise<void> };
 
@@ -331,7 +348,13 @@ export class EngineDriver extends BaseDriver {
 
   public override query<R = unknown>(query: string, values?: unknown[], options?: any): Promise<R[]> {
     const running = this.run(query, values ?? [], { requestId: options?.requestId });
-    const rows = running.then((answer) => rowsOf(answer) as R[]) as CancelablePromise<R[]>;
+    const rows = running.then((answer) => rowsOf(answer) as R[], (e: unknown) => {
+      // Cube's queue keeps the message alone: the code rides on it, to the client (`engineCodeOf`).
+      if (e instanceof EngineError && e.code) {
+        throw new EngineError(withEngineCode(e.message, e.code), e.code, e.status);
+      }
+      throw e;
+    }) as CancelablePromise<R[]>;
     rows.cancel = running.cancel;
     return rows;
   }

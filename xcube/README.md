@@ -569,8 +569,11 @@ what Cube can't (its Spotfire stages); Cube still evaluates every policy.
   - `overLeaves` is the measure over its leaves' aggregates, each a column
     named by its leaf's alias.
   - Refused with their reasons (`unsupported_measure`, `refusals`): multi-stage,
-    rolling window, running total, count_distinct_approx and rank measures,
-    and a measure that reads one.
+    rolling window, running total, count_distinct_approx and rank measures; a
+    `number`, `number_agg`, `string`, `time` or `boolean` measure that reads no
+    other measure, as its own SQL aggregates and it has no value per row (one
+    over other measures, `{total} / {count}`, is answered); and a measure that
+    reads one of these.
 - **Refused too:** a cube with no primary key in the join (`no_primary_key`),
   and a query that would read a pre-aggregation (`pre_aggregation`).
 - **Answer:** `{ dataSource, dialect, rowSet: { sql, params }, policyRowSet?,
@@ -666,7 +669,12 @@ the connection's service token as `Authorization: Bearer …`, under its
   answers `{ columns: [{ name, type }], rows: [[…]] }`, each cell as Cube's
   DuckDB driver gives it (numbers as strings, dates and timestamps as ISO 8601
   UTC), and rows as objects by column name to Cube. An error is non-2xx
-  `{ error, code }`, which reaches Cube with its message and code. The Cube
+  `{ error, code }`, which reaches Cube with its message and code, and the
+  client of `/v1/load` (and of the other routes on Cube's queue) as `{ error,
+  engineCode }`: the code rides on the message through Cube's queue, which
+  keeps an error's message alone (`[engine code: …]`, taken off again by the
+  gateway). xcube's own refusals have codes too: `timeout` (no answer 5 s past
+  `timeoutMs`), `cancelled`, `answer_too_large`, `bad_answer`. The Cube
   request id goes as `requestId` and `X-Request-Id`. Only the SQL runner sends
   `maxRows`, one past its cap.
 - `DELETE /v1/query/{queryId}` stops a query: on Cube's cancel, on a SQL
@@ -678,6 +686,12 @@ the connection's service token as `Authorization: Bearer …`, under its
   `information_schema` statements through `/v1/query`.
 - An answer over 512 MB is refused. `baseUrl` is `https://`; `http://` only
   with `XCUBE_ENGINE_ALLOW_HTTP=true`, as the token would cross in the clear.
+- A cube's refresh key on it (wechart's `SELECT sf_table_version('<table id>')
+  AS refresh_key`), once expired, is read again before a request it keys is
+  answered (`waitForEngineRefreshKeys`, `src/server.ts`): on Cube's default
+  path, one request would be answered on the old value while it renews
+  (`skipRefreshKeyWaitForRenew`). Other connections keep Cube's way. The
+  refresh worker sends each cube's refresh key once a cycle, when expired.
 
 **A time series from the data, on DuckDB.** A rolling window or a time shift
 with no date range is answered over the periods from the data's first to its
@@ -1992,6 +2006,8 @@ that fails when it changes:
 | `prepareCompiler` building its validator from the `CubeValidator` module's export, which checks each pre-aggregation with its `meta` set aside | `test/unit/meta.test.ts`, on live compiles and both planners |
 | Tesseract building a time series from the data with the DuckDB dialect's `generated_time_series_*` templates | `test/integration/duckdb-series.test.ts`, on an in-process DuckDB |
 | Cube's legacy planner rendering measures (`renderSqlMeasure`), leaf measures (`collectLeafMeasures`) and multiplied cubes (`multipliedJoinRowResult`), which row-sets build on | `test/integration/rowset.test.ts`: aggregates over a row-set equal `/v1/load`'s, fan-out, policies and views included |
+| `QueryCache.cacheRefreshKeyResult` taking `waitForRenew` for a refresh key, which an engine's refresh keys are read with | The typecheck, and `test/integration/engine-1j.test.ts` (C1 d: the first request past a new version is answered fresh) |
+| Cube's queue keeping an error's message alone, which an engine error's code rides on | `test/integration/engine-1j.test.ts` (C6) |
 | Cube's DuckDB cell encoding, which wechart's engine copies | `test/integration/engine.test.ts`, whose stand-in engine encodes with Cube's `Transform.ts` |
 | The queue options Cube builds, with xcube's heartbeat | `test/unit/config.test.ts`, through Cube's own `OptsHandler` |
 | A running query's cancel from an instance that hasn't opened its queues | `test/integration/builds.test.ts`, on the memory queue and Cube Store |

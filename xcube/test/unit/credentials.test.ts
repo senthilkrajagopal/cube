@@ -157,3 +157,37 @@ describe('wechart\'s golden vectors, scheme v1', () => {
     }
   });
 });
+
+// The engine driver's token (wechart sub-phase 1j, C9), in golden-v1.json's form, sealed to the same
+// development key: xcube's own vector, sent to wechart for its sealing test (test/fixtures/engine-vector-v1.json).
+describe('the engine token\'s vector, scheme v1', () => {
+  const fixtures = path.join(__dirname, '..', 'fixtures');
+  const vector = JSON.parse(fs.readFileSync(path.join(fixtures, 'engine-vector-v1.json'), 'utf8'));
+
+  test('binds the token to baseUrl, sslRejectUnauthorized and sslCa, byte for byte', () => {
+    expect(vector.aad.length).toBe(2);
+    for (const entry of vector.aad) {
+      expect(secretAadV1(entry.driver, entry.field, entry.fields).toString('utf8')).toBe(entry.aad);
+    }
+  });
+
+  test('opens with the development key for exactly its fields, and for no other value of any of them', () => {
+    const key = generateCredentialKey(fs.readFileSync(path.join(fixtures, 'wechart-golden-v1', 'dev-credential-key.pem'), 'utf8'));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xcube-engine-vector-'));
+    try {
+      fs.writeFileSync(path.join(dir, `${key.kid}.pem`), key.pem);
+      fs.writeFileSync(path.join(dir, `${key.kid}.check`), key.check);
+      const keys = new CredentialKeys(dir, [key.kid], key.kid);
+      const [{ driver, field, fields, secret, envelope }] = vector.envelopes;
+      expect(envelope.kid).toBe(key.kid);
+      expect(keys.open(envelope, driver, field, fields)).toBe(secret);
+      for (const bound of ['baseUrl', 'sslRejectUnauthorized', 'sslCa']) {
+        expect(() => keys.open(envelope, driver, field, { ...fields, [bound]: 'elsewhere' })).toThrow(CredentialError);
+      }
+      // Fields outside the target don't bind it.
+      expect(keys.open(envelope, driver, field, { ...fields, queryTimeoutMs: 1 })).toBe(secret);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

@@ -27,6 +27,8 @@ export async function standInEngine(tables: string[] = [FACTS], token = ENGINE_T
     await connection.run(table);
   }
   const calls: { method: string; url: string; body: any; requestId?: string }[] = [];
+  /** An answer of the test's own in place of the engine's, for a query it returns one for: a status and its body. */
+  let intercept: ((body: any) => { status: number; body: unknown } | undefined) | undefined;
   const reply = (res: http.ServerResponse, status: number, body: unknown) => {
     res.writeHead(status, { 'content-type': 'application/json' });
     res.end(JSON.stringify(body));
@@ -48,6 +50,11 @@ export async function standInEngine(tables: string[] = [FACTS], token = ENGINE_T
       }
       if (req.method === 'DELETE') {
         reply(res, 404, { error: 'No such query', code: 'unknown_query' });
+        return;
+      }
+      const forced = intercept?.(body);
+      if (forced) {
+        reply(res, forced.status, forced.body);
         return;
       }
       const unknown = Object.keys(body ?? {}).filter((k) => !['sql', 'params', 'queryId', 'timeoutMs', 'requestId', 'maxRows'].includes(k));
@@ -81,6 +88,10 @@ export async function standInEngine(tables: string[] = [FACTS], token = ENGINE_T
     url: `http://127.0.0.1:${port}`,
     calls,
     connection,
+    /** Answers the queries `fn` returns an answer for with it, until set again (`undefined`: none). */
+    intercept: (fn: typeof intercept) => {
+      intercept = fn;
+    },
     close: async () => {
       server.closeAllConnections();
       await new Promise((resolve) => server.close(resolve));

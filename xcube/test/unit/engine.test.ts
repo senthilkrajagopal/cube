@@ -4,7 +4,7 @@ import type { AddressInfo } from 'net';
 import { DRIVERS } from '../../src/connections/drivers';
 import { openSession, RowCollector } from '../../src/sql/runner';
 import {
-  baseUrlProblems, checkedAnswer, EngineDriver, EngineError, engineParam, rowsOf,
+  baseUrlProblems, checkedAnswer, EngineDriver, EngineError, engineCodeOf, engineParam, rowsOf,
 } from '../../src/connections/engine';
 
 interface Seen {
@@ -112,11 +112,16 @@ describe('engine connections', () => {
     }
   });
 
-  test('the engine\'s error reaches Cube with its message and code', async () => {
+  test('the engine\'s error reaches Cube with its message and code, the code on the message through Cube\'s queue', async () => {
     const engine = await fakeEngine((_seen, res) => json(res, 400, { error: 'Binder Error: no such column x', code: 'binder' }));
     const driver = new EngineDriver({ baseUrl: engine.url, token: 'tok' });
     try {
-      await expect(driver.query('SELECT x')).rejects.toMatchObject({ name: 'EngineError', message: 'Binder Error: no such column x', code: 'binder', status: 400 });
+      const tagged = 'Binder Error: no such column x [engine code: binder]';
+      await expect(driver.query('SELECT x')).rejects.toMatchObject({ name: 'EngineError', message: tagged, code: 'binder', status: 400 });
+      expect(engineCodeOf(`Error: ${tagged}`)).toEqual({ message: 'Error: Binder Error: no such column x', code: 'binder' });
+      expect(engineCodeOf('Binder Error: no such column x')).toEqual({ message: 'Binder Error: no such column x' });
+      // The SQL runner's path keeps the engine's message as it is.
+      await expect(driver.run('SELECT x')).rejects.toMatchObject({ message: 'Binder Error: no such column x', code: 'binder' });
     } finally {
       await driver.release();
       await engine.close();
