@@ -693,6 +693,21 @@ the connection's service token as `Authorization: Bearer …`, under its
   (`skipRefreshKeyWaitForRenew`). Other connections keep Cube's way. The
   refresh worker sends each cube's refresh key once a cycle, when expired.
 
+**Zoneless time dimensions, on DuckDB.** Cube takes every `time` dimension's
+value as UTC and converts it to the query's `timezone`, with no per-member way
+not to: a DATE `2024-01-15` comes back as `2024-01-14T16:00` in
+`America/Los_Angeles`. A `time` dimension marked
+`meta: { wechart: { engine: { zoneless: true } } }` holds a wall-clock value
+instead (a DATE, or a TIMESTAMP with no zone), and keeps it: on `duckdb` and
+`engine` connections, xcube's DuckDB dialect reads its SQL as the instant at
+which the query's zone shows that value (`timezone('<zone>', CAST(… AS
+TIMESTAMP))`), so Cube's conversion gives the value back. Its granularities,
+date ranges and filters fall on its own day, on both planners (`/v1/load` and
+row-sets). A view's member reads its cube's, marked there. Unmarked time
+dimensions are converted as Cube does. The engine's sessions run in UTC, as
+Cube's DuckDB dialect reads a zoneless value cast to `TIMESTAMPTZ` in the
+session's zone.
+
 **A time series from the data, on DuckDB.** A rolling window or a time shift
 with no date range is answered over the periods from the data's first to its
 last, as Cube does on Postgres, on `duckdb` and `engine` connections and a
@@ -2008,6 +2023,7 @@ that fails when it changes:
 | Cube's legacy planner rendering measures (`renderSqlMeasure`), leaf measures (`collectLeafMeasures`) and multiplied cubes (`multipliedJoinRowResult`), which row-sets build on | `test/integration/rowset.test.ts`: aggregates over a row-set equal `/v1/load`'s, fan-out, policies and views included |
 | `QueryCache.cacheRefreshKeyResult` taking `waitForRenew` for a refresh key, which an engine's refresh keys are read with | The typecheck, and `test/integration/engine-1j.test.ts` (C1 d: the first request past a new version is answered fresh) |
 | Cube's queue keeping an error's message alone, which an engine error's code rides on | `test/integration/engine-1j.test.ts` (C6) |
+| Tesseract compiling a member's SQL through the dialect's `compileMemberSql`, and the legacy planner through `autoPrefixAndEvaluateSql`, each with the member's own `sql` function, which zoneless dimensions are found by | `test/integration/engine-zoneless.test.ts`, on both planners (`/v1/load`, row-sets) |
 | Cube's DuckDB cell encoding, which wechart's engine copies | `test/integration/engine.test.ts`, whose stand-in engine encodes with Cube's `Transform.ts` |
 | The queue options Cube builds, with xcube's heartbeat | `test/unit/config.test.ts`, through Cube's own `OptsHandler` |
 | A running query's cancel from an instance that hasn't opened its queues | `test/integration/builds.test.ts`, on the memory queue and Cube Store |

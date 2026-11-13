@@ -23,6 +23,8 @@ export const FACTS = `CREATE TABLE main.t_sales AS SELECT * FROM (VALUES
 export async function standInEngine(tables: string[] = [FACTS], token = ENGINE_TOKEN) {
   const instance = await DuckDBInstance.create(':memory:');
   const connection: DuckDBConnection = await instance.connect();
+  // As the engine runs its sessions: in UTC, whatever the host's zone.
+  await connection.run('SET TimeZone = \'UTC\'');
   for (const table of tables) {
     await connection.run(table);
   }
