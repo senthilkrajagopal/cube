@@ -428,6 +428,85 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
       expect(all).toHaveLength(300002);
     });
 
+    test('an export reads a batch sized by bytes per round trip; a SQL run still reads 500', async () => {
+      // eslint-disable-next-line global-require, @typescript-eslint/no-var-requires
+      const Cursor = require('pg-cursor');
+      const reads: number[] = [];
+      const original = Cursor.prototype.read;
+      Cursor.prototype.read = function read(this: any, n: number, cb: any) {
+        reads.push(n);
+        return original.call(this, n, cb);
+      };
+      try {
+        await sql(`CREATE TABLE IF NOT EXISTS ${warehouse}.wide AS SELECT n, repeat('y', 200) AS pad FROM generate_series(1, 200000) n`);
+        const res = await exportOf({ schema: warehouse, table: 'wide' }, 'gzip').expect(200);
+        expect(lines(res.body).at(-1).end.rows).toBe(200000);
+        // The first 1,000 rows, then about 16 MiB of rows (about 215 bytes each), at most 50,000.
+        expect(reads[0]).toBe(1000);
+        expect(Math.max(...reads)).toBe(50000);
+        expect(reads.length).toBeLessThan(10);
+
+        reads.length = 0;
+        process.env.XCUBE_EXPORT_FETCH_BYTES = String(1024 * 1024);
+        process.env.XCUBE_EXPORT_FETCH_ROWS = '3000';
+        await exportOf({ schema: warehouse, table: 'wide' }).expect(200);
+        expect(reads[0]).toBe(1000);
+        expect(Math.max(...reads.slice(1))).toBe(3000);
+
+        reads.length = 0;
+        await admin('post', '/connections/default/sql', { runId: crypto.randomUUID(), sql: `SELECT n FROM ${warehouse}.wide` }).expect(200);
+        expect(reads[0]).toBe(500);
+      } finally {
+        Cursor.prototype.read = original;
+        delete process.env.XCUBE_EXPORT_FETCH_BYTES;
+        delete process.env.XCUBE_EXPORT_FETCH_ROWS;
+      }
+    });
+
+    test('a client that stops reading pauses the reads; once it reads on, every row comes', async () => {
+      // eslint-disable-next-line global-require, @typescript-eslint/no-var-requires
+      const Cursor = require('pg-cursor');
+      let reads = 0;
+      const original = Cursor.prototype.read;
+      Cursor.prototype.read = function read(this: any, n: number, cb: any) {
+        reads += 1;
+        return original.call(this, n, cb);
+      };
+      process.env.XCUBE_EXPORT_FETCH_BYTES = String(256 * 1024);
+      try {
+        await sql(`CREATE TABLE IF NOT EXISTS ${warehouse}.wide AS SELECT n, repeat('y', 200) AS pad FROM generate_series(1, 200000) n`);
+        const { port } = server.address() as any;
+        const body = JSON.stringify({ runId: crypto.randomUUID(), schema: warehouse, table: 'wide' });
+        const response = await new Promise<http.IncomingMessage>((resolve, reject) => {
+          const req = http.request({
+            port,
+            method: 'POST',
+            path: `${base}/connections/default/export`,
+            headers: { Authorization: `Bearer ${ADMIN_TOKEN}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+          }, resolve);
+          req.on('error', reject);
+          req.end(body);
+        });
+        expect(response.statusCode).toBe(200);
+        response.pause();
+        // The socket's buffers fill, and the reads stop short of the table's 43 MB (about 165 reads of 256 KiB).
+        await sleep(3000);
+        const paused = reads;
+        await sleep(2000);
+        expect(reads).toBe(paused);
+        expect(paused).toBeLessThan(120);
+        const chunks: Buffer[] = [];
+        response.on('data', (c: Buffer) => chunks.push(c));
+        await new Promise((resolve) => { response.on('end', resolve); response.resume(); });
+        const all = lines(Buffer.concat(chunks).toString('utf8'));
+        expect(all.at(-1)).toEqual({ end: { rows: 200000, durationMs: expect.any(Number) } });
+        expect(all).toHaveLength(200002);
+      } finally {
+        Cursor.prototype.read = original;
+        delete process.env.XCUBE_EXPORT_FETCH_BYTES;
+      }
+    });
+
     test('a name it can\'t quote is refused; a table that isn\'t there fails as a SQL run does, before any line', async () => {
       const quoted = await exportOf({ schema: warehouse, table: 'orders"; DROP TABLE x; --' }).expect(400);
       expect(JSON.parse(quoted.body).code).toBe('invalid_export');

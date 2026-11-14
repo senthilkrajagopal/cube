@@ -36,7 +36,7 @@ import { PARAMETER_NAME } from '../sql/classify';
 import type { QueueEntry } from '../gateway';
 import { SqlRunError, type SqlFailure } from '../sql/runner';
 import {
-  EXPORT_MAX_BUFFERED, EXPORT_MAX_TIMEOUT_MS, EXPORT_TIMEOUT_MS, ExportError, ExportRows,
+  EXPORT_MAX_BUFFERED, EXPORT_MAX_TIMEOUT_MS, EXPORT_STALL_MS, EXPORT_TIMEOUT_MS, ExportError, ExportRows, exportFetchFromEnv,
 } from '../sql/export';
 import { adminAuth } from './auth';
 
@@ -864,12 +864,39 @@ export function initAdminRoutes(
       }
       return out;
     };
+    const fetch = exportFetchFromEnv();
+    const unsent = (to: NodeJS.WritableStream & { writableLength: number }) => to.writableLength + (to === res ? 0 : res.writableLength);
+    // Between batches: while more than a batch waits unsent, the run waits for the client to take it,
+    // up to EXPORT_STALL_MS without a drain (then `false`: it has stopped reading).
+    const caughtUp = async (): Promise<boolean> => {
+      const to = out;
+      while (to && unsent(to) > fetch.bytes && !res.destroyed) {
+        const drained = await new Promise<boolean>((resolve) => {
+          let done: (value: boolean) => void = resolve;
+          const onDrain = () => done(true);
+          const onClose = () => done(true);
+          const timer = setTimeout(() => done(false), EXPORT_STALL_MS);
+          done = (value) => {
+            clearTimeout(timer);
+            to.removeListener('drain', onDrain);
+            res.removeListener('close', onClose);
+            resolve(value);
+          };
+          to.once('drain', onDrain);
+          res.once('close', onClose);
+        });
+        if (!drained) {
+          return false;
+        }
+      }
+      return true;
+    };
     // `false` once more waits unsent than the cap: the client doesn't keep up.
     const rows = new ExportRows((line) => {
       const to = start();
       to.write(`${line}\n`);
-      return to.writableLength + (to === res ? 0 : res.writableLength) < EXPORT_MAX_BUFFERED;
-    });
+      return unsent(to) < EXPORT_MAX_BUFFERED;
+    }, fetch, caughtUp);
     let finished = false;
     // The client gone: its run stops.
     res.on('close', () => {
@@ -889,7 +916,7 @@ export function initAdminRoutes(
         : await runtime.exportStatement(model, name, body, rows);
       if (rows.slow) {
         logger('xcube: export', { ...logged, outcome: 'client_too_slow', rows: rows.count, durationMs: Date.now() - started });
-        last({ error: { code: 'client_too_slow', message: `The client read too slowly: over ${EXPORT_MAX_BUFFERED} bytes waited unsent` } });
+        last({ error: { code: 'client_too_slow', message: `The client read too slowly: over ${EXPORT_MAX_BUFFERED} bytes waited unsent, or none was taken for ${EXPORT_STALL_MS / 1000} s` } });
         return;
       }
       rows.finishColumns();

@@ -155,6 +155,20 @@ export class RowCollector {
     return this.truncated !== null;
   }
 
+  /** How many rows a session reads in one round trip: an interactive run's own, `interactive`. An export's are more. */
+  // eslint-disable-next-line class-methods-use-this
+  public fetchRows(interactive: number): number {
+    return interactive;
+  }
+
+  /**
+   * Resolves once the rows read so far are taken, at once but for an export
+   * whose client is behind: `false` when the session should read no more.
+   */
+  public async ready(): Promise<boolean> {
+    return !this.full;
+  }
+
   /** The rows read before a stop, as they stand: a session let go of may still be adding. */
   public stopped(): SqlRows {
     const rows = this.rows.slice();
@@ -200,8 +214,8 @@ const sleep = (ms: number) => new Promise((resolve) => {
   setTimeout(resolve, ms);
 });
 
-/** How many rows to read at a time: never more than the cap's one past. */
-const batchOf = (rows: RowCollector, maxRows: number) => Math.max(1, Math.min(500, maxRows + 1 - rows.rows.length));
+/** How many rows to read at a time: 500 for a run (an export's own for one), never more than the cap's one past. */
+const batchOf = (rows: RowCollector, maxRows: number, interactive = 500) => Math.max(1, Math.min(rows.fetchRows(interactive), maxRows + 1 - rows.rows.length));
 
 /**
  * PostgreSQL and Redshift: a connection of the run's own, in a read-only
@@ -260,6 +274,9 @@ async function pgSession(driver: any, dialect: 'postgres' | 'redshift', caps: Sq
           });
           columnsOf(result);
           if (!more || read.length < batch) {
+            break;
+          }
+          if (!(await rows.ready())) {
             break;
           }
         }
@@ -466,6 +483,9 @@ async function bigquerySession(driver: any, caps: SqlCaps, refuse: Refuse): Prom
           return;
         }
         pageToken = next?.pageToken;
+        if (pageToken && !(await rows.ready())) {
+          return;
+        }
       } while (pageToken);
     },
     async cancel() {
@@ -546,7 +566,7 @@ async function mssqlSession(driver: any): Promise<SqlSession> {
   };
 }
 
-/** Oracle's rows per round trip. */
+/** Oracle's rows per round trip for a run (an export's own for one). */
 const ORACLE_FETCH = 100;
 
 /**
@@ -576,12 +596,14 @@ async function oracleSession(driver: any, caps: SqlCaps): Promise<SqlSession> {
       const values = Object.fromEntries(binds.map((b) => [b.id, {
         dir: db.BIND_IN, type: b.type === 'boolean' ? db.DB_TYPE_BOOLEAN : db.STRING, val: b.value,
       }]));
+      // An export's first batch: the size its rows are read in from the database.
+      const fetch = Math.max(1, rows.fetchRows(ORACLE_FETCH));
       const result = await conn.execute(sql, values, {
         resultSet: true,
         outFormat: db.OUT_FORMAT_ARRAY,
         // One round trip per read: a stop loses at most the fetch it interrupts.
-        fetchArraySize: ORACLE_FETCH,
-        prefetchRows: ORACLE_FETCH,
+        fetchArraySize: fetch,
+        prefetchRows: fetch,
         fetchTypeHandler: (meta: any) => {
           if (meta.dbType === db.DB_TYPE_CLOB || meta.dbType === db.DB_TYPE_NCLOB) {
             return { type: db.STRING };
@@ -593,9 +615,12 @@ async function oracleSession(driver: any, caps: SqlCaps): Promise<SqlSession> {
       const set = result.resultSet;
       try {
         for (;;) {
-          const batch = Math.min(ORACLE_FETCH, batchOf(rows, caps.maxRows));
+          const batch = batchOf(rows, caps.maxRows, ORACLE_FETCH);
           const read: unknown[][] = await set.getRows(batch);
           if (!read.every((row) => rows.add(row)) || read.length < batch) {
+            break;
+          }
+          if (!(await rows.ready())) {
             break;
           }
         }

@@ -224,6 +224,8 @@ In both modes:
 | `XCUBE_DUCKDB_MAX_OPEN` | `4` | The most DuckDB instances open in a pod at once (1 to 1,000) |
 | `XCUBE_DUCKDB_EXTENSION_DIRECTORY` | `/cube/duckdb-extensions` in the image | Where DuckDB loads its extensions from: the image's httpfs, aws, iceberg (and avro) and motherduck, for its own platform. Unset, DuckDB's own (`~/.duckdb/extensions`) |
 | `XCUBE_DUCKDB_VOLUMES` | unset | Comma-separated absolute directories a `volume` connection's file may be in. Unset, none may |
+| `XCUBE_EXPORT_FETCH_ROWS` | `50000` | The most rows an export reads from the database in one round trip (1 to 1,000,000), where its driver reads in batches (PostgreSQL, Redshift, BigQuery, Oracle) |
+| `XCUBE_EXPORT_FETCH_BYTES` | `16777216` | About how much of an export's NDJSON one round trip reads (64 KiB to 64 MiB): a batch is this over the rows' average size so far, at most `XCUBE_EXPORT_FETCH_ROWS`, and the first is 1,000 rows. It is also how much may wait unsent before the export waits for its client |
 | `XCUBE_CONNECTION_HEARTBEAT_MS` | `600000` | How often an instance re-writes its report of each connection it holds a driver for (10 s to 30 min), so a report within the hour means an instance running |
 | `CUBEJS_TRANSPILATION_WORKER_THREADS_COUNT` | `2` | Cube's; the image sets it when unset, as unset a compile can take gigabytes |
 
@@ -1624,10 +1626,22 @@ timeoutMs? }` (`src/sql/export.ts`).
 - **A failure before the first line** is answered as a SQL run's is (status
   and `{ error, code }`). One after it ends the stream with
   `{"error":{"code","message","rows"}}` as the last line: `timeout`,
-  `cancelled`, `query_failed`, or `client_too_slow` once more than 256 MB wait
-  unsent.
+  `cancelled`, `query_failed`, or `client_too_slow` (below).
 - Rows are read as the database sends them, a page or a cursor's batch at a
   time, and written as they come: nothing holds the table.
+- **Its batches are sized by bytes**, where the driver reads a batch per round
+  trip (PostgreSQL and Redshift's cursor, BigQuery's pages, Oracle's fetches):
+  1,000 rows first, then about `XCUBE_EXPORT_FETCH_BYTES` (16 MiB) of NDJSON
+  by the rows' average size so far, at most `XCUBE_EXPORT_FETCH_ROWS`
+  (50,000). A SQL run's own reads stay 500 rows (Oracle's 100). MySQL, SQL
+  Server, Snowflake, ClickHouse and DuckDB stream, and Trino's server sizes
+  its own pages, so there is no batch to size; Dremio's and Athena's APIs page
+  at most 500 and 1,000 rows.
+- **A client that falls behind pauses it:** before each batch, while more
+  than `XCUBE_EXPORT_FETCH_BYTES` waits unsent, the export waits for the
+  client to take it. It ends as `client_too_slow` once over 256 MB waits
+  unsent (a stream that doesn't pause), or when the client takes nothing for
+  5 minutes.
 - **Or a statement:** `{ runId, sql, parameters?, timeoutMs? }` in place of
   `table` (never both, and `schema` and `columns` only with `table`) exports
   the rows of a caller's SELECT, answered as a table's is. It runs under the

@@ -1,5 +1,6 @@
 import { DEFAULT_LIMITS, type SnapshotLimits } from '../model/snapshot';
 import { duckdbSettingsFromEnv } from '../connections/duckdb';
+import { exportFetchFromEnv } from '../sql/export';
 import { assertSchemaName } from '../store/db';
 
 /** xcube's runtime settings, from `XCUBE_*`. */
@@ -171,6 +172,7 @@ export function settingsFromEnv(env: NodeJS.ProcessEnv = process.env): XcubeSett
 
   // Checked here, so a value that isn't one fails xcube as it starts, not a DuckDB source's first query.
   duckdbSettingsFromEnv(env);
+  exportFetchFromEnv(env);
 
   return {
     databaseUrl,

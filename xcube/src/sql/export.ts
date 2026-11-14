@@ -15,6 +15,12 @@
  *
  * Its cells are the SQL runner's (`cellOf`). The last line says whether every
  * row came: an answer without an `end` line is incomplete.
+ *
+ * Where a session reads a batch per round trip (PostgreSQL and Redshift's
+ * cursor, BigQuery's pages, Oracle's fetches), an export's batches are sized
+ * by bytes (`ExportRows.fetchRows`): about `XCUBE_EXPORT_FETCH_BYTES` of
+ * NDJSON, at most `XCUBE_EXPORT_FETCH_ROWS` rows. Between batches the run
+ * waits while the client is behind (`ready`), rather than buffering.
  */
 import { RowCollector, cellOf, type SqlColumn, type SessionDialect } from './runner';
 
@@ -26,6 +32,45 @@ export const EXPORT_MAX_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 
 /** What an export's answer may hold unsent before it is stopped as `client_too_slow`. */
 export const EXPORT_MAX_BUFFERED = 256 * 1024 * 1024;
+
+/** The most rows an export reads in one round trip, unless `XCUBE_EXPORT_FETCH_ROWS` says. */
+export const EXPORT_FETCH_ROWS = 50000;
+
+/** About what one round trip of an export holds, as NDJSON: 16 MiB, unless `XCUBE_EXPORT_FETCH_BYTES` says. */
+export const EXPORT_FETCH_BYTES = 16 * 1024 * 1024;
+
+/** An export's first read, before the size of its rows is known. */
+export const EXPORT_FIRST_FETCH = 1000;
+
+/** How long an export waits for a client that has stopped reading before it ends as `client_too_slow`. */
+export const EXPORT_STALL_MS = 5 * 60 * 1000;
+
+/** How an export reads its rows from the database. */
+export interface ExportFetch {
+  rows: number;
+  bytes: number;
+}
+
+function whole(env: NodeJS.ProcessEnv, name: string, fallback: number, min: number, max: number): number {
+  const raw = env[name];
+  if (raw === undefined || raw === '') {
+    return fallback;
+  }
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be a whole number from ${min} to ${max}, not ${JSON.stringify(raw)}`);
+  }
+  return value;
+}
+
+/** The settings, checked: a value that isn't one fails xcube as it starts (`settingsFromEnv`), not an export. */
+export function exportFetchFromEnv(env: NodeJS.ProcessEnv = process.env): ExportFetch {
+  return {
+    rows: whole(env, 'XCUBE_EXPORT_FETCH_ROWS', EXPORT_FETCH_ROWS, 1, 1000000),
+    // Well under what may wait unsent (`EXPORT_MAX_BUFFERED`): a batch is written whole.
+    bytes: whole(env, 'XCUBE_EXPORT_FETCH_BYTES', EXPORT_FETCH_BYTES, 64 * 1024, 64 * 1024 * 1024),
+  };
+}
 
 /** The cap an export's run is given: none that a table reaches. */
 export const EXPORT_ROWS = Number.MAX_SAFE_INTEGER - 1;
@@ -82,8 +127,36 @@ export class ExportRows extends RowCollector {
 
   protected wroteColumns = false;
 
-  public constructor(protected readonly write: (line: string) => boolean) {
+  /** What the rows written so far came to. */
+  protected written = 0;
+
+  /**
+   * `write` sends a line, `false` once more waits unsent than the client may
+   * leave; `waitFor` resolves once the client has taken what was sent, or
+   * says `false` when it has stopped reading.
+   */
+  public constructor(
+    protected readonly write: (line: string) => boolean,
+    protected readonly fetch: ExportFetch = exportFetchFromEnv(),
+    protected readonly waitFor: () => Promise<boolean> = async () => true,
+  ) {
     super(EXPORT_ROWS, Number.POSITIVE_INFINITY);
+  }
+
+  /** A batch of about `fetch.bytes` of the rows seen so far, at most `fetch.rows`. */
+  public override fetchRows(_interactive: number): number {
+    if (!this.count) {
+      return Math.min(EXPORT_FIRST_FETCH, this.fetch.rows);
+    }
+    const perRow = Math.max(1, this.written / this.count);
+    return Math.max(1, Math.min(this.fetch.rows, Math.floor(this.fetch.bytes / perRow)));
+  }
+
+  public override async ready(): Promise<boolean> {
+    if (!this.slow && !(await this.waitFor())) {
+      this.slow = true;
+    }
+    return !this.slow;
   }
 
   public override setColumns(columns: SqlColumn[]) {
@@ -102,7 +175,9 @@ export class ExportRows extends RowCollector {
       this.setColumns(this.columns);
     }
     this.count += 1;
-    if (!this.write(JSON.stringify(row.map(cellOf)))) {
+    const line = JSON.stringify(row.map(cellOf));
+    this.written += line.length + 1;
+    if (!this.write(line)) {
       this.slow = true;
       return false;
     }
