@@ -1626,7 +1626,18 @@ timeoutMs? }` (`src/sql/export.ts`).
 - **A failure before the first line** is answered as a SQL run's is (status
   and `{ error, code }`). One after it ends the stream with
   `{"error":{"code","message","rows"}}` as the last line: `timeout`,
-  `cancelled`, `query_failed`, or `client_too_slow` (below).
+  `cancelled`, `query_failed`, or `client_too_slow` (below). Redshift words
+  its statement timeout as a cancel (`Query (N) cancelled on user's
+  request`): one that comes at the export's timeout is `timeout`, one before
+  it a cancel from elsewhere (`query_failed`).
+- **It is logged** as it starts (`xcube: export started`) and as it ends
+  (`xcube: export`), with the model, connection, `runId`, `source` (the
+  table's `schema.table`, or `statement`: never its SQL or values), the rows
+  sent and the time taken. These print at `info`, the default
+  `CUBEJS_LOG_LEVEL`, where Cube's own logger would show them only at
+  `trace`. A failure prints at `error` with its message, and the database's
+  own words as `databaseMessage` where its code is xcube's (`timeout`); a
+  cancel is no failure.
 - Rows are read as the database sends them, a page or a cursor's batch at a
   time, and written as they come: nothing holds the table.
 - **Its batches are sized by bytes**, where the driver reads a batch per round

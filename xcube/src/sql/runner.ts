@@ -74,6 +74,9 @@ export class SqlRunError extends Error {
   ) {
     super(message);
   }
+
+  /** The database's own words, where the failure is worded as xcube's (its statement timeout firing): for the log. */
+  public databaseMessage: string | null = null;
 }
 
 /** A JSON value for a cell: binary as `\x` and hex, dates as ISO 8601, big numbers as strings. */
@@ -1217,14 +1220,26 @@ export function queryFailedReason(dialect: SessionDialect, e: any): string | nul
   return null;
 }
 
-/** Whether a database's error is its own statement timeout firing. */
-export function isTimeout(dialect: SessionDialect, e: any): boolean {
+/** How much sooner than its timeout a statement's cancel may come and still be the timeout's (Redshift's). */
+const TIMEOUT_SLACK_MS = 1000;
+
+/**
+ * Whether a database's error is its own statement timeout firing. `ran`,
+ * how long the statement had run and its timeout, tells Redshift's apart: it
+ * words its statement timeout as a cancel, `Query (N) cancelled on user's
+ * request`, as it does a cancel from elsewhere (xcube's own cancel is told
+ * apart before: `runs.ts`).
+ */
+export function isTimeout(dialect: SessionDialect, e: any, ran?: { ms: number; timeoutMs: number }): boolean {
   const code = String(e?.code ?? '');
   const message = String(e?.message ?? '');
   switch (dialect) {
     case 'postgres':
-    case 'redshift':
       return code === '57014' && /statement timeout/i.test(message);
+    case 'redshift':
+      // The cancel by its words, whatever its SQLSTATE (57014 as Redshift sends it): the time it came at tells.
+      return (code === '57014' && /statement timeout/i.test(message))
+        || (/cancell?ed on user's request/i.test(message) && ran !== undefined && ran.ms >= ran.timeoutMs - TIMEOUT_SLACK_MS);
     case 'mysql':
       return e?.errno === 3024 || code === 'ER_QUERY_TIMEOUT' || /max_statement_time|maximum statement execution time/i.test(message);
     case 'snowflake':

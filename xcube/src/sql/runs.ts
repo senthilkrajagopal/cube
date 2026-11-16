@@ -269,8 +269,10 @@ export class SqlRuns {
         if (reason) {
           throw stopped(ranAt, rows.stopped());
         }
-        if (isTimeout(dialect, e)) {
-          throw fail('timeout', `The statement ran past ${elapsed(request.timeoutMs)} and was stopped`, Date.now() - ranAt, rows.stopped());
+        if (isTimeout(dialect, e, { ms: Date.now() - ranAt, timeoutMs: request.timeoutMs })) {
+          const timedOut = fail('timeout', `The statement ran past ${elapsed(request.timeoutMs)} and was stopped`, Date.now() - ranAt, rows.stopped());
+          timedOut.databaseMessage = redact(String(e?.message ?? e), built.secrets);
+          throw timedOut;
         }
         throw new SqlRunError(
           'query_failed',

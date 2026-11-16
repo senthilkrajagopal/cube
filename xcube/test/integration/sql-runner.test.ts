@@ -410,6 +410,9 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
       expect(rows).toHaveLength(50);
       // As the SQL runner gives them: Cube's Postgres driver reads a timestamptz as UTC, with no zone.
       expect(rows[0]).toEqual([1, 'c1', '1.50', '2024-01-02T00:00:00.000']);
+      const ended = logs.filter((l) => l.message === 'xcube: export' && l.params?.source === `${warehouse}.orders`).at(-1);
+      expect(ended?.params).toMatchObject({ outcome: 'ok', rows: 50, durationMs: expect.any(Number) });
+      expect(ended?.params.error).toBeUndefined();
     });
 
     test('every column, gzipped where the client takes it', async () => {
@@ -510,8 +513,19 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
     test('a name it can\'t quote is refused; a table that isn\'t there fails as a SQL run does, before any line', async () => {
       const quoted = await exportOf({ schema: warehouse, table: 'orders"; DROP TABLE x; --' }).expect(400);
       expect(JSON.parse(quoted.body).code).toBe('invalid_export');
-      const missing = await exportOf({ schema: warehouse, table: 'nope' }).expect(422);
-      expect(JSON.parse(missing.body)).toMatchObject({ code: 'query_failed' });
+      const missingRun = crypto.randomUUID();
+      const missing = await request(server).post(`${base}/connections/default/export`)
+        .set('Authorization', `Bearer ${ADMIN_TOKEN}`)
+        .send({ runId: missingRun, schema: warehouse, table: 'nope' })
+        .expect(422);
+      expect(missing.body).toMatchObject({ code: 'query_failed' });
+      // Logged as it starts and as it fails, with the database's own words at error level.
+      const logged = logs.filter((l) => l.params?.runId === missingRun);
+      expect(logged.map((l) => [l.message, l.params.source, l.params.outcome])).toEqual([
+        ['xcube: export started', `${warehouse}.nope`, undefined],
+        ['xcube: export', `${warehouse}.nope`, 'query_failed'],
+      ]);
+      expect(logged[1].params.error).toMatch(/does not exist/);
       await exportOf({ table: 'orders', limit: 5 }).expect(400);
     });
 

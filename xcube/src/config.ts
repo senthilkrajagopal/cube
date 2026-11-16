@@ -8,6 +8,7 @@ import { DRIVERS, isDriverType } from './connections/drivers';
 import { dialectFactory } from './model/dialects';
 import { XcubeRuntime, type ServingOptions } from './runtime/runtime';
 import { GATE_GROUP } from './security/marker';
+import { xcubeLogger } from './logger';
 
 export interface XcubeConfigOptions {
   /** The security-context claim naming the model a request reads. Default `xcubeModel`. */
@@ -149,6 +150,8 @@ export function createConfig(
 
   return {
     ...cube,
+    // Cube's own, but for xcube's export lines, printed at `info` (`src/logger.ts`); cube.js's, where it gives one.
+    logger: cube.logger ?? xcubeLogger(!(cube.devServer ?? getEnv('devMode')), getEnv('logLevel') ?? 'info'),
     contextToAppId,
     contextToGroups,
     repositoryFactory: (context: any) => {

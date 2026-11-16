@@ -905,18 +905,22 @@ export function initAdminRoutes(
       }
     });
     const started = Date.now();
-    const logged = { model, target: name, runId: body.runId };
+    // What it exports: a table by its name; a statement never by its SQL or values.
+    const source = body.sql === undefined ? [body.schema, body.table].filter((n) => n !== undefined).join('.') : 'statement';
+    const logged = { model, target: name, runId: body.runId, source };
     const last = (line: object) => {
       finished = true;
       start().end(`${JSON.stringify(line)}\n`);
     };
+    logger('xcube: export started', logged);
     try {
       const answer = body.sql === undefined
         ? await runtime.exportTable(model, name, body, rows)
         : await runtime.exportStatement(model, name, body, rows);
       if (rows.slow) {
-        logger('xcube: export', { ...logged, outcome: 'client_too_slow', rows: rows.count, durationMs: Date.now() - started });
-        last({ error: { code: 'client_too_slow', message: `The client read too slowly: over ${EXPORT_MAX_BUFFERED} bytes waited unsent, or none was taken for ${EXPORT_STALL_MS / 1000} s` } });
+        const message = `The client read too slowly: over ${EXPORT_MAX_BUFFERED} bytes waited unsent, or none was taken for ${EXPORT_STALL_MS / 1000} s`;
+        logger('xcube: export', { ...logged, outcome: 'client_too_slow', rows: rows.count, durationMs: Date.now() - started, error: message });
+        last({ error: { code: 'client_too_slow', message } });
         return;
       }
       rows.finishColumns();
@@ -929,12 +933,20 @@ export function initAdminRoutes(
       if (!(e instanceof SqlRunError)) {
         if (out) {
           last({ error: { code: 'internal', message: 'The export failed' } });
-          logger('xcube: export', { ...logged, outcome: 'internal', rows: rows.count, error: String((e as any)?.message ?? e) });
+          logger('xcube: export', { ...logged, outcome: 'internal', rows: rows.count, durationMs: Date.now() - started, error: String((e as any)?.message ?? e) });
           return;
         }
         throw e;
       }
-      logger('xcube: export', { ...logged, outcome: e.code, rows: rows.count, durationMs: Date.now() - started });
+      // A failure at error level, with the database's own words; a cancel is no failure.
+      logger('xcube: export', {
+        ...logged,
+        outcome: e.code,
+        rows: rows.count,
+        durationMs: Date.now() - started,
+        ...(e.code === 'cancelled' ? {} : { error: e.message }),
+        ...(e.databaseMessage ? { databaseMessage: e.databaseMessage } : {}),
+      });
       if (out) {
         last({ error: { code: e.code, message: e.message, rows: rows.count } });
         return;
