@@ -1,7 +1,9 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "types": ["node"]
+    "types": ["node"],
+    // src/model/exact-extends.js and transpile-worker.js, which Cube's transpiler workers load as they are.
+    "allowJs": true
   },
   "include": ["src"]
 }

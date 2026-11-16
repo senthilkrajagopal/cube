@@ -24,9 +24,15 @@ import { installPreAggregationMeta } from './model/meta';
 import type { ServingCore, XcubeRuntime } from './runtime/runtime';
 import { markedDataSources, MAX_OVERLAY_ORCHESTRATORS } from './overlays/connections';
 
-// Before any model compiles: every compile builds its join graph and validator from Cube's exports.
+// Plain JavaScript, which Cube's transpiler workers load as it is.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { installExactExtends }: { installExactExtends: () => void } = require('./model/exact-extends');
+
+// Before any model compiles: every compile builds its join graph and validator from Cube's exports,
+// and transpiles in workers that load the transpiler `exact-extends.js` patches.
 installKeylessJoins();
 installPreAggregationMeta();
+installExactExtends();
 
 /**
  * Drops an entry of Cube's orchestrator cache, from a subclass so the compiler
