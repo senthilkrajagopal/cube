@@ -15,7 +15,7 @@
  */
 
 export type SqlDialect = 'postgres' | 'redshift' | 'mysql' | 'snowflake' | 'bigquery' | 'mssql' | 'oracle' | 'dremio'
-  | 'duckdb' | 'clickhouse' | 'trino' | 'athena' | 'cubestore' | 'hive';
+  | 'duckdb' | 'clickhouse' | 'trino' | 'athena' | 'cubestore' | 'hive' | 'impala';
 
 export type StatementKind = 'select' | 'explain';
 
@@ -103,6 +103,13 @@ interface Rules {
   namesTakeNoBackslash?: boolean;
   /** `/*+ … *\/` is a hint the database acts on: refused. */
   refuseHints?: boolean;
+  /**
+   * Impala's hints, refused: `/* +…*\/` and `-- +…` (space before the `+`
+   * allowed), and `[…]` after a JOIN or in an INSERT.
+   */
+  impalaHints?: boolean;
+  /** A doubled quote isn't the quote: it closes the string or name and opens another (Impala). */
+  noDoubledQuotes?: boolean;
   /** What may come between EXPLAIN and the statement, beyond the common options. */
   explainOptions?: Set<string>;
   /** Names refused anywhere, unquoted: statements that write or lock, and the words that start them. */
@@ -356,6 +363,19 @@ const RULES: Record<SqlDialect, Rules> = {
     deniedFunction: HIVE_FUNCTIONS,
     deniedFunctionIs: { what: 'function', why: 'it runs code or reads files on the server' },
   },
+  // Apache Impala. Its SET, USE, REFRESH, INVALIDATE METADATA, COMPUTE STATS, LOAD DATA, :SHUTDOWN(),
+  // ALTER and COMMENT are statements, refused as any but a read is; after a WITH it takes only a
+  // SELECT, an INSERT or an UPSERT.
+  impala: {
+    ...base,
+    doubleQuote: 'string',
+    backtick: true,
+    noDoubledQuotes: true,
+    impalaHints: true,
+    // A backslash escapes in strings and in quoted names alike; its comments don't nest (Impala 4.5).
+    readings: readings([true], [false]),
+    deniedWords: new Set(WRITES),
+  },
 };
 
 /** Its tables of cached results and queued queries, every model's: what Cube Store's cache and queue commands read. */
@@ -418,7 +438,7 @@ function lex(sql: string, rules: Rules, reading: Reading): Lexed {
         j += 2;
       } else if (sql.startsWith(quote, j)) {
         // A doubled quote is the quote itself (a triple quote has none).
-        if (width === 1 && sql[j + 1] === quote) {
+        if (width === 1 && sql[j + 1] === quote && !rules.noDoubledQuotes) {
           j += 2;
         } else {
           return j + width;
@@ -438,6 +458,9 @@ function lex(sql: string, rules: Rules, reading: Reading): Lexed {
     } else if ((c === '-' && next === '-' && (!rules.dashNeedsSpace || i + 2 >= n || sql.charCodeAt(i + 2) <= 0x20))
       || (c === '#' && rules.hashComment)
       || (c === '/' && next === '/' && rules.slashComment)) {
+      if (rules.impalaHints && c === '-' && /^--[ \t]*\+/.test(sql.slice(i, i + 100))) {
+        throw new LexError('a hint (-- +…) is refused: the database acts on it', i);
+      }
       const end = sql.slice(i).search(/[\r\n]/);
       const stop = end === -1 ? n : i + end;
       comments.push([i, stop]);
@@ -446,7 +469,7 @@ function lex(sql: string, rules: Rules, reading: Reading): Lexed {
       if (rules.executableComments && (sql[i + 2] === '!' || (sql[i + 2] === 'M' && sql[i + 3] === '!'))) {
         throw new LexError('MySQL runs what an executable comment (/*! … */) holds: it is refused', i);
       }
-      if (rules.refuseHints && sql[i + 2] === '+') {
+      if ((rules.refuseHints && sql[i + 2] === '+') || (rules.impalaHints && /^\/\*\s*\+/.test(sql.slice(i, i + 1000)))) {
         throw new LexError('a hint (/*+ … */) is refused: the database acts on it', i);
       }
       let depth = 1;
@@ -480,6 +503,8 @@ function lex(sql: string, rules: Rules, reading: Reading): Lexed {
       const end = quoted(i, c, 1, reading.backslash && !rules.namesTakeNoBackslash, 'a quoted name');
       push('quoted', sql.slice(i + 1, end - 1).replace(c === '"' ? /""/g : /``/g, c), i, end);
       i = end;
+    } else if (c === '[' && rules.impalaHints) {
+      throw new LexError('a hint ([…]) is refused: the database acts on it', i);
     } else if (c === '[' && rules.brackets) {
       const end = quoted(i, ']', 1, false, 'a bracketed name');
       push('quoted', sql.slice(i + 1, end - 1).replace(/]]/g, ']'), i, end);
@@ -835,12 +860,12 @@ export function hiveTrailingOffset(sql: string): { sql: string; skip: number } |
 }
 
 /**
- * The places of a Hive statement's `?` placeholders, as Hive's lexer reads
- * it: never a `?` in a string, a quoted name or a comment. For Cube's SQL,
- * whose values the driver writes in as literals (`hive.ts`).
+ * The places of a Hive (or Impala) statement's `?` placeholders, as its lexer
+ * reads it: never a `?` in a string, a quoted name or a comment. For Cube's
+ * SQL, whose values the driver writes in as literals (`hive.ts`).
  */
-export function hivePlaceholders(sql: string): number[] {
-  const rules = RULES.hive;
+export function hivePlaceholders(sql: string, dialect: 'hive' | 'impala' = 'hive'): number[] {
+  const rules = RULES[dialect];
   return lex(sql, rules, rules.readings[0]).tokens.filter((t) => isOp(t, '?')).map((t) => t.start);
 }
 

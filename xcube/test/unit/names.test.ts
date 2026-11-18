@@ -642,6 +642,8 @@ describe('data sources', () => {
       { folderId: 'froot', name: 'ch', driver: 'clickhouse' },
       { folderId: 'froot', name: 'tr', driver: 'trino' },
       { folderId: 'froot', name: 'pg', driver: 'postgres' },
+      { folderId: 'froot', name: 'hv', driver: 'hive' },
+      { folderId: 'froot', name: 'im', driver: 'impala' },
     ];
     const rollups = (...lines: string[]) => `    pre_aggregations:\n${lines.map((l) => `      ${l}\n`).join('')}`;
     const indexed = '  indexes: [{ name: by_id, columns: [id] }]';
@@ -655,6 +657,12 @@ describe('data sources', () => {
     expect(messages([cubeWith('froot', 'a', `    data_source: ch\n${rollups('- name: plain', '- name: lam', '  type: rollup_lambda', '- name: good', indexed)}`)])).toEqual([
       ['a', 'compile', 'Pre-aggregation plain names no index: a ClickHouse rollup must name an index'],
     ]);
+    // Hive's and Impala's drivers are read-only too (db_support).
+    for (const source of ['hv', 'im']) {
+      expect(messages([cubeWith('froot', 'a', `    data_source: ${source}\n${rollups('- name: r', '  external: false', '- name: ok')}`)])).toEqual([
+        ['a', 'compile', `Pre-aggregation r would be built in "${source}": rollups on ${source} are built in Cube Store only`],
+      ]);
+    }
     // Inherited through extends, and redefined by the child.
     expect(messages([
       cubeWith('froot', 'base', rollups('- name: one', '- name: two')),

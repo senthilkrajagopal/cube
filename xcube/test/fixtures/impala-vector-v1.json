@@ -1,0 +1,49 @@
+{
+  "about": "The impala driver's password, scheme v1, in golden-v1.json's form: `aad` and `envelopes` entries, sealed to the same development key (dev-credential-key.pub.jwk). Development values only.",
+  "aad": [
+    {
+      "driver": "impala",
+      "field": "password",
+      "fields": {
+        "host": "impala.example",
+        "port": 21050,
+        "database": "default"
+      },
+      "aad": "[\"wechart/data-source-secret/v1\",\"impala\",\"password\",[[\"host\",\"impala.example\"],[\"port\",\"21050\"],[\"ssl\",\"\"],[\"sslCa\",\"\"],[\"sslRejectUnauthorized\",\"\"]]]"
+    },
+    {
+      "driver": "impala",
+      "field": "password",
+      "fields": {
+        "host": "impala.example",
+        "port": 21051,
+        "database": "sales",
+        "ssl": true,
+        "sslRejectUnauthorized": true,
+        "sslCa": "-----BEGIN CERTIFICATE-----\nMIIgolden\n-----END CERTIFICATE-----"
+      },
+      "aad": "[\"wechart/data-source-secret/v1\",\"impala\",\"password\",[[\"host\",\"impala.example\"],[\"port\",\"21051\"],[\"ssl\",\"true\"],[\"sslCa\",\"-----BEGIN CERTIFICATE-----\\nMIIgolden\\n-----END CERTIFICATE-----\"],[\"sslRejectUnauthorized\",\"true\"]]]"
+    }
+  ],
+  "envelopes": [
+    {
+      "driver": "impala",
+      "field": "password",
+      "fields": {
+        "host": "impala.example",
+        "port": 21051,
+        "database": "sales",
+        "ssl": true,
+        "sslRejectUnauthorized": true,
+        "sslCa": "-----BEGIN CERTIFICATE-----\nMIIgolden\n-----END CERTIFICATE-----"
+      },
+      "secret": "impala-dev-password",
+      "envelope": {
+        "v": 1,
+        "kid": "uYWeMx6i173fsiolFp1xi-qiav50k52AGinM56Y8JEw",
+        "enc": "h7RAVmMjtMBt-tN8Y1ZTQEL-WENAkFtsPcnXp6HD428",
+        "ct": "ZukG0m_D1Y4KPjU5GqRNSVFkA6IF7Lu-YYEJzHYt7hhDWLKApAODelyDsvt1S-fRRWb2eLI5o2Ha0JhBomN6oBwNNZiOBq1uaf_rJCtcwjGel6ZrJoaELw2BHWUz3rnpfvIyZlAQ9aoSoNESqI6EcCKr04YKXBLcuTySz7E2yqf7o7M3RUeJ8A6b6DxZe7vSPRA_lc0zoAlh5gmM4OBblcx0xU-h5Wjw5feUi650slD0f5VPEPB5DJ3_Mqkk163YTNT647LcRxvSbino_ihpAyuZDryjCseELvwcsqDptoC_W1UiBcHTiy6YaJjvvHJ10Hrb6GNV5Y-MiuRQMMT5qJ3-WJrRPl7xuaGOBvtdRXk"
+      }
+    }
+  ]
+}

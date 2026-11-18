@@ -252,10 +252,11 @@ status="$(conn POST /connections/default/sql '{"sql": "DELETE FROM public.servin
 [ "$status" = 400 ] && grep -q '"code":"not_read_only"' /tmp/xcube-admin.json || { echo "a write answered $status: $(cat /tmp/xcube-admin.json)"; exit 1; }
 echo "SQL runner check passed: read-only SQL on the connection, capped, a write refused."
 
-# The drivers a connection may use, `hive` among them (wechart's db_support R2).
+# The drivers a connection may use, `hive` and `impala` among them (wechart's db_support R2).
 status="$(signed GET /drivers)"
-[ "$status" = 200 ] && grep -q '{"type":"hive","available":true}' /tmp/xcube-admin.json || { echo "the drivers answered $status: $(cat /tmp/xcube-admin.json)"; exit 1; }
-echo "Drivers check passed: hive is listed, available."
+[ "$status" = 200 ] && grep -q '{"type":"hive","available":true}' /tmp/xcube-admin.json && grep -q '{"type":"impala","available":true}' /tmp/xcube-admin.json \
+  || { echo "the drivers answered $status: $(cat /tmp/xcube-admin.json)"; exit 1; }
+echo "Drivers check passed: hive and impala are listed, available."
 
 # Hive (wechart's db_support R4 test 3), when given a HiveServer2 the container reaches as
 # HIVE_HOST (host:port, SASL PLAIN as `hive`, no password), where `hive` may create a table.
@@ -301,4 +302,51 @@ if [ -n "${HIVE_HOST:-}" ]; then
   status="$(hive POST /connections/hive/sql '{"sql": "SELECT '"'"'${env:HOME}'"'"'", "runId": "image-hive-2"}')"
   [ "$status" = 400 ] && grep -q '"code":"not_read_only"' /tmp/xcube-admin.json || { echo "a \${ answered $status: $(cat /tmp/xcube-admin.json)"; exit 1; }
   echo "Hive check passed: a cube on a hive connection answers its DECIMAL(38,9) whole, and the SQL runner reads it and refuses \${."
+fi
+
+# Impala (wechart's db_support), when given an Impala daemon the container reaches as IMPALA_HOST
+# (host:port, no sign-in: NOSASL), where tables may be created in `default`. Cube looks the type
+# `impala` up by name for its queue: a query answering shows xcube registered it.
+if [ -n "${IMPALA_HOST:-}" ]; then
+  docker run --rm --network "$DOCKER_NETWORK" --entrypoint node "$IMAGE" -e '
+    const { HiveConnection } = require("/cube/node_modules/xcube/dist/src/connections/hive");
+    const [host, port] = process.argv[1].split(":");
+    (async () => {
+      const c = await HiveConnection.open({ flavour: "impala", host, port: Number(port), database: "default", ssl: false, mechanism: "nosasl" });
+      for (const sql of ["DROP TABLE IF EXISTS default.serving_check_impala", "CREATE TABLE default.serving_check_impala (id INT, ts TIMESTAMP, d DECIMAL(38,9))",
+        "INSERT INTO default.serving_check_impala VALUES (1, CAST(\"2026-03-08 10:30:00\" AS TIMESTAMP), 12345678901234567890.123456789)"]) {
+        await c.all(sql, 600, () => false);
+      }
+      await c.close();
+    })().catch((e) => { console.error(e.message); process.exit(1); });
+  ' -- "$IMPALA_HOST"
+  impala_fields="{\"host\": \"${IMPALA_HOST%:*}\", \"port\": ${IMPALA_HOST##*:}, \"database\": \"default\", \"ssl\": false}"
+  impala() {
+    curl -s -o /tmp/xcube-admin.json -w '%{http_code}' -X "$1" \
+      -H "Authorization: Bearer $service" -H 'Content-Type: application/json' \
+      ${3:+--data "$3"} "$CUBE_URL/cubejs-api/v1/semantic/models/impalacheck$2"
+  }
+  status="$(impala POST /connections/test "{\"driver\": \"impala\", \"authMethod\": \"none\", \"fields\": $impala_fields}")"
+  [ "$status" = 200 ] && grep -q '"ok":true' /tmp/xcube-admin.json || { echo "the impala connection test answered $status: $(cat /tmp/xcube-admin.json)"; exit 1; }
+  status="$(impala PUT /connections/impala "{\"baseVersion\": null, \"folderId\": \"froot\", \"driver\": \"impala\", \"authMethod\": \"none\", \"fields\": $impala_fields}")"
+  [ "$status" = 200 ] || { echo "the impala connection answered $status"; cat /tmp/xcube-admin.json; exit 1; }
+  status="$(impala PUT /snapshot '{"baseRevision": null, "folders": [{"id": "froot", "parentId": null}], "items": [{"folderId": "froot", "name": "on_impala", "kind": "cube", "yaml": "cubes:\n  - name: on_impala\n    data_source: impala\n    sql_table: default.serving_check_impala\n    dimensions:\n      - name: id\n        sql: id\n        type: number\n        primary_key: true\n      - name: at\n        sql: ts\n        type: time\n    measures:\n      - name: biggest\n        sql: d\n        type: max\n      - name: n\n        type: count\n"}]}')"
+  case "$status" in 200|201) ;; *) echo "the impala model's snapshot answered $status"; cat /tmp/xcube-admin.json; exit 1 ;; esac
+  impala_revision="$(sed -E 's/.*"revision":([0-9]+).*/\1/' /tmp/xcube-admin.json)"
+  impala_token="$(node -e '
+    const crypto = require("crypto");
+    const part = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
+    const body = `${part({ alg: "HS256", typ: "JWT" })}.${part({ wechartModel: "impalacheck", wechartRevision: Number(process.argv[2]) })}`;
+    console.log(`${body}.${crypto.createHmac("sha256", process.argv[1]).update(body).digest("base64url")}`);
+  ' -- "$API_SECRET" "$impala_revision")"
+  answer="$(curl -s -H "Authorization: $impala_token" -H 'Content-Type: application/json' \
+    --data '{"query": {"measures": ["on_impala.biggest", "on_impala.n"], "timeDimensions": [{"dimension": "on_impala.at", "granularity": "quarter"}], "timezone": "America/Los_Angeles"}}' \
+    "$CUBE_URL/cubejs-api/v1/load")"
+  echo "$answer" | grep -q '"on_impala.biggest":"12345678901234567890.123456789"' && echo "$answer" | grep -q '"on_impala.at.quarter":"2026-01-01T00:00:00.000"' \
+    || { echo "a query on Impala got: $(echo "$answer" | head -c 600)"; exit 1; }
+  status="$(impala POST /connections/impala/sql '{"sql": "SELECT d FROM default.serving_check_impala", "runId": "image-impala-1"}')"
+  [ "$status" = 200 ] && grep -q '"12345678901234567890.123456789"' /tmp/xcube-admin.json || { echo "an Impala SQL run answered $status: $(cat /tmp/xcube-admin.json)"; exit 1; }
+  status="$(impala POST /connections/impala/sql '{"sql": "SELECT /* +straight_join */ 1", "runId": "image-impala-2"}')"
+  [ "$status" = 400 ] && grep -q '"code":"not_read_only"' /tmp/xcube-admin.json || { echo "a hint answered $status: $(cat /tmp/xcube-admin.json)"; exit 1; }
+  echo "Impala check passed: a cube on an impala connection answers by quarter in a zone and its DECIMAL(38,9) whole, and the SQL runner reads it and refuses a hint."
 fi

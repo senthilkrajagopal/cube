@@ -93,6 +93,8 @@ const cases = {
   engine: [{ baseUrl: 'https://xc-engine.example:8443' }, 'service-token', { token: 'xc-token' }],
   hive: [{ host: 'xc-host', port: 10000, database: 'xc-db', user: 'xc-user', ssl: true, sslCa: 'xc-ca' }, 'password', { password: 'xc-password' }],
   'hive (username)': [{ host: 'xc-host', port: 10000, database: 'xc-db', user: 'xc-user', ssl: false }, 'username', {}, 'hive'],
+  impala: [{ host: 'xc-host', port: 21050, database: 'xc-db', user: 'xc-user', ssl: true, sslCa: 'xc-ca' }, 'password', { password: 'xc-password' }],
+  'impala (none)': [{ host: 'xc-host', port: 21050, database: 'xc-db', ssl: false }, 'none', {}, 'impala'],
   athena: [{ region: 'eu-west-1', workGroup: 'xc-workgroup', s3OutputLocation: 's3://xc-results/', catalog: 'xc-catalog', database: 'xc-db', accessKeyId: 'AKIAXCXCXCXCXCXCXCXC' }, 'access-key', { secretAccessKey: 'xc-secret' }],
 };
 

@@ -1,8 +1,9 @@
 /**
- * Apache Hive (HiveServer2) and Spark's Thrift server, as a data source:
- * xcube's own driver over the `hive-driver` package's Thrift client, not
- * Cube's (deprecated) Hive driver. Binary transport only, with or without TLS;
- * SASL PLAIN, a user alone or with a password; NOSASL for Impala.
+ * Apache Hive (HiveServer2), Spark's Thrift server and Apache Impala, as
+ * data sources: xcube's own driver over the `hive-driver` package's Thrift
+ * client, not Cube's (deprecated) Hive driver. Binary transport only, with or
+ * without TLS; SASL PLAIN, a user alone or with a password; NOSASL (no
+ * sign-in) for Impala.
  *
  * The package is a thin Thrift client, and leaves to its caller what makes a
  * connection safe to serve with, all of which is here:
@@ -319,11 +320,14 @@ export class HiveConnection {
   public server: { name: string; version: string } = { name: '', version: '' };
 
   /**
-   * Whether the server honours an OFFSET: Hive 4 and later, and Spark 3.4 and
-   * later. Hive 3 ignores one after an ORDER BY (and miscounts it after a
-   * subquery's), and Spark before 3.4 has none.
+   * Whether the server honours an OFFSET: Impala, Hive 4 and later, and Spark
+   * 3.4 and later. Hive 3 ignores one after an ORDER BY (and miscounts it
+   * after a subquery's), and Spark before 3.4 has none.
    */
   public get offsetWorks(): boolean {
+    if (/impala/i.test(this.server.name)) {
+      return true;
+    }
     const [major, minor] = this.server.version.split('.').map((part) => Number.parseInt(part, 10));
     if (/spark/i.test(this.server.name)) {
       return major > 3 || (major === 3 && minor >= 4);
@@ -388,14 +392,15 @@ export class HiveConnection {
       connectTransport();
       this.socket = transport.getTransport();
       this.socket!.on('error', (e: Error) => this.fail(new HiveError(`${config.host}:${config.port}: ${e.message}`, 'connect')));
-      this.socket!.on('close', () => this.fail(new HiveError('The server closed the connection', 'closed')));
+      this.socket!.on('close', () => this.fail(this.session ? new HiveError('The server closed the connection', 'closed') : this.refusedSignIn()));
     };
     let timer: NodeJS.Timeout | undefined;
     try {
       await new Promise<void>((resolve, reject) => {
         this.waiting.add(reject);
+        const hint = config.flavour === 'impala' && config.mechanism === 'plain' ? ' An Impala daemon without LDAP takes no sign-in: the `none` method.' : '';
         timer = setTimeout(() => this.fail(new HiveError(
-          `${config.host}:${config.port} didn't complete ${config.mechanism === 'plain' ? 'the sign-in' : 'connecting'} within ${deadline} ms: is it HiveServer2's binary port${config.ssl ? ', with TLS' : ', without TLS'}?`,
+          `${config.host}:${config.port} didn't complete ${config.mechanism === 'plain' ? 'the sign-in' : 'connecting'} within ${deadline} ms: is it HiveServer2's binary port${config.ssl ? ', with TLS' : ', without TLS'}?${hint}`,
           'connect',
         )), deadline);
         auth.authenticate(transport).then((authenticated: any) => {
@@ -414,7 +419,7 @@ export class HiveConnection {
           });
           // Thrift's own errors (a frame it can't read): the connection fails, nothing throws.
           this.thriftConnection.on('error', (e: Error) => this.fail(new HiveError(e.message, 'protocol')));
-          this.thriftConnection.on('close', () => this.fail(new HiveError('The server closed the connection', 'closed')));
+          this.thriftConnection.on('close', () => this.fail(this.session ? new HiveError('The server closed the connection', 'closed') : this.refusedSignIn()));
           // It connected (and signed in) before Thrift's connection was made over it: Thrift is told so.
           authenticated.emit('connect');
           this.client = thrift.createClient(TCLIService, this.thriftConnection);
@@ -453,6 +458,21 @@ export class HiveConnection {
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  /**
+   * The server closing the connection before a session opened: a sign-in it
+   * refused, which neither Hive nor Impala explains (each closes without a
+   * word), or a sign-in it doesn't take.
+   */
+  protected refusedSignIn(): HiveError {
+    const { config } = this;
+    const where = `${config.host}:${config.port}`;
+    if (config.mechanism === 'plain') {
+      const hint = config.flavour === 'impala' ? ' (an Impala daemon without LDAP takes no sign-in: the `none` method)' : '';
+      return new HiveError(`${where} closed the connection at the sign-in: the user or password is wrong, or the server signs in otherwise${hint}`, 'connect');
+    }
+    return new HiveError(`${where} closed the connection before a session opened: it wants a sign-in (a user, and a password)`, 'connect');
   }
 
   /** The server's name and version; empty where it doesn't say. */
@@ -817,7 +837,7 @@ export class HiveConnections {
   }
 }
 
-/** Cube's driver for a Hive (or Spark, or Impala) data source. */
+/** Cube's driver for a Hive, Spark or Impala data source. */
 export class HiveDriver extends BaseDriver {
   public readonly config: HiveConfig;
 
@@ -850,7 +870,7 @@ export class HiveDriver extends BaseDriver {
   public override query<R = unknown>(query: string, values?: unknown[]): Promise<R[]> {
     let stopped = false;
     let connection: HiveConnection | null = null;
-    const sql = inlineValues(query, values ?? [], hivePlaceholders);
+    const sql = inlineValues(query, values ?? [], (s) => hivePlaceholders(s, this.config.flavour));
     const promise = this.withConnection(async (c) => {
       connection = c;
       const { columns, rows } = await c.all(sql, this.config.queryTimeout ?? HIVE_QUERY_TIMEOUT_S, () => stopped);

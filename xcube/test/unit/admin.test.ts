@@ -45,7 +45,7 @@ describe('admin routes', () => {
     await request(a).get(url).expect(401);
     const ok = await request(a).get(url).set('Authorization', `Bearer ${TOKEN}`).expect(200);
     expect(ok.body.drivers.map((d: any) => d.type)).toEqual([
-      'postgres', 'redshift', 'mysql', 'snowflake', 'bigquery', 'mssql', 'oracle', 'dremio', 'duckdb', 'clickhouse', 'trino', 'athena', 'engine', 'hive',
+      'postgres', 'redshift', 'mysql', 'snowflake', 'bigquery', 'mssql', 'oracle', 'dremio', 'duckdb', 'clickhouse', 'trino', 'athena', 'engine', 'hive', 'impala',
     ]);
     expect(ok.body.drivers.every((d: any) => d.available === true && d.reason === undefined)).toBe(true);
     await request(a).get('/cubejs-api/v1/semantic/models/Bad!/drivers').set('Authorization', `Bearer ${TOKEN}`).expect(400);

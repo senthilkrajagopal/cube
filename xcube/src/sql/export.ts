@@ -99,6 +99,7 @@ export function quoteName(dialect: SessionDialect, name: string): string {
     case 'clickhouse':
     case 'bigquery':
     case 'hive':
+    case 'impala':
       return `\`${name}\``;
     case 'mssql':
       return `[${name}]`;

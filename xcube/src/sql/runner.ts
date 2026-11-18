@@ -199,7 +199,7 @@ export interface SqlSession {
 export type Refuse = (message: string, statement: string, reason?: string) => never;
 
 export type SessionDialect = 'postgres' | 'redshift' | 'mysql' | 'snowflake' | 'bigquery' | 'mssql' | 'oracle' | 'dremio'
-  | 'duckdb' | 'clickhouse' | 'trino' | 'athena' | 'cubestore' | 'hive';
+  | 'duckdb' | 'clickhouse' | 'trino' | 'athena' | 'cubestore' | 'hive' | 'impala';
 
 /** A dialect no case took: the compiler holds every switch over them to all of them. */
 function unknownDialect(dialect: never): never {
@@ -1078,9 +1078,9 @@ async function duckdbSession(driver: any, caps: SqlCaps): Promise<SqlSession> {
 }
 
 /**
- * Hive and Spark's Thrift server (HiveServer2's protocol): a connection of
+ * Hive, Spark's Thrift server and Impala (HiveServer2's protocol): a connection of
  * the run's own, the statement started asynchronously with the server's own
- * time limit (`queryTimeout`), polled to its end, and its rows fetched a
+ * time limit (Hive's `queryTimeout`, Impala's `EXEC_TIME_LIMIT_S`), polled to its end, and its rows fetched a
  * batch at a time. There is no read-only session: the check (`classify.ts`)
  * and the account's grants are the guard. A cancel is CancelOperation.
  */
@@ -1247,6 +1247,7 @@ export function openSession(
     case 'cubestore':
       return cubeStoreSession(driver, refuse);
     case 'hive':
+    case 'impala':
       return hiveSession(driver, caps);
     default:
       return unknownDialect(dialect);
@@ -1301,7 +1302,9 @@ export function isTimeout(dialect: SessionDialect, e: any, ran?: { ms: number; t
       // EXCEEDED_TIME_LIMIT: its query_max_run_time; or the client's own clock.
       return code === 'EXCEEDED_TIME_LIMIT' || /query timed out/.test(message);
     case 'hive':
-      // Its queryTimeout: the operation ends TIMEDOUT (or, on some versions, fails saying so).
+    case 'impala':
+      // Hive's queryTimeout: the operation ends TIMEDOUT (or, on some versions, fails saying so);
+      // Impala's EXEC_TIME_LIMIT_S: it fails saying so.
       return e instanceof HiveError && e.kind === 'timeout';
     case 'dremio':
     // It has no statement timeout: the run's clock interrupts it.

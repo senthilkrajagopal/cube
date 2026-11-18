@@ -590,8 +590,8 @@ xcube's credential key, so the client stores them and can't open them.
 
 **Drivers.** `postgres`, `redshift`, `mysql`, `snowflake`, `bigquery`, `mssql`,
 `oracle`, `dremio`, `duckdb`, `clickhouse`, `trino` and `athena`, through Cube's own drivers,
-and `engine`, wechart's in-memory engine, and `hive` (Apache Hive and Spark's
-Thrift server), through xcube's:
+and `engine`, wechart's in-memory engine, `hive` (Apache Hive and Spark's
+Thrift server) and `impala` (Apache Impala), through xcube's:
 
 | Driver | Auth methods | Target (what a secret is bound to) |
 | --- | --- | --- |
@@ -609,8 +609,9 @@ Thrift server), through xcube's:
 | `athena` | `access-key`, `pod-role` | region, workGroup |
 | `engine` | `service-token` | baseUrl, sslRejectUnauthorized, sslCa |
 | `hive` | `username` (SASL PLAIN, a placeholder password), `password` | host, port, ssl, sslRejectUnauthorized, sslCa |
+| `impala` | `none` (NOSASL), `username`, `password` (LDAP) | host, port, ssl, sslRejectUnauthorized, sslCa |
 
-DuckDB, ClickHouse, Trino, Athena and Hive connections are read-only:
+DuckDB, ClickHouse, Trino, Athena, Hive and Impala connections are read-only:
 - **Rollups are built in Cube Store only.** A publish refuses a cube on one
   of them with a pre-aggregation built in the source (`external: false`, or
   `original_sql`).
@@ -658,6 +659,37 @@ Apache Hive's HiveServer2 and Spark's Thrift server.
   first `m` rows: Cube's queries and the SQL runner's alike.
 - **SQL runner.** One `ExecuteStatement` with the run's `queryTimeout`;
   `CancelOperation` stops it. No bound values (`parameters_unsupported`).
+- **A sign-in refused.** HiveServer2 closes the connection without a word;
+  the driver says the user or password is wrong, or the server signs in
+  otherwise.
+
+**Impala** is the same driver (`flavour: 'impala'`), at its HiveServer2 port
+(21050 by default). What differs:
+- **Sign-in.** `none` is NOSASL, no handshake: an Impala daemon without LDAP
+  takes only that. `username` and `password` are SASL PLAIN, for a daemon
+  with LDAP (`password`; `username` sends the placeholder, which LDAP
+  refuses). Impala closes the connection on a refused sign-in, and on NOSASL
+  to an LDAP daemon, and the driver says which it was; SASL PLAIN to a daemon
+  without LDAP waits for the connect deadline, which says to use `none`.
+- **Session.** No variable substitution to turn off (Impala has none): `${`
+  is text. The run's time limit is the statement's `EXEC_TIME_LIMIT_S`
+  (Impala ignores `queryTimeout`).
+- **OFFSET** works on every version: no rows are skipped by the reader.
+- **Cube's SQL.** Values are written in as literals, found by Impala's lexer
+  (a backslash escapes in a backtick name). The dialect
+  (`src/model/impala-dialect.ts`) is xcube's own on `BaseQuery` (Cube has
+  none), for Tesseract and the legacy planner: backtick names,
+  `DATE_TRUNC` for each granularity but the quarter (`TRUNC(…, 'Q')`),
+  `FROM_UTC_TIMESTAMP` for the zone, `INTERVAL n unit` one unit at a time,
+  `CONCAT` (`||` is Impala's OR), `NDV` for an approximate count distinct,
+  and ILIKE with a pattern that depends on the row: Impala matches a
+  constant `%…%` pattern as a substring, its escape included, so `'%\%%'`
+  finds no `50%`.
+- **Cube's type.** Cube looks a data source's type up by name (its queue's
+  concurrency) and has no `impala`: xcube adds it to Cube's list
+  (`src/connections/impala-type.ts`), resolving to its dialect.
+- **A dropped connection.** A statement whose connection drops runs on until
+  Impala sees its client gone (`idle_client_poll_period_s`, 30 s by default).
 
 **DuckDB** runs in Cube's own process, one instance per connection (`src/connections/duckdb.ts`).
 - **Kinds.**
@@ -1017,6 +1049,13 @@ top of them:
      included, which a server with variable substitution on replaces with
      its environment (`${env:…}`) or settings before parsing. A backslash in
      a backtick name is a character, as on both.
+   - Impala's: its hints, in every form (`/*+ … */`, `/* +… */`, `-- +…`
+     and `[SHUFFLE]`-style brackets); `INSERT` or `UPSERT` after a `WITH`.
+     Its `SET`, `USE`, `REFRESH`, `INVALIDATE METADATA`, `COMPUTE STATS`,
+     `LOAD DATA`, `:SHUTDOWN()`, `ALTER` and `COMMENT` are statements, refused
+     as anything but a read is. It reads a backslash in a backtick name as an
+     escape (`` `a\`; drop table t` `` is one name), and a doubled quote as
+     two strings, never as a quote.
    - ClickHouse's FROM clause calls only `numbers`, `zeros`,
      `generate_series`, `generateRandom`, `values`, `null`, `view`, `merge`,
      `format` and `dictionary`, and a statement's own `SETTINGS` or `FORMAT`
@@ -1038,8 +1077,8 @@ top of them:
    BigQuery's dry run must call the statement a `SELECT` before it runs.
    ClickHouse runs it with `readonly=2`, so its login must not be at
    `readonly=1` (Cube's own queries set settings too). DuckDB has its
-   instance's lock (see DuckDB above). Snowflake, Dremio, Trino, Athena and
-   Hive have the check alone.
+   instance's lock (see DuckDB above). Snowflake, Dremio, Trino, Athena, Hive
+   and Impala have the check alone.
 4. **A connection of the run's own**, a pool of one, never one Cube serves
    with, dropped afterwards: nothing it sets outlives the run.
 
@@ -1048,7 +1087,8 @@ on Snowflake (external functions), SQL Server and Dremio; and on Oracle a
 function with an autonomous transaction; and on Trino whatever a catalog's
 connector does on a read; on Hive and Spark a user's own UDFs, and views
 (an operator should also set `hive.server2.builtin.udf.blacklist=reflect,reflect2,java_method,in_file`,
-`hive.variable.substitute=false` and SQL-standard authorization).
+`hive.variable.substitute=false` and SQL-standard authorization); on Impala
+a UDF someone created.
 
 **Caps per run**, sent with each run (R50's by default):
 - **Rows** (`maxRows`, 10,000; at most 100,000): read as they come, one past
@@ -1649,7 +1689,7 @@ none were known yet):
 | 400 | `not_read_only` | The check refused it; `statement` is its kind (`insert`, `select` …). Refused for a name, it carries `refused: { kind, name }`: `function` (lowercased, `url`), `table_function` (ClickHouse's, `mergetreeindex`) or `clause` (ClickHouse's `SETTINGS`, `FORMAT`; Hive's `TRANSFORM`, `MAP`, `REDUCE`, `FILE`, `|>`, `${`). Cube Store's router joins carry `reason: "cubestore_router_join"` |
 | 400 | `several_statements` | |
 | 400 | `invalid_parameters` | `reason`: `missing_value`, `unused_value`, `malformed_placeholder`, `placeholder_written` (a `$1`, `?`, `@x` or `:x` written by hand), `invalid_value` |
-| 400 | `parameters_unsupported` | `reason`: `dremio`, `trino`, `athena`, `cubestore`, `hive`, `oracle_boolean` |
+| 400 | `parameters_unsupported` | `reason`: `dremio`, `trino`, `athena`, `cubestore`, `hive`, `impala`, `oracle_boolean` |
 | 400 | `cap_unsupported` | `reason`: `athena_workgroup_cutoff` (a `maxBytesBilled` on Athena) |
 | 404 | `unknown_connection`, `unknown_overlay` | |
 | 409 | `run_in_progress` | A run of this `runId` runs |

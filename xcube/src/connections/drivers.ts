@@ -20,7 +20,7 @@ import { makeHiveDriver } from './hive';
 import { makeTrinoDriver } from './trino';
 
 export const DRIVER_TYPES = [
-  'postgres', 'redshift', 'mysql', 'snowflake', 'bigquery', 'mssql', 'oracle', 'dremio', 'duckdb', 'clickhouse', 'trino', 'athena', 'engine', 'hive',
+  'postgres', 'redshift', 'mysql', 'snowflake', 'bigquery', 'mssql', 'oracle', 'dremio', 'duckdb', 'clickhouse', 'trino', 'athena', 'engine', 'hive', 'impala',
 ] as const;
 
 export type DriverType = (typeof DRIVER_TYPES)[number];
@@ -653,7 +653,55 @@ export const DRIVERS: Record<DriverType, DriverSpec> = {
     },
     make: makeHiveDriver,
   },
+  /**
+   * Apache Impala, its HiveServer2 port, over the binary transport, with or
+   * without TLS: no sign-in (NOSASL, an Impala daemon without LDAP), or SASL
+   * PLAIN, a user alone or a user and password (LDAP). xcube's driver
+   * (`hive.ts`), its own dialect (`impala-dialect.ts`).
+   */
+  impala: {
+    cubeType: 'impala',
+    connection: [text('host', { required: true }), text('port', { kind: 'number' }), text('database', { required: true }), ...tlsFields],
+    auth: {
+      none: [],
+      username: [text('user', { required: true })],
+      password: [text('user', { required: true }), secret('password')],
+    },
+    target: ['host', 'port', ...TLS_TARGET],
+    check: hiveCheck,
+    config(f, auth, s) {
+      checked(this, f, auth);
+      const ssl = tls(f, s, false, true);
+      return {
+        flavour: 'impala',
+        host: str(f.host),
+        port: num(f.port, 21050),
+        database: str(f.database),
+        ssl: ssl ? { rejectUnauthorized: ssl.rejectUnauthorized, ca: ssl.ca } : false,
+        mechanism: auth === 'none' ? 'nosasl' : 'plain',
+        user: auth === 'none' ? undefined : str(f.user),
+        password: auth === 'password' ? s.password : undefined,
+        readOnly: true,
+      };
+    },
+    make: makeHiveDriver,
+  },
 };
+
+/**
+ * Cube resolves a data source's type by name for its queue and its dialect
+ * (`DriverDependencies`), and throws on one it doesn't know: `impala` is
+ * xcube's alone, so it is added to Cube's list.
+ */
+function registerCubeType(type: string, modulePath: string) {
+  // eslint-disable-next-line global-require
+  const known: Record<string, string> = require('@cubejs-backend/server-core/dist/src/core/DriverDependencies').default;
+  if (!known[type]) {
+    known[type] = modulePath;
+  }
+}
+
+registerCubeType('impala', require.resolve('./impala-type'));
 
 /** A driver type, and whether this deployment can connect one: `reason` says why not, where it can't. */
 export interface DriverAvailability {
