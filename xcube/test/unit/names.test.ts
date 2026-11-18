@@ -432,8 +432,8 @@ describe('every reference stays on the referrer\'s folder path (R72)', () => {
     // fsales moved under fops: orders still reaches the root's customers. customers under fsales, moved: stranded.
     const withLocal = publish({ tree, current: [], upserts: [{ ...customers, folderId: 'fsales' }, orders('feu')], deletes: [] }).items;
     const under = (id: string, parentId: string) => new FolderTree([...tree.folders.filter((f) => f.id !== id), { id, parentId }]);
-    expect(outOfRange(withLocal, under('feu', 'fops'), []).items).toEqual(['orders']);
-    expect(outOfRange(withLocal, under('fsales', 'fops'), [])).toEqual({ cubes: [], items: [] });
+    expect(outOfRange(withLocal, under('feu', 'fops')).items).toEqual(['orders']);
+    expect(outOfRange(withLocal, under('fsales', 'fops'))).toEqual({ items: [] });
   });
 });
 
@@ -559,7 +559,7 @@ describe('data sources', () => {
   const cubeWith = (folderId: string, name: string, extra = '') => cube(folderId, name, `    sql_table: t\n${extra}    dimensions:\n      - name: id\n        sql: id\n        type: number\n        primary_key: true\n`);
   const dataSourceOf = (items: PublishedItem[], name: string) => doc(byName(items, name)).data_source;
 
-  test('a cube may use a data source in its folder or an ancestor, written as named; one elsewhere is refused (4.1)', () => {
+  test('a cube may use a data source in any folder, written as named; one the model doesn\'t hold is refused (4.1, AC-3396)', () => {
     const { items, errors } = publish({
       tree,
       current: [],
@@ -570,11 +570,10 @@ describe('data sources', () => {
     expect(errors).toEqual([]);
     expect(dataSourceOf(items, 'a')).toBe('warehouse');
     expect(dataSourceOf(items, 'b')).toBe('default');
+    // lake is in fops, beside feu's path: bound by its name all the same.
     const sibling = publish({ tree, current: [], deletes: [], dataSources: sources, upserts: [cubeWith('feu', 'c', '    data_source: lake\n')] });
-    expect(sibling.errors).toEqual([{
-      folderId: 'feu', name: 'c', kind: 'data_source_range', message: 'It uses the data source "lake", which isn\'t in its folder or one of its ancestors',
-    }]);
-    expect(JSON.stringify(sibling.errors)).not.toContain('fops');
+    expect(sibling.errors).toEqual([]);
+    expect(dataSourceOf(sibling.items, 'c')).toBe('lake');
     const unknown = publish({ tree, current: [], deletes: [], dataSources: sources, upserts: [cubeWith('feu', 'c', '    data_source: Warehouse\n')] });
     expect(unknown.errors.map((e) => [e.kind, e.message])).toEqual([['reference', 'It uses the data source "Warehouse", which the model doesn\'t hold']]);
   });
@@ -592,8 +591,8 @@ describe('data sources', () => {
     expect(dataSourceOf(items, 'child')).toBeUndefined();
   });
 
-  test('an inherited data source is held to the rule too, naming the child and its parent (4.4)', () => {
-    // A child off its parent's path is refused for both: R72's reference, and the data source it inherits.
+  test('an inherited data source binds from any folder too; only the reference to the parent is held to the path (4.4, R72)', () => {
+    // A child off its parent's path is refused for R72's reference alone, never for the data source it inherits.
     const { errors } = publish({
       tree,
       current: [],
@@ -603,23 +602,18 @@ describe('data sources', () => {
     });
     expect(errors).toEqual([{
       folderId: 'fops', name: 'child', kind: 'reference_range', message: 'It refers to "w", which isn\'t in its folder or one of its ancestors',
-    }, {
-      folderId: 'fops',
-      name: 'child',
-      kind: 'data_source_range',
-      message: 'It uses the data source "warehouse" (through w, which it extends), which isn\'t in its folder or one of its ancestors',
     }]);
-    // A parent moved onto another data source can't carry a kept child out of range.
+    // A parent moved onto a data source in another folder carries its kept child with it.
     const landed = publish({
       tree, current: [], deletes: [], dataSources: sources, upserts: [cubeWith('froot', 'p'), cube('fsales', 'kid', '    extends: p\n')],
     });
     expect(landed.errors).toEqual([]);
     const withRootLake = [...sources, { folderId: 'fops', name: 'lake2' }];
     const moved = publish({ tree, current: landed.items, deletes: [], dataSources: withRootLake, upserts: [cubeWith('froot', 'p', '    data_source: lake2\n')] });
-    expect(moved.errors.map((e) => [e.name, e.kind]).sort()).toEqual([['kid', 'data_source_range'], ['p', 'data_source_range']]);
+    expect(moved.errors).toEqual([]);
   });
 
-  test('outOfRange: the cubes a folder push or a data source moved would carry out of range', () => {
+  test('outOfRange: a folder push or a data source moved strands no cube by its data source', () => {
     const { items } = publish({
       tree,
       current: [],
@@ -627,13 +621,10 @@ describe('data sources', () => {
       dataSources: sources,
       upserts: [cubeWith('feu', 'a', '    data_source: warehouse\n'), cube('feu', 'child', '    extends: a\n'), cubeWith('fops', 'b')],
     });
-    expect(outOfRange(items, tree, sources)).toEqual({ cubes: [], items: [] });
-    // warehouse moved into feu: still in range. Into fops: a and child out of it.
-    expect(outOfRange(items, tree, sources.map((s) => (s.name === 'warehouse' ? { ...s, folderId: 'feu' } : s)))).toEqual({ cubes: [], items: [] });
-    expect(outOfRange(items, tree, sources.map((s) => (s.name === 'warehouse' ? { ...s, folderId: 'fops' } : s))).cubes).toEqual(['a', 'child']);
-    // feu moved under fops: away from warehouse.
+    expect(outOfRange(items, tree)).toEqual({ items: [] });
+    // feu moved under fops, away from warehouse's fsales: a and child still bind it, and child still reaches a.
     const moved = new FolderTree([...tree.folders.filter((f) => f.id !== 'feu'), { id: 'feu', parentId: 'fops' }]);
-    expect(outOfRange(items, moved, sources).cubes).toEqual(['a', 'child']);
+    expect(outOfRange(items, moved)).toEqual({ items: [] });
   });
 
   test('rollups on a read-only driver are built in Cube Store only, and a ClickHouse one names an index (AC-1042, AC-1048)', () => {

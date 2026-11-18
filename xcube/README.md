@@ -961,14 +961,11 @@ Pool sizes and timeouts still come from the environment.
 `data_source` names a data source by its name, as it is written in the
 resolved file.
 - **It must be a data source of the model** (`reference`, otherwise).
-- **It must be in the cube's folder or an ancestor of it** (R71 4.1,
-  `data_source_range`, naming the cube, never where the data source is).
-  This holds for the data source a cube runs on, inherited through `extends`
-  included (4.4). It is checked:
-  - at every publish, for every cube;
-  - at a folder push;
-  - when a data source is moved;
-  - at an overlay push, for its own items.
+- **It may be in any folder** (AC-3396): a cube binds it by its name, its
+  own or inherited through `extends`, wherever it is stored, and keeps it
+  through any folder push or data source move. Who may use a data source is
+  the client's to check. (Until AC-3396 it had to be in the cube's folder or
+  an ancestor, refused as `data_source_range`.)
 - **A cube naming none uses the root's `default`**, which is Cube's default.
   A cube that `extends` another inherits its parent's.
 - A connection a published cube uses can't be dropped (`409 in_use`, naming
@@ -1300,8 +1297,8 @@ Replaces the folder tree, with each folder's allowed groups, and sets security:
 ```
 
 - **The tree** changes nothing Cube serves. It is refused when it would carry
-  an item away from what it refers to, or a cube away from its data source
-  (R71 4.3, R72), checked under the model's lock against what is published.
+  an item away from what it refers to (R72), checked under the model's lock
+  against what is published.
 - **`allowedGroups`** is at most 10,000 group names per folder.
   - A folder sent without it keeps what it has.
   - A new folder has none, and neither has a folder that moved to another parent.
@@ -1319,7 +1316,7 @@ goes up only when security or a folder's groups changed.
 | `400` | `invalid_folders`: a bad id, a missing root, an unknown parent or a cycle |
 | `400` | `invalid_permissions`: with security on, a folder allows groups its parent doesn't (`problems`) |
 | `409` | `folder_in_use`: a folder that still holds items or data sources would go (`folders`) |
-| `409` | `data_source_range`: a cube would use a data source outside its folder's range; `reference_range`: an item would refer outside its own. Both answer `{ cubes, items }`, by name, and `data_source_range` is the code when both are broken |
+| `409` | `reference_range`: an item would refer outside its folder's range (`items`, by name) |
 | `409` | `mode`: security on for a model holding a file set |
 | `409` | `older_instances`: security turned on while an xcube before schema version 4 is connected (`instances`) |
 
@@ -1567,8 +1564,7 @@ Stores a model's data source:
   - `null` creates it. It is refused while any data source holds the name, in
     any case, so a create never lands over another.
   - A version edits that version of it, in place or moved to another folder
-    (`folderId`). It is refused unless that is the stored version, and a move
-    is refused when it would leave a cube using it outside its folder's range.
+    (`folderId`), to any folder. It is refused unless that is the stored version.
 
   Each check is made under the model's lock, which publishes take too.
 
@@ -1583,7 +1579,6 @@ Stores a model's data source:
   - `400 default_outside_root`: `default` in another folder, or not in lower case;
   - `409 name_in_use`: a create of a name another holds, or an edit naming it in another case;
   - `409 conflict` with `currentVersion` (`null`: there is none): `baseVersion` isn't the stored version;
-  - `409 data_source_range` with `cubes` (by name): a move that would leave them out of range;
   - `422 invalid_secret`;
   - `409 driver_change`.
 - **After storing,** every instance swaps it in as soon as it hears, or, for
@@ -1867,7 +1862,6 @@ R71's and R72's refusals are `errors` of their own kinds:
 | `kind` | When | Names |
 | --- | --- | --- |
 | `name_in_use` | A name another item holds, in any case; a landed name sent in another case; two of one name in the changeset; a split view's name in use | The caller's item, never where the other is |
-| `data_source_range` | A cube's data source, its own or inherited, isn't in its folder or an ancestor | The cube (published ones too, when a change strands them), never where the data source is |
 | `reference_range` | An item refers to one outside its folder and its ancestors | The referrer and what it refers to, never where that is |
 
 The overlay push and the snapshot import answer the same way.

@@ -424,9 +424,8 @@ export function initAdminRoutes(
         status = 409;
         body = { error: e.message, code: 'folder_in_use', folders: e.folders };
       } else if (e instanceof OutOfRangeError) {
-        // The data source rule's code first, when both are broken; each list says what to fix.
         status = 409;
-        body = { error: e.message, code: e.cubes.length ? 'data_source_range' : 'reference_range', cubes: e.cubes, items: e.items };
+        body = { error: e.message, code: 'reference_range', items: e.items };
       } else if (e instanceof LaneBusyError) {
         status = 503;
         res.set('Retry-After', String(Math.ceil(e.retryAfterMs / 1000)));

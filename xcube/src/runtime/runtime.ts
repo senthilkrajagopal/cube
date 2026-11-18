@@ -333,13 +333,9 @@ export interface ItemsCheck {
   items: ItemRef[];
 }
 
-/**
- * What a folder push would carry out of range, by name: cubes using a data
- * source outside their folder's (R71 4.3), and items referring to one
- * outside it (R72).
- */
+/** What a folder push would carry out of range, by name: items referring to one outside their folder (R72). */
 export class OutOfRangeError extends Error {
-  public constructor(message: string, public readonly cubes: string[], public readonly items: string[]) {
+  public constructor(message: string, public readonly items: string[]) {
     super(message);
   }
 }
@@ -1905,8 +1901,8 @@ export class XcubeRuntime {
    * secret opens for its target. Its name is one per model, in any case
    * (R71): `baseVersion` null creates it, and is refused while any data
    * source holds the name; a version edits that version of it, or moves it
-   * to another folder, as long as every cube using it keeps it in its
-   * folder's range. Each check is made under the model's lock, which
+   * to another folder (a cube uses a data source in any folder, AC-3396).
+   * Each check is made under the model's lock, which
    * publishes take too. Nothing connects here: the test route does that.
    */
   public async putConnection(
@@ -1954,19 +1950,6 @@ export class XcubeRuntime {
         throw new ConnectionError(`Connection "${name}" is a ${known.driver} data source; its driver can't change`, [
           'Cube fixes a data source\'s SQL dialect when it compiles: create one under another name',
         ], 'driver_change');
-      }
-      if (known.folderId !== body.folderId) {
-        const head = await store.head(model);
-        const items = head ? await this.itemsAt(head) : [];
-        const tree = new FolderTree(folders);
-        const before = new Set(outOfRange(items, tree, connections).cubes);
-        const after = outOfRange(items, tree, connections.map((c) => (c === known ? { ...c, folderId: body.folderId } : c))).cubes
-          .filter((cube) => !before.has(cube));
-        if (after.length) {
-          throw new ConnectionError(`Moving data source "${name}" would leave cubes using it outside their folder's range`, [
-            'a cube may use a data source in its own folder or an ancestor of it',
-          ], 'data_source_range', { cubes: after });
-        }
       }
     });
     this.persistently('a connection', model, () => this.connections.changed(model, name));
@@ -3741,16 +3724,11 @@ export class XcubeRuntime {
       if (dropped.length) {
         throw new FolderInUseError(dropped);
       }
-      const before = outOfRange(items, new FolderTree(await store.folders(model)), connections);
-      const after = outOfRange(items, tree, connections);
-      const cubes = after.cubes.filter((cube) => !before.cubes.includes(cube));
+      const before = outOfRange(items, new FolderTree(await store.folders(model)));
+      const after = outOfRange(items, tree);
       const referrers = after.items.filter((item) => !before.items.includes(item));
-      if (cubes.length || referrers.length) {
-        throw new OutOfRangeError(
-          'The folder tree would leave items using what isn\'t in their folder or one of its ancestors',
-          cubes,
-          referrers,
-        );
+      if (referrers.length) {
+        throw new OutOfRangeError('The folder tree would leave items using what isn\'t in their folder or one of its ancestors', referrers);
       }
     });
     // This instance answers with them in force; the others follow the notification.

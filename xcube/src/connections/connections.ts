@@ -22,11 +22,11 @@ export interface ConnectionInput {
  * - `invalid_connection`, `default_outside_root`: the request itself (400);
  * - `driver_change`, `in_use`: what it would do to what is published;
  * - `name_in_use`: another data source has its name, in any case (R71 2.3);
- * - `conflict`: it isn't the version the request edits (2.5);
- * - `data_source_range`: a cube would use it outside its folder's range (4.3).
+ * - `conflict`: it isn't the version the request edits (2.5).
+ * A data source may move to any folder: a cube uses one in any folder (AC-3396).
  */
 export type ConnectionErrorCode = 'invalid_connection' | 'default_outside_root' | 'driver_change' | 'in_use'
-  | 'name_in_use' | 'conflict' | 'data_source_range';
+  | 'name_in_use' | 'conflict';
 
 export class ConnectionError extends Error {
   public constructor(

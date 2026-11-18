@@ -71,7 +71,7 @@ export interface ItemError {
   name: string | null;
   line?: number;
   column?: number;
-  kind: 'yaml' | 'item' | 'reference' | 'alias' | 'compile' | 'folder' | 'name_in_use' | 'data_source_range' | 'reference_range';
+  kind: 'yaml' | 'item' | 'reference' | 'alias' | 'compile' | 'folder' | 'name_in_use' | 'reference_range';
   message: string;
 }
 

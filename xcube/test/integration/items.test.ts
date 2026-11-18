@@ -360,7 +360,7 @@ describeWithDatabase('xcube items and changesets', () => {
     // fsub under fside: sub_stats would lose orders, in fops.
     const stranded = await admin.put('/folders', { folders: tree.map((f) => (f.id === 'fsub' ? { ...f, parentId: 'fside' } : f)) }).expect(409);
     expect(stranded.body).toEqual({
-      error: 'The folder tree would leave items using what isn\'t in their folder or one of its ancestors', code: 'reference_range', cubes: [], items: ['sub_stats'],
+      error: 'The folder tree would leave items using what isn\'t in their folder or one of its ancestors', code: 'reference_range', items: ['sub_stats'],
     });
     // Under the root, fops is no ancestor of it either.
     await admin.put('/folders', { folders: tree.map((f) => (f.id === 'fsub' ? { ...f, parentId: 'froot' } : f)) }).expect(409);

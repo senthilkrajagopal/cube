@@ -396,36 +396,6 @@ function checkNames(defs: ItemDefinition[], resolved: Set<string>): ItemError[] 
 }
 
 /**
- * The cubes whose data source isn't in their folder or an ancestor of it
- * (R71 4.1), inherited ones included (4.4). A data source the model doesn't
- * hold is left to the binding's own refusal.
- */
-function checkRanges(
-  entries: Entry[],
-  tree: FolderTree,
-  dataSources: DataSourceRef[],
-  checked: (entry: Entry) => boolean = () => true,
-): ItemError[] {
-  const folderOf = new Map(dataSources.map((d) => [d.name, d.folderId]));
-  const byName = new Map(entries.map((entry) => [entry.def.name, entry]));
-  const errors: ItemError[] = [];
-  for (const entry of entries.filter((e) => e.def.kind === 'cube' && checked(e))) {
-    const { name, from } = usedDataSource(entry, byName);
-    const folder = folderOf.get(name);
-    if (name !== 'default' && folder !== undefined && !tree.chain(entry.def.folderId).includes(folder)) {
-      const through = from === entry ? '' : ` (through ${from.def.name}, which it extends)`;
-      errors.push({
-        folderId: entry.def.folderId,
-        name: entry.def.name,
-        kind: 'data_source_range',
-        message: `It uses the data source "${name}"${through}, which isn't in its folder or one of its ancestors`,
-      });
-    }
-  }
-  return errors;
-}
-
-/**
  * The items referring to one outside their folder and its ancestors (R72):
  * a join, `extends`, a view's join path, `{cube.member}` or `FILTER_PARAMS`,
  * as their bindings record. A name only resolved up the path before names
@@ -652,8 +622,8 @@ export function publish({
     const checked = (entry: Entry) => !overlay || entry.resolved;
     const bindingsOf = (entry: Entry) => newBindings.get(itemKey(entry.def.name)) ?? kept.get(itemKey(entry.def.name))?.bindings ?? {};
     errors.push(...checkReferences(entries, tree, bindingsOf, checked));
+    // A cube may use a data source in any folder, by its name (AC-3396): the client checks who may.
     if (dataSources) {
-      errors.push(...checkRanges(entries, tree, dataSources, checked));
       errors.push(...checkRollups(entries, dataSources, checked));
     }
   }
@@ -684,15 +654,11 @@ export function publish({
 }
 
 /**
- * What of a published revision a folder push or a data source moved would
- * carry out of range: the cubes whose data source would be outside their
- * folder's (R71 4.1), and the items referring to one outside it (R72).
+ * What of a published revision a folder push would carry out of range: the
+ * items referring to one outside their folder and its ancestors (R72). A
+ * cube's data source may be in any folder (AC-3396).
  */
-export function outOfRange(
-  items: PublishedItem[],
-  tree: FolderTree,
-  dataSources: DataSourceRef[],
-): { cubes: string[]; items: string[] } {
+export function outOfRange(items: PublishedItem[], tree: FolderTree): { items: string[] } {
   const bindings = new Map(items.map((item) => [item.name, item.bindings]));
   const entries: Entry[] = items.map((item) => ({
     def: { folderId: item.folderId, name: item.name, kind: item.kind, fullName: item.name, doc: {}, members: new Set<string>() },
@@ -700,7 +666,6 @@ export function outOfRange(
     resolved: false,
   }));
   return {
-    cubes: checkRanges(entries, tree, dataSources).map((e) => e.name!).sort(),
     items: checkReferences(entries, tree, (entry) => bindings.get(entry.def.name) ?? {}).map((e) => e.name!).sort(),
   };
 }

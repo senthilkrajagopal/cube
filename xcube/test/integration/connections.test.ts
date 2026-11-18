@@ -363,7 +363,7 @@ describeWithDatabase('connections: data sources served from sealed credentials',
 
   const salesYaml = (dataSource = 'warehouse', name = 'sales') => `cubes:\n  - name: ${name}\n    data_source: ${dataSource}\n    sql_table: ${warehouse}.orders\n    measures:\n      - name: total\n        sql: amount\n        type: sum\n`;
 
-  test('a cube in a folder uses a data source in its folder or an ancestor, by its name (R71 4.1)', async () => {
+  test('a cube in a folder uses a data source by its name (R71 4.1)', async () => {
     await admin('put', '/folders', { folders: [{ id: 'froot', parentId: null }, { id: 'fa', parentId: 'froot' }] }).expect(200);
     await putConnection('warehouse', { ...connection(role, 'second-password'), folderId: 'fa' }).expect(200);
     const res = await admin('post', '/changesets', {
@@ -434,36 +434,46 @@ describeWithDatabase('connections: data sources served from sealed credentials',
     expect(overlay.body.code).toBe('default_outside_root');
   });
 
-  test('a cube is refused a data source off its path: at publish, overlay push, connection move and folder push (R71 4.3)', async () => {
+  test('a cube binds a data source under a sibling folder by its name and queries it; no move strands it (AC-3396)', async () => {
     const tree = [{ id: 'froot', parentId: null }, { id: 'fa', parentId: 'froot' }, { id: 'faa', parentId: 'fa' }, { id: 'fb', parentId: 'froot' }];
     await admin('put', '/folders', { folders: tree }).expect(200);
-    // At publish: fb is beside fa, which holds warehouse.
-    const side = await admin('post', '/changesets', {
+    const total = async (cube: string) => {
+      const answer = await request(server).get('/cubejs-api/v1/load')
+        .query({ query: JSON.stringify({ measures: [`${cube}.total`] }) })
+        .set('Authorization', jwt.sign({ wechartModel: 'dev', wechartRevision: revision }, API_SECRET));
+      expect({ status: answer.status, error: answer.body.error }).toEqual({ status: 200, error: undefined });
+      return answer.body.data[0][`${cube}.total`];
+    };
+    // Folder B's cube, side, binds warehouse, which folder A (its sibling) holds.
+    revision = (await admin('post', '/changesets', {
       baseRevision: revision, upserts: [{ folderId: 'fb', name: 'side', kind: 'cube', yaml: salesYaml('warehouse', 'side') }],
-    }).expect(422);
-    expect(side.body.errors).toEqual([{
-      folderId: 'fb', name: 'side', kind: 'data_source_range', message: 'It uses the data source "warehouse", which isn\'t in its folder or one of its ancestors',
-    }]);
-    // At an overlay push, for its own items.
-    const pushed = await admin('put', '/overlays/ws-side', { upserts: [{ folderId: 'fb', name: 'side', kind: 'cube', yaml: salesYaml('warehouse', 'side') }] }).expect(422);
-    expect(pushed.body.errors).toEqual([expect.objectContaining({ name: 'side', kind: 'data_source_range' })]);
+    }).expect(201)).body.revision;
+    expect(await total('side')).toBe('42');
+    expect((await admin('get', '/items').expect(200)).body.items.find((i: any) => i.name === 'side')).toMatchObject({ folderId: 'fb', dataSource: 'warehouse' });
+    // An overlay's own cube may too.
+    await admin('put', '/overlays/ws-side', { upserts: [{ folderId: 'fb', name: 'side2', kind: 'cube', yaml: salesYaml('warehouse', 'side2') }] }).expect(201);
+    await admin('delete', '/overlays/ws-side').expect(204);
 
-    // deep, in faa, uses fa's warehouse.
+    // deep, in faa, uses fa's warehouse; a folder push carrying faa under fb leaves it bound.
     revision = (await admin('post', '/changesets', {
       baseRevision: revision, upserts: [{ folderId: 'faa', name: 'deep', kind: 'cube', yaml: salesYaml('warehouse', 'deep') }],
     }).expect(201)).body.revision;
-    // A folder push carrying faa under fb strands deep.
-    const stranded = await admin('put', '/folders', { folders: tree.map((f) => (f.id === 'faa' ? { ...f, parentId: 'fb' } : f)) }).expect(409);
-    expect(stranded.body).toMatchObject({ code: 'data_source_range', cubes: ['deep'], items: [] });
-    // A move of warehouse into fb strands sales and deep; into faa, sales.
-    const stored = (await admin('get', '/connections').expect(200)).body.connections.find((c: any) => c.name === 'warehouse');
-    const move = (folderId: string) => admin('put', '/connections/warehouse', { ...connection(role, 'second-password'), folderId, baseVersion: stored.version });
-    expect((await move('fb').expect(409)).body).toMatchObject({ code: 'data_source_range', cubes: ['deep', 'sales'] });
-    expect((await move('faa').expect(409)).body).toMatchObject({ code: 'data_source_range', cubes: ['sales'] });
-    // Up to the root, it stays on every path.
-    const moved = await move('froot').expect(200);
-    await admin('put', '/connections/warehouse', { ...connection(role, 'second-password'), folderId: 'fa', baseVersion: moved.body.version }).expect(200);
-    revision = (await admin('post', '/changesets', { baseRevision: revision, deletes: [{ folderId: 'faa', name: 'deep' }] }).expect(201)).body.revision;
+    await admin('put', '/folders', { folders: tree.map((f) => (f.id === 'faa' ? { ...f, parentId: 'fb' } : f)) }).expect(200);
+    await admin('put', '/folders', { folders: tree }).expect(200);
+    // warehouse moved into fb, then faa: every cube using it still answers.
+    const move = async (folderId: string) => {
+      const stored = (await admin('get', '/connections').expect(200)).body.connections.find((c: any) => c.name === 'warehouse');
+      await admin('put', '/connections/warehouse', { ...connection(role, 'second-password'), folderId, baseVersion: stored.version }).expect(200);
+    };
+    await move('fb');
+    await move('faa');
+    expect(await total('side')).toBe('42');
+    expect(await total('deep')).toBe('42');
+    expect(await total('sales')).toBe('42');
+    await move('fa');
+    revision = (await admin('post', '/changesets', {
+      baseRevision: revision, deletes: [{ folderId: 'faa', name: 'deep' }, { folderId: 'fb', name: 'side' }],
+    }).expect(201)).body.revision;
     await admin('put', '/folders', { folders: [{ id: 'froot', parentId: null }, { id: 'fa', parentId: 'froot' }] }).expect(200);
   });
 
