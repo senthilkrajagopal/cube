@@ -1,6 +1,9 @@
+/* eslint-disable no-template-curly-in-string -- `${…}` here is text under test */
 import { Readable } from 'stream';
 
-import { ParameterError, placeholdersOf, SqlRefusal, type SqlDialect } from '../../src/sql/classify';
+import {
+  classifySql, lexedKinds, ParameterError, placeholdersOf, SqlRefusal, type SqlDialect,
+} from '../../src/sql/classify';
 import { bindParameters, type SqlParameter } from '../../src/sql/parameters';
 import { openSession, RowCollector, type SqlCaps } from '../../src/sql/runner';
 import { SqlRuns, type SqlTarget } from '../../src/sql/runs';
@@ -244,9 +247,9 @@ describe('a run with parameters', () => {
   const target = (dialect: SqlTarget['dialect'], driver: any = {}): SqlTarget => ({ dialect, label: dialect, build: async () => ({ driver, secrets: [] }) });
   const runs = () => new SqlRuns('here', () => null, () => undefined);
 
-  test('Dremio, Trino, Athena and Cube Store take no bound values: refused before anything connects', async () => {
-    const names = { dremio: 'Dremio', trino: 'Trino', athena: 'Athena', cubestore: 'Cube Store' };
-    for (const dialect of ['dremio', 'trino', 'athena', 'cubestore'] as const) {
+  test('Dremio and Cube Store take no bound values: refused before anything connects', async () => {
+    const names = { dremio: 'Dremio', cubestore: 'Cube Store' };
+    for (const dialect of ['dremio', 'cubestore'] as const) {
       const build = jest.fn();
       await expect(runs().run('m', { ...target(dialect), build }, {
         runId: 'r1', sql: 'SELECT {{a}}', parameters: { a: text('x') }, ...caps,
@@ -326,5 +329,121 @@ describe('list parameters (an export\'s statement): one placeholder per item, wh
       .toEqual(['too_many_values', 'The statement binds 80000 values: MySQL takes at most 65535 in a statement']);
     expect(bindParameters(sql, 'postgres', { ids: many(32767) }, { lists: true }).binds).toHaveLength(32767);
     expect(reasonOf(() => bindParameters(sql, 'postgres', { ids: many(32768) }, { lists: true }))?.[0]).toBe('too_many_values');
+  });
+});
+
+describe('date and time parameters (R12): a wall-clock time, bound as the database\'s zoneless timestamp', () => {
+  const at: SqlParameter = { type: 'datetime', value: '2026-03-08T02:30:00.5' };
+
+  test('per dialect: its zoneless timestamp, the value sent with six digits after the second', () => {
+    const expected: Record<string, [string, string]> = {
+      postgres: ['SELECT  $1::timestamp ', '2026-03-08T02:30:00.500000'],
+      redshift: ['SELECT  $1::timestamp ', '2026-03-08T02:30:00.500000'],
+      mysql: ['SELECT  CAST(? AS DATETIME(6)) ', '2026-03-08T02:30:00.500000'],
+      snowflake: ['SELECT  ?::TIMESTAMP_NTZ ', '2026-03-08T02:30:00.500000'],
+      bigquery: ['SELECT  @p1 ', '2026-03-08T02:30:00.500000'],
+      mssql: ['SELECT  CAST(@p1 AS DATETIME2(6)) ', '2026-03-08T02:30:00.500000'],
+      oracle: ['SELECT  TO_TIMESTAMP(:p1, \'YYYY-MM-DD"T"HH24:MI:SS.FF6\') ', '2026-03-08T02:30:00.500000'],
+      duckdb: ['SELECT  $1::TIMESTAMP ', '2026-03-08T02:30:00.500000'],
+      // ClickHouse reads a DateTime64 with a space between day and time.
+      clickhouse: ['SELECT  {p1:DateTime64(6)} ', '2026-03-08 02:30:00.500000'],
+    };
+    for (const [dialect, [rewritten, value]] of Object.entries(expected)) {
+      const bound = bindParameters('SELECT {{at}}', dialect as SqlDialect, { at });
+      expect([dialect, bound.sql, bound.binds.map((b) => [b.type, b.value])]).toEqual([dialect, rewritten, [['datetime', value]]]);
+    }
+  });
+
+  test('a value with a zone, past six digits, or not a real time is refused', () => {
+    for (const value of ['2026-03-08T02:30:00Z', '2026-03-08T02:30:00+01:00', '2026-03-08 02:30:00', '2026-03-08T02:30', '2026-03-08T24:00:00',
+      '2026-02-30T00:00:00', '2026-03-08T02:30:00.1234567', '2026-03-08']) {
+      expect([value, reasonOf(() => bindParameters('SELECT {{a}}', 'postgres', { a: { type: 'datetime', value } }))]).toEqual([value, [
+        'invalid_value', '"a" is a Date and time: its value is YYYY-MM-DDTHH:MM:SS, up to 6 digits after the second, with no zone',
+      ]]);
+    }
+    // Years 1 to 99 are days too (JavaScript's Date.UTC would read them as 1900 to 1999).
+    expect(reasonOf(() => bindParameters('SELECT {{a}}', 'postgres', { a: { type: 'datetime', value: '0001-01-01T00:00:00' } }))).toBeNull();
+    expect(reasonOf(() => bindParameters('SELECT {{a}}', 'postgres', { a: { type: 'date', value: '0099-02-28' } }))).toBeNull();
+    expect(reasonOf(() => bindParameters('SELECT {{a}}', 'postgres', { a: { type: 'date', value: '0100-02-29' } }))?.[0]).toBe('invalid_value');
+    // ClickHouse's DateTime64 holds 1900 to 2299, as its Date32 does.
+    expect(reasonOf(() => bindParameters('SELECT {{a}}', 'clickhouse', { a: { type: 'datetime', value: '1899-12-31T23:59:59' } })))
+      .toEqual(['invalid_value', '"a" is a Date and time ClickHouse can\'t hold: its days run from 1900-01-01 to 2299-12-31']);
+  });
+
+  test('a list of them binds one placeholder per item', () => {
+    const bound = bindParameters('SELECT 1 WHERE t IN ({{ts}})', 'postgres', {
+      ts: { type: 'datetime', value: ['2026-01-01T00:00:00', '2026-01-02T00:00:00'] },
+    }, { lists: true });
+    expect(bound.sql).toBe('SELECT 1 WHERE t IN ( $1::timestamp , $2::timestamp )');
+  });
+});
+
+describe('values written in as typed literals (R12): Trino, Athena, Hive and Impala, each read as its literal alone', () => {
+  const hostile = [
+    INJECTION, 'it\'s', 'back\\slash\\', 'a\\\'; DROP TABLE t; --', '${env:HOME}', '${system:user.name}', '*/ DROP /*', '-- x\n; DELETE FROM t',
+    'line\nbreak\r\0', 'tab\there', '\'\'\'', '\\', '$', '; SELECT 1',
+  ];
+  const values: Record<string, SqlParameter> = {
+    n: { type: 'number', value: '-12.50' },
+    d: { type: 'date', value: '2026-02-28' },
+    at: { type: 'datetime', value: '2026-03-08T02:30:00.5' },
+    b: { type: 'boolean', value: false },
+  };
+
+  test('Trino and Athena: quotes doubled, DECIMAL, DATE and TIMESTAMP literals, TRUE and FALSE', () => {
+    for (const dialect of ['trino', 'athena'] as const) {
+      const bound = bindParameters('SELECT {{t}}, {{n}}, {{d}}, {{at}}, {{b}}', dialect, { t: text(INJECTION), ...values });
+      expect(bound).toEqual({
+        sql: 'SELECT  \'\'\'; DROP TABLE x; --\' ,  DECIMAL \'-12.50\' ,  DATE \'2026-02-28\' ,  TIMESTAMP \'2026-03-08 02:30:00.500000\' ,  FALSE ',
+        binds: [],
+      });
+    }
+  });
+
+  test('Hive and Impala: Cube\'s own escaping, a $ as \\u0024, numbers, days and times cast', () => {
+    for (const dialect of ['hive', 'impala'] as const) {
+      const bound = bindParameters('SELECT {{t}}, {{n}}, {{d}}, {{at}}, {{b}}', dialect, { t: text('it\'s ${env:HOME}\\'), ...values });
+      expect(bound).toEqual({
+        sql: 'SELECT  \'it\\\'s \\u0024{env:HOME}\\\\\' ,  CAST(\'-12.50\' AS DECIMAL(38, 2)) ,  CAST(\'2026-02-28\' AS DATE) , '
+          + ' CAST(\'2026-03-08 02:30:00.500000\' AS TIMESTAMP) ,  FALSE ',
+        binds: [],
+      });
+    }
+  });
+
+  test('every hostile text stays one string: the statement passes the check, and reads back the same without it', () => {
+    for (const dialect of ['trino', 'athena', 'hive', 'impala'] as const) {
+      for (const value of hostile) {
+        const { sql } = bindParameters('SELECT {{t}} AS v FROM t WHERE x = {{t}}', dialect, { t: text(value) });
+        // One statement, a read, its literals redacted: nothing of the value outside its strings.
+        const classified = classifySql(sql, dialect);
+        expect([dialect, value, classified.statement, classified.redactedSql]).toEqual([dialect, value, 'select', 'SELECT  ?  AS v FROM t WHERE x =  ?']);
+        // Hive's and Impala's literals write a $ as \u0024: no `${` a server could substitute.
+        if (dialect === 'hive' || dialect === 'impala') {
+          expect(sql).not.toContain('${');
+        }
+      }
+    }
+  });
+
+  test('a list, in IN (…), each item its own literal', () => {
+    expect(bindParameters('SELECT 1 FROM t WHERE a IN ({{a}})', 'impala', { a: { type: 'text', value: ['x', 'y\'z'] } }, { lists: true }).sql)
+      .toBe('SELECT 1 FROM t WHERE a IN ( \'x\' , \'y\\\'z\' )');
+    expect(bindParameters('SELECT 1 FROM t WHERE a IN ({{a}})', 'trino', { a: { type: 'date', value: ['2026-01-01'] } }, { lists: true }).sql)
+      .toBe('SELECT 1 FROM t WHERE a IN ( DATE \'2026-01-01\' )');
+  });
+
+  test('a literal that wouldn\'t read as itself alone is caught by the check of its kinds', () => {
+    expect(lexedKinds('\'a\' \'b\'', 'trino')).toEqual(['string', 'string']);
+    expect(lexedKinds('\'a\\\'', 'trino')).toEqual(['string']);
+    expect(lexedKinds('\'a\\\'', 'hive')).toBeNull();
+    expect(lexedKinds('\'a\' -- x', 'trino')).toBeNull();
+  });
+});
+
+describe('a SQL run takes lists too (R12)', () => {
+  test('a list on /sql binds one value per item', () => {
+    const bound = bindParameters('SELECT * FROM t WHERE id IN ({{ids}})', 'postgres', { ids: { type: 'number', value: ['1', '2'] } }, { lists: true });
+    expect(bound.binds.map((b) => b.value)).toEqual(['1', '2']);
   });
 });

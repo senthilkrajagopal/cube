@@ -16,7 +16,7 @@ import {
   classifySql, hivePlaceholders, redactSql, SqlRefusal,
 } from '../../src/sql/classify';
 import { exportStatement } from '../../src/sql/export';
-import { DIALECT_NAMES, UNBOUND_DIALECTS } from '../../src/sql/parameters';
+import { DIALECT_NAMES, LITERAL_DIALECTS } from '../../src/sql/parameters';
 
 /** The refusal's code, its statement kind and what it named, or `ok` and the kind. */
 function verdict(sql: string): string {
@@ -97,8 +97,8 @@ describe('the SQL runner\'s check: Impala', () => {
       .toBe('SELECT \'?\', `a\\`?`, x FROM t WHERE b = \'x\\\'y\' AND c = "?" -- ?\nAND d IN (2, NULL)');
   });
 
-  test('parameters are unbound, and it names itself so', () => {
-    expect(UNBOUND_DIALECTS.has('impala')).toBe(true);
+  test('parameters are written in as literals (R12), and it names itself so', () => {
+    expect(LITERAL_DIALECTS.has('impala')).toBe(true);
     expect(DIALECT_NAMES.impala).toBe('Impala');
   });
 });

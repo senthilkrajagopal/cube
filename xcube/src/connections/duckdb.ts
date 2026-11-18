@@ -458,6 +458,8 @@ function duckdbDriverClass() {
           const run = (sql: string) => connection!.run(sql);
 
           step = 'limits';
+          // UTC, whatever the pod's zone: Cube reads a TIMESTAMP as UTC (`::timestamptz`), and a SQL run's session is UTC.
+          await run('SET GLOBAL TimeZone = \'UTC\'');
           await run(`SET memory_limit = ${literal(own.memoryLimit)}`);
           await run(`SET threads = ${own.threads}`);
           await run(`SET temp_directory = ${literal(this.tempDir)}`);

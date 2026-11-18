@@ -23,7 +23,7 @@ export interface SqlRunRequest extends SqlCaps {
   runId: string;
   /** `{{name}}`'s values, bound, never written into the SQL (`parameters.ts`); absent, `{{…}}` is the SQL's own text. */
   parameters?: Record<string, SqlParameter>;
-  /** A parameter's value may be a list, bound as one value per item (an export's statement). */
+  /** A parameter's value may be a list, bound as one value per item (an export's statement, and a SQL run's: R12). */
   lists?: boolean;
   /** Only a SELECT runs (an export's statement): an EXPLAIN is refused, `not_select`. */
   selectOnly?: boolean;

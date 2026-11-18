@@ -111,8 +111,44 @@ const FACTS: [number, string, string, string][] = [
     expect((await failure(run('SELECT reflect(\'java.lang.System\', \'getenv\', \'HOME\')'))).code).toBe('not_read_only');
     expect((await failure(run(`INSERT INTO ${facts} VALUES (9, NULL, 'x', 1)`))).code).toBe('not_read_only');
     expect((await exec(`SELECT count(*) FROM ${facts}`)).rows).toEqual([[FACTS.length]]);
-    const parameters = await failure(run('SELECT {{a}}', { parameters: { a: { type: 'text', value: 'x' } } }));
-    expect(parameters.code).toBe('parameters_unsupported');
+  });
+
+  test('parameters written in as literals: hostile text comes back as data, nothing else runs (R12)', async () => {
+    const hostile = [
+      '\'; DROP TABLE x; --', 'a\\\'; DROP TABLE x; --', '${env:HOME}', '${system:user.name}', '$', '*/ DROP TABLE x /*', '-- c\n; SELECT 1',
+      'back\\slash\\', '\\', 'tab\tq"d', ';', 'line\nbreak\r', '\'\'\'',
+    ];
+    for (const value of hostile) {
+      const answer = await run('SELECT {{t}} AS v', { parameters: { t: { type: 'text', value } } });
+      expect([value, answer.rows]).toEqual([value, [[value]]]);
+    }
+    const named = await run(`SELECT count(*) FROM ${facts} WHERE name = {{t}}`, { parameters: { t: { type: 'text', value: 'a%_\'x' } } });
+    expect(named.rows).toEqual([[1]]);
+    expect((await exec(`SELECT count(*) FROM ${facts}`)).rows).toEqual([[FACTS.length]]);
+  });
+
+  test('parameters written in as literals: a list, a number and a boolean (R12)', async () => {
+    const listed = await run(`SELECT count(*) FROM ${facts} WHERE id IN ({{ids}}) AND name IN ({{names}})`, {
+      lists: true,
+      parameters: { ids: { type: 'number', value: ['1', '3', '4'] }, names: { type: 'text', value: ['east', 'a%_\'x'] } },
+    } as any);
+    expect(listed.rows).toEqual([[3]]);
+    const typed = await run('SELECT {{n}} + 1 AS n, {{b}} AS b', {
+      parameters: { n: { type: 'number', value: '-12.50' }, b: { type: 'boolean', value: false } },
+    });
+    expect(typed.rows).toEqual([['-11.50', false]]);
+  });
+
+  // Known to fail where noted (wechart's user, R12): ${label}'s date and time parameters are to be fixed against a live data source.
+  test('parameters written in as literals: a date, and a date and time (R12)', async () => {
+    const day = await run(`SELECT count(*) FROM ${facts} WHERE CAST(ts AS DATE) = {{d}}`, { parameters: { d: { type: 'date', value: '2026-03-08' } } });
+    expect(day.rows).toEqual([[2]]);
+    const at = await run(`SELECT count(*) FROM ${facts} WHERE ts = {{at}}`, { parameters: { at: { type: 'datetime', value: '2026-03-08T09:30:00' } } });
+    expect(at.rows).toEqual([[1]]);
+    const exact = await run('SELECT {{at}} = CAST(\'2026-03-08 02:30:00.5\' AS TIMESTAMP) AS same', {
+      parameters: { at: { type: 'datetime', value: '2026-03-08T02:30:00.5' } },
+    });
+    expect(exact.rows).toEqual([[true]]);
   });
 
   test('a run past its time ends as `timeout`, and the server stops it', async () => {

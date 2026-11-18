@@ -860,6 +860,35 @@ export function hiveTrailingOffset(sql: string): { sql: string; skip: number } |
 }
 
 /**
+ * The kinds of token `text` reads as on a dialect, in every reading of it
+ * (`word`, `string`, …), or `null` where the readings differ, it can't be
+ * read, or it holds a comment: for a literal xcube writes into a statement,
+ * which must read as that literal alone.
+ */
+export function lexedKinds(text: string, dialect: SqlDialect): string[] | null {
+  const rules = RULES[dialect];
+  let seen: string | null = null;
+  for (const reading of rules.readings) {
+    let lexed: Lexed;
+    try {
+      lexed = lex(text, rules, reading);
+    } catch {
+      return null;
+    }
+    const covered = lexed.tokens.length > 0 && lexed.tokens[0].start === 0 && lexed.tokens[lexed.tokens.length - 1].end === text.length;
+    if (lexed.comments.length || !covered) {
+      return null;
+    }
+    const kinds = lexed.tokens.map((t) => t.kind).join();
+    if (seen !== null && kinds !== seen) {
+      return null;
+    }
+    seen = kinds;
+  }
+  return seen === null ? null : seen.split(',');
+}
+
+/**
  * The places of a Hive (or Impala) statement's `?` placeholders, as its lexer
  * reads it: never a `?` in a string, a quoted name or a comment. For Cube's
  * SQL, whose values the driver writes in as literals (`hive.ts`).

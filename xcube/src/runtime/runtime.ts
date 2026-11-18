@@ -2044,7 +2044,9 @@ export class XcubeRuntime {
    * short name), or on Cube Store (`sql/runs.ts`).
    */
   public async runSql(model: string, on: { connection: string; overlay?: string } | { cubeStore: true }, request: SqlRunRequest): Promise<SqlAnswer> {
-    return this.sqlRuns.run(model, await this.sqlTargetOf(model, on, request), request);
+    // A parameter's value may be a list here too, as in an export's statement (R12).
+    const run = { ...request, lists: true };
+    return this.sqlRuns.run(model, await this.sqlTargetOf(model, on, run), run);
   }
 
   /**

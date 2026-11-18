@@ -965,6 +965,36 @@ describeWithDatabase('the SQL runner: read-only SQL on a model\'s data sources a
       expect(body.rows).toEqual([[INJECTION, 42.5, expect.stringMatching(/^2026-02-2[78]/), true, 0]]);
     });
 
+    // R12: a date and time is a wall-clock time, read as UTC against an instant (each run's session is UTC); a list on /sql.
+    const timed = { at: { type: 'datetime', value: '2026-03-08T02:30:00.5' }, ids: { type: 'number', value: ['1', '3'] } };
+    const timedRows = async (name: string, statement: string) => {
+      const res = await run(name, { sql: statement, parameters: timed });
+      expect({ status: res.status, error: res.body.error }).toEqual({ status: 200, error: undefined });
+      return res.body.rows.map((row: unknown[]) => row.map(String));
+    };
+
+    test('PostgreSQL: a date and time, as a zoneless timestamp and against an instant in UTC; a list in IN (…)', async () => {
+      expect(await timedRows('default', `SELECT {{at}} = TIMESTAMP '2026-03-08 02:30:00.5' AS wall,
+        {{at}} = TIMESTAMPTZ '2026-03-08 02:30:00.5+00' AS utc, current_setting('TimeZone') AS zone,
+        (SELECT count(*) FROM (VALUES (1), (2), (3)) AS v(n) WHERE n IN ({{ids}})) AS listed`)).toEqual([['true', 'true', 'UTC', '2']]);
+    });
+
+    (MYSQL ? test : test.skip)('MySQL: a date and time, and a list', async () => {
+      expect(await timedRows('mysql', `SELECT {{at}} = TIMESTAMP('2026-03-08 02:30:00.5') AS wall, @@session.time_zone AS zone,
+        (SELECT count(*) FROM (SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3) AS v WHERE n IN ({{ids}})) AS listed`)).toEqual([['1', '+00:00', '2']]);
+    });
+
+    (MSSQL ? test : test.skip)('SQL Server: a date and time, and a list', async () => {
+      expect(await timedRows('mssql', `SELECT CASE WHEN {{at}} = CAST('2026-03-08T02:30:00.5' AS DATETIME2(6)) THEN 1 ELSE 0 END AS wall,
+        (SELECT count(*) FROM (VALUES (1), (2), (3)) AS v(n) WHERE n IN ({{ids}})) AS listed`)).toEqual([['1', '2']]);
+    });
+
+    (ORACLE ? test : test.skip)('Oracle: a date and time, its session in UTC, and a list', async () => {
+      expect(await timedRows('oracle', `SELECT CASE WHEN {{at}} = TIMESTAMP '2026-03-08 02:30:00.5' THEN 1 ELSE 0 END AS wall, SESSIONTIMEZONE AS zone,
+        (SELECT count(*) FROM (SELECT 1 AS n FROM dual UNION ALL SELECT 2 FROM dual UNION ALL SELECT 3 FROM dual) WHERE n IN ({{ids}})) AS listed
+        FROM dual`)).toEqual([['1', 'UTC', '2']]);
+    });
+
     (DREMIO_URL ? test : test.skip)('Dremio takes no bound values', async () => {
       const refused = await run('dremio', { sql: 'SELECT {{t}}', parameters: { t: parameters.t } }).expect(400);
       expect(refused.body).toMatchObject({ code: 'parameters_unsupported', reason: 'dremio', error: 'Dremio takes no bound values: run the statement without parameters' });

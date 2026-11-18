@@ -227,6 +227,23 @@ describe('xcube\'s DuckDB driver, in process', () => {
     await podRole.release();
   });
 
+  test('the SQL runner: a date and time bound as a TIMESTAMP, its instance in UTC, and a list (R12)', async () => {
+    const caps: SqlCaps = { maxRows: 3, timeoutMs: 30000, maxBytes: 1024 * 1024 };
+    const session = await openSession('duckdb', driver, caps, (m: string): never => {
+      throw new Error(m);
+    });
+    const { sql, binds } = bindParameters(
+      'SELECT {{at}} = TIMESTAMP \'2026-03-08 02:30:00.5\' AS wall, current_setting(\'TimeZone\') AS zone, (SELECT count(*) FROM orders WHERE id IN ({{ids}})) AS listed',
+      'duckdb',
+      { at: { type: 'datetime', value: '2026-03-08T02:30:00.5' }, ids: { type: 'number', value: ['1', '3'] } },
+      { lists: true },
+    );
+    const rows = new RowCollector(caps.maxRows, caps.maxBytes);
+    await session.run(sql, rows, binds);
+    expect(rows.rows).toEqual([[true, 'UTC', '2']]);
+    await session.close();
+  });
+
   test('the SQL runner: its own connection, held in the pool; binds as $n; read to the row cap', async () => {
     const caps: SqlCaps = { maxRows: 3, timeoutMs: 30000, maxBytes: 1024 * 1024 };
     const session = await openSession('duckdb', driver, caps, (m: string): never => {

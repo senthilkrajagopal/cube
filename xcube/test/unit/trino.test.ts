@@ -305,7 +305,7 @@ describe('Trino, against a double of its client protocol', () => {
       expect(trino.killed.has(idOf(sql)!)).toBe(true);
     });
 
-    test('refused statements and held parameters never reach Trino (AC-1044, AC-1046)', async () => {
+    test('refused statements never reach Trino (AC-1044, AC-1046)', async () => {
       const before = trino.statements().length;
       for (const sql of [
         'CALL hive.system.drop_stats(\'s\', \'t\')', 'SET SESSION query_max_run_time = \'1h\'', 'EXPLAIN ANALYZE SELECT 1',
@@ -313,9 +313,22 @@ describe('Trino, against a double of its client protocol', () => {
       ]) {
         expect((await failure(run(sql))).code).toBe('not_read_only');
       }
-      const held = await failure(run('SELECT {{n}}', { parameters: { n: { type: 'number', value: '1' } } }));
-      expect(held.code).toBe('parameters_unsupported');
       expect(trino.statements().length).toBe(before);
+    });
+
+    test('parameters reach Trino as xcube\'s typed literals, a list in IN (…), the statement checked as it runs (R12)', async () => {
+      const parameters = {
+        t: { type: 'text', value: '\'; DROP TABLE x; --' },
+        n: { type: 'number', value: '-12.50' },
+        d: { type: 'date', value: '2026-02-28' },
+        at: { type: 'datetime', value: '2026-03-08T02:30:00.5' },
+        b: { type: 'boolean', value: true },
+        ids: { type: 'number', value: ['1', '2'] },
+      } as const;
+      await run('SELECT {{t}}, {{n}}, {{d}}, {{at}}, {{b}} FROM t WHERE id IN ({{ids}})', { parameters, lists: true } as any).catch(() => undefined);
+      expect(trino.statements().pop()).toBe(
+        'SELECT  \'\'\'; DROP TABLE x; --\' ,  DECIMAL \'-12.50\' ,  DATE \'2026-02-28\' ,  TIMESTAMP \'2026-03-08 02:30:00.500000\' ,  TRUE  FROM t WHERE id IN ( DECIMAL \'1\' , DECIMAL \'2\' )',
+      );
     });
 
     test('a wrong password fails the run without saying the password', async () => {

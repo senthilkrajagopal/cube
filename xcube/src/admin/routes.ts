@@ -198,6 +198,9 @@ const rewrapSchema = Joi.object({
 /** A SQL run's id: wechart's, a UUID. */
 const RUN_ID = /^[A-Za-z0-9_-]{1,64}$/;
 
+/** The most items a list parameter may hold, of any dialect: each dialect's own is less or equal (`MAX_BOUND`). */
+const MAX_LIST = 65535;
+
 /** A SQL run: the statement, and its caps (R50's by default), within xcube's own ceilings. */
 const sqlSchema = Joi.object({
   sql: Joi.string().min(1).max(100000).required(),
@@ -211,17 +214,19 @@ const sqlSchema = Joi.object({
   // BigQuery only: its job fails, without charge, past this many bytes billed. Athena refuses it (its workgroup caps).
   maxBytesBilled: Joi.number().integer().min(1).max(Number.MAX_SAFE_INTEGER),
   // `{{name}}`'s values, bound, never written into the SQL; each checked against its type when the run binds it.
+  // A list (`IN ({{name}})`) is an array; empty is refused when bound (`empty_list`), with its own reason.
   parameters: Joi.object().pattern(
     Joi.string().pattern(PARAMETER_NAME).max(64),
     Joi.object({
-      type: Joi.string().valid('text', 'number', 'date', 'boolean').required(),
-      value: Joi.alternatives(Joi.string().max(100000), Joi.boolean()).required(),
+      type: Joi.string().valid('text', 'number', 'date', 'datetime', 'boolean').required(),
+      value: Joi.alternatives(
+        Joi.string().max(100000),
+        Joi.boolean(),
+        Joi.array().items(Joi.alternatives(Joi.string().max(100000), Joi.boolean())).max(MAX_LIST),
+      ).required(),
     }),
   ).max(100),
 });
-
-/** The most items a list parameter may hold, of any dialect: each dialect's own is less or equal (`MAX_BOUND`). */
-const MAX_LIST = 65535;
 
 /**
  * An export: a table (`table`, with `schema` and `columns`), or a caller's
@@ -236,7 +241,7 @@ const exportSchema = Joi.object({
   parameters: Joi.object().pattern(
     Joi.string().pattern(PARAMETER_NAME).max(64),
     Joi.object({
-      type: Joi.string().valid('text', 'number', 'date', 'boolean').required(),
+      type: Joi.string().valid('text', 'number', 'date', 'datetime', 'boolean').required(),
       value: Joi.alternatives(
         Joi.string().max(100000),
         Joi.boolean(),

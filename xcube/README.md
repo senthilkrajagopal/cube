@@ -658,7 +658,8 @@ Apache Hive's HiveServer2 and Spark's Thrift server.
   top-level `LIMIT n OFFSET m` runs as `LIMIT n + m`, and the driver skips the
   first `m` rows: Cube's queries and the SQL runner's alike.
 - **SQL runner.** One `ExecuteStatement` with the run's `queryTimeout`;
-  `CancelOperation` stops it. No bound values (`parameters_unsupported`).
+  `CancelOperation` stops it. Its parameters are written in as typed
+  literals, as Cube's values are (see `POST …/sql`, R12).
 - **A sign-in refused.** HiveServer2 closes the connection without a word;
   the driver says the user or password is wrong, or the server signs in
   otherwise.
@@ -1636,16 +1637,28 @@ never written into the SQL.
   a string, a comment or a quoted name.
 - **What runs.** It writes placeholders of its own in their places, each
   between spaces and typed:
-  - PostgreSQL and Redshift: `$1::numeric`;
-  - MySQL and Snowflake: `?`, cast where typed;
-  - SQL Server: `@p1`, `CAST(@p1 AS DECIMAL(38, 2))`;
-  - Oracle: `:p1`, `TO_NUMBER`/`TO_DATE` where typed;
-  - BigQuery: `@p1`, with its `types` on the dry run and the job;
-  - DuckDB: `$1`, `$1::DECIMAL(38, 2)`, `$1::DATE`, `$1::BOOLEAN`;
+  - PostgreSQL and Redshift: `$1::numeric`, `$1::timestamp`;
+  - MySQL and Snowflake: `?`, cast where typed (`CAST(? AS DATETIME(6))`,
+    `?::TIMESTAMP_NTZ`);
+  - SQL Server: `@p1`, `CAST(@p1 AS DECIMAL(38, 2))`, `CAST(@p1 AS DATETIME2(6))`;
+  - Oracle: `:p1`, `TO_NUMBER`/`TO_DATE`/`TO_TIMESTAMP` where typed;
+  - BigQuery: `@p1`, with its `types` (`DATETIME` for a date and time) on
+    the dry run and the job;
+  - DuckDB: `$1`, `$1::DECIMAL(38, 2)`, `$1::DATE`, `$1::TIMESTAMP`, `$1::BOOLEAN`;
   - ClickHouse: `{p1:String}`, `{p1:Decimal(38, 2)}`, `{p1:Date32}`,
-    `{p1:Bool}`, as its query parameters. A date outside Date32's
-    1900-01-01 to 2299-12-31 is refused (`invalid_value`): ClickHouse would
-    take the nearest end.
+    `{p1:DateTime64(6)}`, `{p1:Bool}`, as its query parameters. A date, or
+    a date and time, outside 1900-01-01 to 2299-12-31 is refused
+    (`invalid_value`): ClickHouse would take the nearest end.
+  - **Trino, Athena, Hive (and Spark) and Impala bind nothing** (Trino's
+    protocol and Athena's execution parameters take values as SQL text;
+    HiveServer2 binds none): each value is written in as a typed literal of
+    xcube's, checked to read as that literal alone. Trino and Athena:
+    `'…'` with a quote doubled, `DECIMAL '…'`, `DATE '…'`, `TIMESTAMP '…'`,
+    `TRUE`/`FALSE`. Hive and Impala: `'…'` escaped as the driver writes
+    Cube's own values (a backslash and a quote escaped, no control
+    character raw, a `$` as `\u0024`, so no `${…}` is written),
+    `CAST('…' AS DECIMAL(38, s))`, `CAST('…' AS DATE)`,
+    `CAST('…' AS TIMESTAMP)`, `TRUE`/`FALSE`.
 
   The read-only check reads the statement as it runs, so `redactedSql` is
   that, values left out. The values are never logged.
@@ -1654,9 +1667,24 @@ never written into the SQL.
   - `number`, a decimal string of at most 38 digits, at most 30 after the
     point;
   - `date`, `YYYY-MM-DD`;
-  - `boolean`, `true` or `false`.
+  - `datetime`, `YYYY-MM-DDTHH:MM:SS` with up to 6 digits after the second
+    and no zone: a wall-clock time, bound as the database's zoneless
+    timestamp. Against a column holding an instant (timestamptz,
+    TIMESTAMP_TZ/LTZ, BigQuery's TIMESTAMP, ClickHouse's DateTime) it is read
+    as UTC: every run's session is UTC (see below);
+  - `boolean`, `true` or `false`;
+  - a list of any of them (a JSON array), bound as one value per item where
+    `{{name}}` is all a parenthesis holds, as in `IN ({{name}})`; a one-item
+    array is a list too. Its refusals and limits are an export's (below).
+- **Every run's session is UTC** (R12): PostgreSQL, Redshift, MySQL and
+  Snowflake were already, through their drivers; Oracle (`ALTER SESSION SET
+  TIME_ZONE`), ClickHouse (`session_timezone`), Trino (the session's zone)
+  and DuckDB (its instance's `TimeZone`) are now. BigQuery and SQL Server
+  have no session zone; Athena's is UTC. So what depends on the session's
+  zone (an instant's text, `now()`, `SESSIONTIMEZONE`, `current_timezone()`)
+  reads in UTC on every database.
 - **Without `parameters`,** `{{…}}` is the statement's own text, as before.
-- **Where binding isn't proven:** Dremio and Cube Store take none
+- **Where nothing binds:** Dremio and Cube Store take no values
   (`400 parameters_unsupported`). Oracle takes a Boolean only from 23ai.
 
 → `200`:
@@ -1684,7 +1712,7 @@ none were known yet):
 | 400 | `not_read_only` | The check refused it; `statement` is its kind (`insert`, `select` …). Refused for a name, it carries `refused: { kind, name }`: `function` (lowercased, `url`), `table_function` (ClickHouse's, `mergetreeindex`) or `clause` (ClickHouse's `SETTINGS`, `FORMAT`; Hive's `TRANSFORM`, `MAP`, `REDUCE`, `FILE`, `|>`, `${`). Cube Store's router joins carry `reason: "cubestore_router_join"` |
 | 400 | `several_statements` | |
 | 400 | `invalid_parameters` | `reason`: `missing_value`, `unused_value`, `malformed_placeholder`, `placeholder_written` (a `$1`, `?`, `@x` or `:x` written by hand), `invalid_value` |
-| 400 | `parameters_unsupported` | `reason`: `dremio`, `trino`, `athena`, `cubestore`, `hive`, `impala`, `oracle_boolean` |
+| 400 | `parameters_unsupported` | `reason`: `dremio`, `cubestore`, `oracle_boolean` |
 | 400 | `cap_unsupported` | `reason`: `athena_workgroup_cutoff` (a `maxBytesBilled` on Athena) |
 | 404 | `unknown_connection`, `unknown_overlay` | |
 | 409 | `run_in_progress` | A run of this `runId` runs |
@@ -1765,10 +1793,11 @@ timeoutMs? }` (`src/sql/export.ts`).
   | Oracle | 65,535 | 1,000 | ORA-01795: expressions in a list |
   | ClickHouse | 10,000 | 10,000 | xcube's: its parameters go in the URL, which the server caps (`http_max_uri_size`, 1 MiB by default) |
   | DuckDB, wechart's engine | 65,535 | 65,535 | xcube's |
+  | Trino, Athena, Hive, Impala | 10,000 | 10,000 | xcube's: each value is written in as a literal |
 
   The refusals above are `400 invalid_parameters` with the reason, before
-  anything connects. Dremio, Trino and Athena take no bound values, nor
-  Oracle a Boolean before 23ai: `400 parameters_unsupported`.
+  anything connects. Dremio and Cube Store take no values, nor Oracle a
+  Boolean before 23ai: `400 parameters_unsupported`.
 - **Whether a deployment has the statement form:** `{ runId, sql: "SELECT 1" }`
   to a connection name that is valid but not there (`xcube_probe`) is
   `404 unknown_connection` here, and `400 bad_request` (its body invalid)

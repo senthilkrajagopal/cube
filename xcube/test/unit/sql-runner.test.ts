@@ -199,9 +199,9 @@ describe('the SQL runner: each database\'s session, on drivers shaped as Cube\'s
     await session.cancel();
     await session.close();
     expect(conn.callTimeout).toBe(30000);
-    expect(executed).toEqual(['SET TRANSACTION READ ONLY', 'SELECT a FROM t']);
-    expect(conn.execute.mock.calls[1][2]).toMatchObject({ resultSet: true, outFormat: 4001, fetchArraySize: 100, prefetchRows: 100 });
-    expect(conn.execute.mock.calls[1][2].fetchTypeHandler({ dbType: 'clob' })).toEqual({ type: 's' });
+    expect(executed).toEqual(['ALTER SESSION SET TIME_ZONE = \'UTC\'', 'SET TRANSACTION READ ONLY', 'SELECT a FROM t']);
+    expect(conn.execute.mock.calls[2][2]).toMatchObject({ resultSet: true, outFormat: 4001, fetchArraySize: 100, prefetchRows: 100 });
+    expect(conn.execute.mock.calls[2][2].fetchTypeHandler({ dbType: 'clob' })).toEqual({ type: 's' });
     expect(set.getRows).toHaveBeenCalledWith(4);
     expect(rows).toMatchObject({ columns: [{ name: 'A', type: 'NUMBER' }], rows: [[1], [2], [3]], truncated: 'rows' });
     expect(set.close).toHaveBeenCalled();

@@ -134,6 +134,19 @@ jest.setTimeout(120 * 1000);
     expect(outside.code).toBe('invalid_parameters');
   });
 
+  test('a date and time as a DateTime64 read in UTC (the run\'s session zone), and a list (R12)', async () => {
+    const answer = await runs.run('m', target(), {
+      sql: 'SELECT {{at}} = toDateTime64(\'2026-03-08 02:30:00.5\', 6, \'UTC\'), toTypeName({{at}}), getSetting(\'session_timezone\'), count() FROM numbers(5) WHERE toString(number) IN ({{ids}})',
+      runId: crypto.randomUUID(),
+      maxRows: 10,
+      timeoutMs: 30000,
+      maxBytes: 1024 * 1024,
+      lists: true,
+      parameters: { at: { type: 'datetime', value: '2026-03-08T02:30:00.5' }, ids: { type: 'text', value: ['1', '3'] } },
+    });
+    expect(answer.rows).toEqual([[1, 'DateTime64(6)', 'UTC', '2']]);
+  });
+
   test('the timeout: ClickHouse\'s own, in whole seconds', async () => {
     const e = await failure(run('SELECT sum(number) FROM numbers(1000000000000)', { timeoutMs: 1000 }));
     expect(e.code).toBe('timeout');

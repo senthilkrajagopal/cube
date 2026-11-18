@@ -469,7 +469,7 @@ describe('Athena', () => {
       expect(athena.stopped.has(athena.idOf(sql)!)).toBe(true);
     });
 
-    test('refused statements, held parameters and a scan cap never reach Athena (AC-1044, AC-1046, AC-1047)', async () => {
+    test('refused statements and a scan cap never reach Athena (AC-1044, AC-1046, AC-1047); parameters reach it as typed literals (R12)', async () => {
       const before = athena.statements().length;
       for (const sql of [
         'UNLOAD (SELECT * FROM t) TO \'s3://b/x/\'', 'CALL system.x()', 'INSERT INTO t SELECT 1', 'CREATE TABLE t AS SELECT 1',
@@ -477,12 +477,16 @@ describe('Athena', () => {
       ]) {
         expect([sql, (await failure(run(sql))).code]).toEqual([sql, 'not_read_only']);
       }
-      const held = await failure(run('SELECT {{n}}', { parameters: { n: { type: 'number', value: '1' } } }));
-      expect(held.code).toBe('parameters_unsupported');
+      expect(athena.statements().length).toBe(before);
+      // Parameters reach it written as typed literals.
+      const written = await run('SELECT {{n}}, {{t}}', { parameters: { n: { type: 'number', value: '1' }, t: { type: 'text', value: 'it\'s' } } }).catch((e: unknown) => e);
+      expect(written).not.toMatchObject({ code: 'invalid_parameters' });
+      expect(athena.statements().pop()).toBe('SELECT  DECIMAL \'1\' ,  \'it\'\'s\'');
+      const before2 = athena.statements().length;
       const capped = await failure(run('SELECT 1', { maxBytesBilled: 10 ** 9 }));
       expect(capped).toMatchObject({ code: 'cap_unsupported', reason: 'athena_workgroup_cutoff' });
       expect(capped.message).toMatch(/BytesScannedCutoffPerQuery/);
-      expect(athena.statements().length).toBe(before);
+      expect(athena.statements().length).toBe(before2);
     });
 
     test('a refused key fails the run without saying the key', async () => {

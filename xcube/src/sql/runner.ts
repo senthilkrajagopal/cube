@@ -437,7 +437,7 @@ async function snowflakeSession(driver: any, caps: SqlCaps): Promise<SqlSession>
 /** A value's BigQuery type: NUMERIC holds 29 digits before the point and 9 after; BIGNUMERIC, the rest. */
 function bigQueryType(bind: SqlBind): string {
   if (bind.type !== 'number') {
-    return { text: 'STRING', date: 'DATE', boolean: 'BOOL' }[bind.type];
+    return { text: 'STRING', date: 'DATE', datetime: 'DATETIME', boolean: 'BOOL' }[bind.type];
   }
   const [whole, part = ''] = String(bind.value).replace('-', '').split('.');
   return whole.length <= 29 && part.length <= 9 ? 'NUMERIC' : 'BIGNUMERIC';
@@ -583,6 +583,8 @@ async function oracleSession(driver: any, caps: SqlCaps): Promise<SqlSession> {
   const conn = await driver.pool._factory.create();
   try {
     conn.callTimeout = caps.timeoutMs;
+    // UTC, as every run's session is: a zoneless date and time is read so against an instant.
+    await conn.execute('ALTER SESSION SET TIME_ZONE = \'UTC\'');
     await conn.execute('SET TRANSACTION READ ONLY');
   } catch (e) {
     await quietly(() => conn.close());
@@ -712,6 +714,8 @@ export function clickhouseRunSettings(caps: SqlCaps, format: string): Record<str
     // First: a read-only query, whose settings may still be set (a login at readonly=1 can't run Cube's queries either).
     readonly: 2,
     default_format: format,
+    // UTC, as every run's session is: a DateTime64 parameter, which has no zone, is read so.
+    session_timezone: 'UTC',
     max_execution_time: Math.max(1, Math.ceil(caps.timeoutMs / 1000)),
     max_result_rows: caps.maxRows + 1,
     result_overflow_mode: 'break',
@@ -869,6 +873,8 @@ async function trinoSession(driver: any, caps: SqlCaps): Promise<SqlSession> {
           catalog: driver.config.catalog,
           schema: driver.config.schema,
           session: `query_max_run_time=${seconds}s`,
+          // UTC, as every run's session is: a TIMESTAMP literal is read so against an instant.
+          timezone: 'UTC',
           // The client's own clock, behind the run's: it kills the query too.
           timeout: seconds + 30,
           cancel: () => stopping || settled,
