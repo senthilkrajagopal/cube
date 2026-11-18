@@ -19,6 +19,7 @@
 import { randomUUID } from 'crypto';
 import { duckdbApi } from '../connections/duckdb';
 import { EngineDriver } from '../connections/engine';
+import { HiveError, type HiveDriver, type HiveOperation } from '../connections/hive';
 import { trinoError } from '../connections/trino';
 import type { Refused, StatementKind } from './classify';
 import type { SqlBind } from './parameters';
@@ -198,7 +199,7 @@ export interface SqlSession {
 export type Refuse = (message: string, statement: string, reason?: string) => never;
 
 export type SessionDialect = 'postgres' | 'redshift' | 'mysql' | 'snowflake' | 'bigquery' | 'mssql' | 'oracle' | 'dremio'
-  | 'duckdb' | 'clickhouse' | 'trino' | 'athena' | 'cubestore';
+  | 'duckdb' | 'clickhouse' | 'trino' | 'athena' | 'cubestore' | 'hive';
 
 /** A dialect no case took: the compiler holds every switch over them to all of them. */
 function unknownDialect(dialect: never): never {
@@ -1077,6 +1078,47 @@ async function duckdbSession(driver: any, caps: SqlCaps): Promise<SqlSession> {
 }
 
 /**
+ * Hive and Spark's Thrift server (HiveServer2's protocol): a connection of
+ * the run's own, the statement started asynchronously with the server's own
+ * time limit (`queryTimeout`), polled to its end, and its rows fetched a
+ * batch at a time. There is no read-only session: the check (`classify.ts`)
+ * and the account's grants are the guard. A cancel is CancelOperation.
+ */
+async function hiveSession(driver: HiveDriver, caps: SqlCaps): Promise<SqlSession> {
+  const connection = await driver.openConnection();
+  const seconds = Math.max(1, Math.ceil(caps.timeoutMs / 1000));
+  let op: HiveOperation | null = null;
+  let stopping = false;
+  return {
+    async run(statement, rows) {
+      // Where the server doesn't honour an OFFSET (Hive before 4), its rows are skipped here.
+      const plan = connection.offsetPlan(statement);
+      let { skip } = plan;
+      op = await connection.execute(plan.sql, seconds);
+      await connection.finish(op, () => stopping);
+      rows.setColumns((await connection.columns(op)).map((c) => ({ name: c.name, type: c.type })));
+      for (;;) {
+        const got = await connection.fetch(op, skip > 0 ? Math.min(skip, 10000) : batchOf(rows, caps.maxRows));
+        const skipped = Math.min(skip, got.length);
+        skip -= skipped;
+        // The server may answer fewer than asked before its last rows: only an empty batch ends them.
+        if (!got.length || !got.slice(skipped).every((row) => rows.add(row)) || !(await rows.ready())) {
+          break;
+        }
+      }
+    },
+    async cancel() {
+      stopping = true;
+      await quietly(() => connection.cancel(op));
+    },
+    async close() {
+      await quietly(() => connection.closeOperation(op));
+      await quietly(() => connection.close());
+    },
+  };
+}
+
+/**
  * Whether a Cube Store plan joins on its router: a join not under a
  * `ClusterSend`. Its router runs it, and nothing stops that once it starts
  * (`endsAtCubeStoreTimeout`); a join multiplies what it reads.
@@ -1204,6 +1246,8 @@ export function openSession(
       return driver instanceof EngineDriver ? engineSession(driver, caps) : duckdbSession(driver, caps);
     case 'cubestore':
       return cubeStoreSession(driver, refuse);
+    case 'hive':
+      return hiveSession(driver, caps);
     default:
       return unknownDialect(dialect);
   }
@@ -1256,6 +1300,9 @@ export function isTimeout(dialect: SessionDialect, e: any, ran?: { ms: number; t
     case 'trino':
       // EXCEEDED_TIME_LIMIT: its query_max_run_time; or the client's own clock.
       return code === 'EXCEEDED_TIME_LIMIT' || /query timed out/.test(message);
+    case 'hive':
+      // Its queryTimeout: the operation ends TIMEDOUT (or, on some versions, fails saying so).
+      return e instanceof HiveError && e.kind === 'timeout';
     case 'dremio':
     // It has no statement timeout: the run's clock interrupts it.
     case 'duckdb':

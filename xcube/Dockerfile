@@ -28,6 +28,17 @@ COPY tsconfig.json tsconfig.build.json ./
 COPY src src
 RUN npm run build
 
+# The package's own runtime dependencies, as its lock has them: hive-driver
+# and its Thrift client, pure JavaScript, beside the package (Cube's image has
+# an older thrift of its own, which they don't share). Peers are Cube's, already
+# in the image.
+FROM --platform=$BUILDPLATFORM node:24.22.1-trixie-slim AS runtime-deps
+
+WORKDIR /package
+
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --omit=peer --ignore-scripts --no-audit --no-fund
+
 # DuckDB's extensions, for the platform the image is built for, not the
 # builder's: fetched on the builder, they are only files. The pods never
 # download one (`autoinstall_known_extensions` is off), and DuckDB checks each
@@ -131,6 +142,7 @@ LABEL org.opencontainers.image.title="xcube" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 COPY --from=build /package/dist/src /cube/node_modules/xcube/dist/src
+COPY --from=runtime-deps /package/node_modules /cube/node_modules/xcube/node_modules
 COPY package.json NOTICE README.md /cube/node_modules/xcube/
 RUN rm -rf /cube/node_modules/@duckdb
 COPY --from=duckdb-node /duckdb-node/@duckdb /cube/node_modules/@duckdb

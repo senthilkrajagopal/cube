@@ -39,6 +39,18 @@ describe('admin routes', () => {
     await request(a).get(url).set('Authorization', `Bearer ${OLD_TOKEN}`).expect(200);
   });
 
+  test('drivers: every type xcube takes, each available, behind the token', async () => {
+    const { app: a } = app({});
+    const url = '/cubejs-api/v1/semantic/models/dev/drivers';
+    await request(a).get(url).expect(401);
+    const ok = await request(a).get(url).set('Authorization', `Bearer ${TOKEN}`).expect(200);
+    expect(ok.body.drivers.map((d: any) => d.type)).toEqual([
+      'postgres', 'redshift', 'mysql', 'snowflake', 'bigquery', 'mssql', 'oracle', 'dremio', 'duckdb', 'clickhouse', 'trino', 'athena', 'engine', 'hive',
+    ]);
+    expect(ok.body.drivers.every((d: any) => d.available === true && d.reason === undefined)).toBe(true);
+    await request(a).get('/cubejs-api/v1/semantic/models/Bad!/drivers').set('Authorization', `Bearer ${TOKEN}`).expect(400);
+  });
+
   test('are off without tokens', async () => {
     const { app: a, logs } = app({}, []);
     await request(a).get('/cubejs-api/v1/semantic/models/dev/revision').expect(404);

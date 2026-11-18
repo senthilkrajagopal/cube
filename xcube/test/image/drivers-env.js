@@ -46,6 +46,12 @@ const POISON = {
   CUBEJS_AWS_ATHENA_WORKGROUP: 'poison-workgroup',
   CUBEJS_AWS_ATHENA_CATALOG: 'poison-athena-catalog',
   CUBEJS_AWS_ATHENA_ASSUME_ROLE_ARN: 'arn:aws:iam::1:role/poison-role',
+  CUBEJS_DB_HIVE_TYPE: 'poison-hive-type',
+  CUBEJS_DB_HIVE_VER: 'poison-hive-ver',
+  CUBEJS_DB_HIVE_THRIFT_VER: 'poison-thrift-ver',
+  CUBEJS_DB_HIVE_CDH_VER: 'poison-cdh-ver',
+  CUBEJS_JDBC_URL: 'jdbc:poison://poison-jdbc-url',
+  CUBEJS_JDBC_DRIVER: 'poison.JdbcDriver',
   PGPASSWORD: 'poison-pgpassword',
   PGHOST: 'poison-pghost',
 };
@@ -85,6 +91,8 @@ const cases = {
   trino: [{ host: 'xc-host', port: 443, catalog: 'xc-catalog', schema: 'xc-schema', user: 'xc-user' }, 'password', { password: 'xc-password' }],
   'trino (jwt)': [{ host: 'xc-host', port: 443, catalog: 'xc-catalog', schema: 'xc-schema', user: 'xc-user' }, 'jwt', { token: 'xc-token' }, 'trino'],
   engine: [{ baseUrl: 'https://xc-engine.example:8443' }, 'service-token', { token: 'xc-token' }],
+  hive: [{ host: 'xc-host', port: 10000, database: 'xc-db', user: 'xc-user', ssl: true, sslCa: 'xc-ca' }, 'password', { password: 'xc-password' }],
+  'hive (username)': [{ host: 'xc-host', port: 10000, database: 'xc-db', user: 'xc-user', ssl: false }, 'username', {}, 'hive'],
   athena: [{ region: 'eu-west-1', workGroup: 'xc-workgroup', s3OutputLocation: 's3://xc-results/', catalog: 'xc-catalog', database: 'xc-db', accessKeyId: 'AKIAXCXCXCXCXCXCXCXC' }, 'access-key', { secretAccessKey: 'xc-secret' }],
 };
 

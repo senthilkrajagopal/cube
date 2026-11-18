@@ -15,7 +15,7 @@
  */
 
 export type SqlDialect = 'postgres' | 'redshift' | 'mysql' | 'snowflake' | 'bigquery' | 'mssql' | 'oracle' | 'dremio'
-  | 'duckdb' | 'clickhouse' | 'trino' | 'athena' | 'cubestore';
+  | 'duckdb' | 'clickhouse' | 'trino' | 'athena' | 'cubestore' | 'hive';
 
 export type StatementKind = 'select' | 'explain';
 
@@ -97,6 +97,14 @@ interface Rules {
   clickhouse: boolean;
   /** Trino: no `WITH SESSION` setting the query's session properties. */
   trino: boolean;
+  /** Hive and Spark: no variable, script, file read as a table, raw string, pipe, or comment Spark continues. */
+  hive: boolean;
+  /** A backslash in a quoted name is a character, whatever the reading (Hive's and Spark's backticks). */
+  namesTakeNoBackslash?: boolean;
+  /** `/*+ … *\/` is a hint the database acts on: refused. */
+  refuseHints?: boolean;
+  /** What may come between EXPLAIN and the statement, beyond the common options. */
+  explainOptions?: Set<string>;
   /** Names refused anywhere, unquoted: statements that write or lock, and the words that start them. */
   deniedWords: Set<string>;
   /** A called function's name (its last part) that acts outside the transaction. */
@@ -156,6 +164,7 @@ const base = {
   cubeStore: false,
   clickhouse: false,
   trino: false,
+  hive: false,
 } as const;
 
 /**
@@ -205,6 +214,21 @@ const TRINO_RULES: Rules = {
   deniedFunction: /^(query|raw_query)$/,
   deniedFunctionIs: { what: 'table function', why: 'it sends its SQL to the catalog\'s own database, which runs it as written' },
 };
+
+/**
+ * Hive's and Spark's functions that run code or read files of the server's:
+ * call a Java method by name, or read a file (`in_file`).
+ */
+const HIVE_FUNCTIONS = /^(reflect|reflect2|java_method|try_reflect|in_file)$/;
+
+/** Spark's file formats, read as a table by a path: ``parquet.`/data/x` ``. */
+const SPARK_FILE_FORMATS = new Set(['parquet', 'orc', 'json', 'csv', 'text', 'avro', 'binaryfile', 'jdbc', 'delta', 'xml', 'iceberg', 'hudi']);
+
+/** Hive's EXPLAIN options, and Spark's; ANALYZE (it runs the statement) and REOPTIMIZATION (it does too) aren't. */
+const HIVE_EXPLAIN_OPTIONS = new Set([
+  'EXTENDED', 'FORMATTED', 'DEPENDENCY', 'AUTHORIZATION', 'LOCKS', 'VECTORIZATION', 'ONLY', 'SUMMARY', 'OPERATOR', 'EXPRESSION',
+  'DETAIL', 'CBO', 'COST', 'JOINCOST', 'AST', 'DEBUG', 'DDL', 'CODEGEN',
+]);
 
 const RULES: Record<SqlDialect, Rules> = {
   postgres: {
@@ -316,6 +340,22 @@ const RULES: Record<SqlDialect, Rules> = {
     readings: readings([true], [false]),
     deniedWords: new Set(WRITES),
   },
+  // Apache Hive and Spark SQL (its Thrift server): a statement passes both readings.
+  hive: {
+    ...base,
+    doubleQuote: 'string',
+    backtick: true,
+    namesTakeNoBackslash: true,
+    refuseHints: true,
+    hive: true,
+    explainOptions: HIVE_EXPLAIN_OPTIONS,
+    // A backslash escapes in strings (Spark's escapedStringLiterals off, as by default); Spark's comments nest, Hive's don't.
+    readings: readings([true], BOTH),
+    // TRANSFORM, REDUCE and MAP … USING, which run a script of the server's on the rows: `checkHive`.
+    deniedWords: new Set(WRITES),
+    deniedFunction: HIVE_FUNCTIONS,
+    deniedFunctionIs: { what: 'function', why: 'it runs code or reads files on the server' },
+  },
 };
 
 /** Its tables of cached results and queued queries, every model's: what Cube Store's cache and queue commands read. */
@@ -406,6 +446,9 @@ function lex(sql: string, rules: Rules, reading: Reading): Lexed {
       if (rules.executableComments && (sql[i + 2] === '!' || (sql[i + 2] === 'M' && sql[i + 3] === '!'))) {
         throw new LexError('MySQL runs what an executable comment (/*! … */) holds: it is refused', i);
       }
+      if (rules.refuseHints && sql[i + 2] === '+') {
+        throw new LexError('a hint (/*+ … */) is refused: the database acts on it', i);
+      }
       let depth = 1;
       let j = i + 2;
       while (j < n && depth > 0) {
@@ -434,7 +477,7 @@ function lex(sql: string, rules: Rules, reading: Reading): Lexed {
       push('string', sql.slice(i, end), i, end);
       i = end;
     } else if (c === '"' || (c === '`' && rules.backtick)) {
-      const end = quoted(i, c, 1, reading.backslash, 'a quoted name');
+      const end = quoted(i, c, 1, reading.backslash && !rules.namesTakeNoBackslash, 'a quoted name');
       push('quoted', sql.slice(i + 1, end - 1).replace(c === '"' ? /""/g : /``/g, c), i, end);
       i = end;
     } else if (c === '[' && rules.brackets) {
@@ -550,6 +593,51 @@ function wordForms(word: string): string[] {
   return [...new Set([word, word.toUpperCase(), word.normalize('NFKC').toUpperCase()])];
 }
 
+/**
+ * Hive's and Spark's own, beyond the words and functions refused anywhere:
+ * - TRANSFORM, REDUCE and MAP as clauses, `… USING 'script'`, which run a
+ *   script of the server's (not Spark's `transform(…)`, `reduce(…)` and `map(…)`);
+ * - `${…}`, anywhere: a server whose variable substitution is on replaces it,
+ *   strings and comments included, before it parses the statement, with the
+ *   server's environment (`${env:…}`, `${system:…}`) or its settings;
+ * - a `--` comment ending in a backslash, which Spark continues onto the next
+ *   line and Hive doesn't;
+ * - a raw string, `r'…'`, Spark's only: Hive reads its backslashes as escapes;
+ * - a file read as a table, ``parquet.`/data/x` ``;
+ * - Spark's pipe syntax, `|>`.
+ */
+function checkHive(sql: string, lexed: Lexed, refuse: (message: string, refused?: Refused) => never) {
+  const { tokens, comments } = lexed;
+  if (sql.includes('${')) {
+    refuse('The statement holds ${, which Hive and Spark replace with a variable (the server\'s environment among them) before reading it: write it otherwise, such as \'\\u0024{\'', { kind: 'clause', name: '${' });
+  }
+  for (const [start, end] of comments) {
+    if (sql.startsWith('--', start) && sql.slice(start, end).replace(/\r$/, '').endsWith('\\')) {
+      refuse('A -- comment ends in a backslash, which Spark reads as continuing the comment onto the next line and Hive doesn\'t');
+    }
+  }
+  for (let k = 0; k < tokens.length; k++) {
+    const t = tokens[k];
+    const next = tokens[k + 1];
+    if (t.kind === 'string' && isWord(tokens[k - 1], 'R') && tokens[k - 1].end === t.start) {
+      refuse('A raw string (r\'…\') is Spark\'s, and Hive reads its backslashes otherwise: write it as an ordinary string');
+    }
+    // `TRANSFORM (…) USING 'script'`, `MAP … USING`, `REDUCE … USING`: a script's USING takes a string,
+    // where a join's takes columns. Spark's transform(), reduce() and map() functions are reads.
+    if (isWord(t, 'USING') && next?.kind === 'string') {
+      const clause = [...tokens.slice(0, k)].reverse().find((w) => isWord(w, 'TRANSFORM', 'MAP', 'REDUCE'))?.value ?? 'USING';
+      refuse(`${clause} … USING runs a script of the server's on the rows: only reads run here`, { kind: 'clause', name: clause });
+    }
+    if (t.kind === 'word' && isOp(next, '.') && tokens[k + 2]?.kind === 'quoted' && sql[tokens[k + 2].start] === '`'
+      && (SPARK_FILE_FORMATS.has(t.value.toLowerCase()) || /[/:]/.test(tokens[k + 2].value))) {
+      refuse(`${t.value.toLowerCase()}.\`…\` reads a file as a table: only the data source's tables are read here`, { kind: 'clause', name: 'FILE' });
+    }
+    if (isOp(t, '|') && isOp(next, '>') && t.end === next.start) {
+      refuse('Spark\'s pipe syntax (|>) isn\'t read here: write the query as a SELECT', { kind: 'clause', name: '|>' });
+    }
+  }
+}
+
 /** Checks one reading of a statement: what it is, and that it is a read. */
 function check(sql: string, rules: Rules, reading: Reading, redacted: () => string): { statement: StatementKind; cut: number | null } {
   let lexed: Lexed;
@@ -631,7 +719,7 @@ function check(sql: string, rules: Rules, reading: Reading, redacted: () => stri
           refuse('EXPLAIN ANALYZE runs the statement: only EXPLAIN without ANALYZE runs here', 'explain');
         } else if (isWord(t, 'WITH') && isWord(tokens[at + 1], 'IMPLEMENTATION')) {
           at += 2;
-        } else if ((t?.kind === 'word' && EXPLAIN_OPTIONS.has(t.value)) || isOp(t, '=')) {
+        } else if ((t?.kind === 'word' && (EXPLAIN_OPTIONS.has(t.value) || rules.explainOptions?.has(t.value))) || isOp(t, '=')) {
           at += 1;
         } else {
           break;
@@ -691,6 +779,9 @@ function check(sql: string, rules: Rules, reading: Reading, redacted: () => stri
   if (rules.clickhouse) {
     checkClickHouse(tokens, (message, refused) => refuse(message, statement, 'not_read_only', refused));
   }
+  if (rules.hive) {
+    checkHive(sql, lexed, (message, refused) => refuse(message, statement, 'not_read_only', refused));
+  }
   // `WITH SESSION query_max_run_time = '1h' SELECT …`; a query named session is `WITH session AS (…)`.
   if (rules.trino && isWord(tokens[query], 'WITH') && isWord(tokens[query + 1], 'SESSION')
     && !isWord(tokens[query + 2], 'AS') && !isOp(tokens[query + 2], '(')) {
@@ -714,6 +805,43 @@ function check(sql: string, rules: Rules, reading: Reading, redacted: () => stri
     }
   }
   return { statement, cut };
+}
+
+/**
+ * A Hive statement's last clause, `LIMIT n OFFSET m` at its top level, as
+ * the statement with `LIMIT n + m` in its place and the `m` rows to skip:
+ * Hive before 4 ignores an OFFSET after an ORDER BY, and Spark before 3.4
+ * has none. `null` for a statement that doesn't end so.
+ */
+export function hiveTrailingOffset(sql: string): { sql: string; skip: number } | null {
+  const rules = RULES.hive;
+  let tokens: Token[];
+  try {
+    ({ tokens } = lex(sql, rules, rules.readings[0]));
+    nest(tokens, sql.length);
+  } catch {
+    return null;
+  }
+  while (isOp(tokens[tokens.length - 1], ';')) {
+    tokens = tokens.slice(0, -1);
+  }
+  const [limit, n, offset, m] = tokens.slice(-4);
+  const whole = (t: Token | undefined) => t?.kind === 'number' && /^[0-9]+$/.test(t.value);
+  if (!isWord(limit, 'LIMIT') || !isWord(offset, 'OFFSET') || limit.depth !== 0 || !whole(n) || !whole(m)) {
+    return null;
+  }
+  const rows = Number(n.value) + Number(m.value);
+  return { sql: `${sql.slice(0, limit.start)}LIMIT ${Math.min(rows, 2147483647)}`, skip: Number(m.value) };
+}
+
+/**
+ * The places of a Hive statement's `?` placeholders, as Hive's lexer reads
+ * it: never a `?` in a string, a quoted name or a comment. For Cube's SQL,
+ * whose values the driver writes in as literals (`hive.ts`).
+ */
+export function hivePlaceholders(sql: string): number[] {
+  const rules = RULES.hive;
+  return lex(sql, rules, rules.readings[0]).tokens.filter((t) => isOp(t, '?')).map((t) => t.start);
 }
 
 /**

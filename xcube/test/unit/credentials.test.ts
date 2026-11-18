@@ -191,3 +191,36 @@ describe('the engine token\'s vector, scheme v1', () => {
     }
   });
 });
+
+// The hive driver's password (wechart's db_support R3, R11.1), in golden-v1.json's form, sealed to the
+// development key: xcube's own vector, for wechart's sealing test (test/fixtures/hive-vector-v1.json).
+describe('the hive password\'s vector, scheme v1', () => {
+  const fixtures = path.join(__dirname, '..', 'fixtures');
+  const vector = JSON.parse(fs.readFileSync(path.join(fixtures, 'hive-vector-v1.json'), 'utf8'));
+
+  test('binds the password to host, port, ssl, sslCa and sslRejectUnauthorized, byte for byte', () => {
+    expect(vector.aad.length).toBe(2);
+    for (const entry of vector.aad) {
+      expect(secretAadV1(entry.driver, entry.field, entry.fields).toString('utf8')).toBe(entry.aad);
+    }
+  });
+
+  test('opens with the development key for exactly its target, and for no other value of any of it', () => {
+    const key = generateCredentialKey(fs.readFileSync(path.join(fixtures, 'wechart-golden-v1', 'dev-credential-key.pem'), 'utf8'));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xcube-hive-vector-'));
+    try {
+      fs.writeFileSync(path.join(dir, `${key.kid}.pem`), key.pem);
+      fs.writeFileSync(path.join(dir, `${key.kid}.check`), key.check);
+      const keys = new CredentialKeys(dir, [key.kid], key.kid);
+      const [{ driver, field, fields, secret, envelope }] = vector.envelopes;
+      expect(keys.open(envelope, driver, field, fields)).toBe(secret);
+      for (const bound of ['host', 'port', 'ssl', 'sslRejectUnauthorized', 'sslCa']) {
+        expect(() => keys.open(envelope, driver, field, { ...fields, [bound]: 'elsewhere' })).toThrow(CredentialError);
+      }
+      // The database isn't the target: changing it keeps the password.
+      expect(keys.open(envelope, driver, field, { ...fields, database: 'other' })).toBe(secret);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

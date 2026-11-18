@@ -20,6 +20,8 @@
  */
 import { CubejsServerCore } from '@cubejs-backend/server-core';
 
+import { XcubeHiveQuery } from './hive-dialect';
+
 type DialectClass = new (...args: any[]) => any;
 
 type DialectContext = { dataSource?: string; dbType?: string; [key: string]: unknown };
@@ -110,7 +112,7 @@ export function xcubeDuckDBQuery(): DialectClass {
 
 /**
  * Cube's `dialectFactory`, with xcube's dialects: cube.js's own where it names
- * one, else xcube's for DuckDB, else the driver's, as Cube's default picks it.
+ * one, else xcube's for DuckDB and Hive, else the driver's, as Cube's default picks it.
  */
 export function dialectFactory(given?: DialectFactory): DialectFactory {
   return (context) => {
@@ -120,6 +122,9 @@ export function dialectFactory(given?: DialectFactory): DialectFactory {
     }
     if (context.dbType === 'duckdb') {
       return xcubeDuckDBQuery();
+    }
+    if (context.dbType === 'hive') {
+      return XcubeHiveQuery;
     }
     const driverClass = CubejsServerCore.lookupDriverClass(context.dbType as any) as any;
     return driverClass?.dialectClass ? driverClass.dialectClass() : undefined;

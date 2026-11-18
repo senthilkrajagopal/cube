@@ -590,7 +590,8 @@ xcube's credential key, so the client stores them and can't open them.
 
 **Drivers.** `postgres`, `redshift`, `mysql`, `snowflake`, `bigquery`, `mssql`,
 `oracle`, `dremio`, `duckdb`, `clickhouse`, `trino` and `athena`, through Cube's own drivers,
-and `engine`, wechart's in-memory engine, through xcube's:
+and `engine`, wechart's in-memory engine, and `hive` (Apache Hive and Spark's
+Thrift server), through xcube's:
 
 | Driver | Auth methods | Target (what a secret is bound to) |
 | --- | --- | --- |
@@ -607,8 +608,9 @@ and `engine`, wechart's in-memory engine, through xcube's:
 | `trino` | `password`, `jwt` | host, port, sslRejectUnauthorized, sslCa |
 | `athena` | `access-key`, `pod-role` | region, workGroup |
 | `engine` | `service-token` | baseUrl, sslRejectUnauthorized, sslCa |
+| `hive` | `username` (SASL PLAIN, a placeholder password), `password` | host, port, ssl, sslRejectUnauthorized, sslCa |
 
-DuckDB, ClickHouse, Trino and Athena connections are read-only:
+DuckDB, ClickHouse, Trino, Athena and Hive connections are read-only:
 - **Rollups are built in Cube Store only.** A publish refuses a cube on one
   of them with a pre-aggregation built in the source (`external: false`, or
   `original_sql`).
@@ -618,6 +620,44 @@ DuckDB, ClickHouse, Trino and Athena connections are read-only:
   Store or anywhere: the engine is the fast path.
 - **`pod-role` is off by default.** It signs in as the Cube pods' own AWS role,
   and needs `XCUBE_ALLOW_POD_ROLE=true`.
+
+**Hive** (`src/connections/hive.ts`) is xcube's driver over the `hive-driver`
+package's Thrift client (1.0.1, thrift 0.23), not Cube's deprecated one, for
+Apache Hive's HiveServer2 and Spark's Thrift server.
+- **Transport.** Binary only, TLS on by default and checked
+  (`rejectUnauthorized`, `servername` and `sslCa` set by xcube: the package
+  checks nothing by default). No Kerberos and no HTTP transport.
+- **Sign-in.** SASL PLAIN: `username` sends the user and the placeholder
+  password `anonymous` (HiveServer2 refuses an empty one; a `NONE` server reads
+  none), `password` the user's own.
+- **Session.** Protocol V10 asked, V6 the oldest taken (older ones answer rows,
+  not columns). It opens in the connection's `database`, with
+  `hive.variable.substitute` and `spark.sql.variable.substitute` off (a server
+  substitutes `${env:…}` into a statement's text, strings included) and
+  columns named as selected, not `table.column`.
+- **Safety.** Every error of a connection is listened for before it connects;
+  connecting and signing in (15 s), each call (60 s) and each fetch (5 min)
+  have deadlines; a call is raced against the connection closing, and a
+  connection that failed is dropped, never reused (the client doesn't
+  reconnect). Statements run asynchronously, their status polled from 50 ms
+  to 1 s apart. Each data source has its own pool, of 8 by default.
+- **Cells.** Read from the raw column sets: BIGINT from its 64 bits (past 2^53
+  as its digits), DECIMAL, DATE and TIMESTAMP as the server's strings, a
+  timestamp with local time zone with its offset, binary as `\x` and hex.
+- **Cube's SQL.** Its `?` values are written in as literals (HiveServer2 binds
+  none), found by Hive's lexer, strings escaped with backslashes and `$` as
+  `\u0024`. The dialect (`src/model/hive-dialect.ts`) is Cube's `HiveQuery`
+  made to work under Tesseract: backtick names, GROUP BY by expression, LIMIT
+  before OFFSET, every granularity as a TIMESTAMP (quarter added), and LIKE
+  instead of ILIKE with a pattern that depends on the row, because Hive 4's
+  vectorized LIKE ignores a backslash-escaped `%` or `_` in a constant pattern.
+- **OFFSET.** Hive before 4 ignores an OFFSET after an ORDER BY (and
+  miscounts one after a subquery's), and Spark before 3.4 has none. On those
+  (the server's name and version, from GetInfo), a statement ending in a
+  top-level `LIMIT n OFFSET m` runs as `LIMIT n + m`, and the driver skips the
+  first `m` rows: Cube's queries and the SQL runner's alike.
+- **SQL runner.** One `ExecuteStatement` with the run's `queryTimeout`;
+  `CancelOperation` stops it. No bound values (`parameters_unsupported`).
 
 **DuckDB** runs in Cube's own process, one instance per connection (`src/connections/duckdb.ts`).
 - **Kinds.**
@@ -966,6 +1006,17 @@ top of them:
      their SQL to a catalog's own database, and a `WITH SESSION` prefix: the
      runner sets the session.
    - Athena's are Trino's, and `UNLOAD`, which writes a result to S3.
+   - Hive's and Spark's (one dialect: a statement passes both readings):
+     `TRANSFORM`, `REDUCE` and `MAP … USING`, which run a script of the
+     server's; `reflect`, `reflect2`, `java_method`, `try_reflect` and
+     `in_file`; a file read as a table (``parquet.`/data/x` ``); Spark's pipe
+     syntax `|>`; `EXPLAIN ANALYZE` and `EXPLAIN REOPTIMIZATION`, which run
+     the statement; hints (`/*+ … */`); Spark's raw strings (`r'…'`), which
+     Hive reads otherwise; a `--` comment ending in a backslash, which Spark
+     continues onto the next line; and `${` anywhere, strings and comments
+     included, which a server with variable substitution on replaces with
+     its environment (`${env:…}`) or settings before parsing. A backslash in
+     a backtick name is a character, as on both.
    - ClickHouse's FROM clause calls only `numbers`, `zeros`,
      `generate_series`, `generateRandom`, `values`, `null`, `view`, `merge`,
      `format` and `dictionary`, and a statement's own `SETTINGS` or `FORMAT`
@@ -987,15 +1038,17 @@ top of them:
    BigQuery's dry run must call the statement a `SELECT` before it runs.
    ClickHouse runs it with `readonly=2`, so its login must not be at
    `readonly=1` (Cube's own queries set settings too). DuckDB has its
-   instance's lock (see DuckDB above). Snowflake, Dremio, Trino and Athena
-   have the check alone.
+   instance's lock (see DuckDB above). Snowflake, Dremio, Trino, Athena and
+   Hive have the check alone.
 4. **A connection of the run's own**, a pool of one, never one Cube serves
    with, dropped afterwards: nothing it sets outlives the run.
 
 What only a SELECT-only login closes: a SELECT calling a function that writes,
 on Snowflake (external functions), SQL Server and Dremio; and on Oracle a
 function with an autonomous transaction; and on Trino whatever a catalog's
-connector does on a read.
+connector does on a read; on Hive and Spark a user's own UDFs, and views
+(an operator should also set `hive.server2.builtin.udf.blacklist=reflect,reflect2,java_method,in_file`,
+`hive.variable.substitute=false` and SQL-standard authorization).
 
 **Caps per run**, sent with each run (R50's by default):
 - **Rows** (`maxRows`, 10,000; at most 100,000): read as they come, one past
@@ -1593,10 +1646,10 @@ none were known yet):
 
 | Status | `code` | |
 | --- | --- | --- |
-| 400 | `not_read_only` | The check refused it; `statement` is its kind (`insert`, `select` …). Refused for a name, it carries `refused: { kind, name }`: `function` (lowercased, `url`), `table_function` (ClickHouse's, `mergetreeindex`) or `clause` (ClickHouse's `SETTINGS`, `FORMAT`). Cube Store's router joins carry `reason: "cubestore_router_join"` |
+| 400 | `not_read_only` | The check refused it; `statement` is its kind (`insert`, `select` …). Refused for a name, it carries `refused: { kind, name }`: `function` (lowercased, `url`), `table_function` (ClickHouse's, `mergetreeindex`) or `clause` (ClickHouse's `SETTINGS`, `FORMAT`; Hive's `TRANSFORM`, `MAP`, `REDUCE`, `FILE`, `|>`, `${`). Cube Store's router joins carry `reason: "cubestore_router_join"` |
 | 400 | `several_statements` | |
 | 400 | `invalid_parameters` | `reason`: `missing_value`, `unused_value`, `malformed_placeholder`, `placeholder_written` (a `$1`, `?`, `@x` or `:x` written by hand), `invalid_value` |
-| 400 | `parameters_unsupported` | `reason`: `dremio`, `trino`, `athena`, `cubestore`, `oracle_boolean` |
+| 400 | `parameters_unsupported` | `reason`: `dremio`, `trino`, `athena`, `cubestore`, `hive`, `oracle_boolean` |
 | 400 | `cap_unsupported` | `reason`: `athena_workgroup_cutoff` (a `maxBytesBilled` on Athena) |
 | 404 | `unknown_connection`, `unknown_overlay` | |
 | 409 | `run_in_progress` | A run of this `runId` runs |
@@ -1721,6 +1774,14 @@ Not per model, so a service token naming a model can't use them:
 Not per model: this pod's DuckDB instances, `{ open, max, busy, waiting }`.
 `open` counts those opening and closing too; `busy` the queries and runs
 holding one; `waiting` those waiting for one.
+
+#### `GET …/drivers`
+
+The driver types a connection may use, for the client's catalog of what it
+can offer: `{ drivers: [{ type, available, reason? }] }`, in the order of
+`DRIVER_TYPES`. The same for every model. Every type is available today; a
+JDBC type will be available only where its vendor jar is mounted, with a
+`reason` naming the type and directory where it isn't.
 
 #### `GET …/meta`
 

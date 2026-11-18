@@ -251,3 +251,54 @@ status="$(conn POST /connections/default/sql '{"sql": "SELECT id, amount FROM pu
 status="$(conn POST /connections/default/sql '{"sql": "DELETE FROM public.serving_check", "runId": "image-check-2"}')"
 [ "$status" = 400 ] && grep -q '"code":"not_read_only"' /tmp/xcube-admin.json || { echo "a write answered $status: $(cat /tmp/xcube-admin.json)"; exit 1; }
 echo "SQL runner check passed: read-only SQL on the connection, capped, a write refused."
+
+# The drivers a connection may use, `hive` among them (wechart's db_support R2).
+status="$(signed GET /drivers)"
+[ "$status" = 200 ] && grep -q '{"type":"hive","available":true}' /tmp/xcube-admin.json || { echo "the drivers answered $status: $(cat /tmp/xcube-admin.json)"; exit 1; }
+echo "Drivers check passed: hive is listed, available."
+
+# Hive (wechart's db_support R4 test 3), when given a HiveServer2 the container reaches as
+# HIVE_HOST (host:port, SASL PLAIN as `hive`, no password), where `hive` may create a table.
+if [ -n "${HIVE_HOST:-}" ]; then
+  # The table, made with the image's own driver (outside the SQL runner, which writes nothing).
+  docker run --rm --network "$DOCKER_NETWORK" --entrypoint node "$IMAGE" -e '
+    const { HiveConnection } = require("/cube/node_modules/xcube/dist/src/connections/hive");
+    const [host, port] = process.argv[1].split(":");
+    (async () => {
+      const c = await HiveConnection.open({ flavour: "hive", host, port: Number(port), database: "default", ssl: false, mechanism: "plain", user: "hive" });
+      for (const sql of ["DROP TABLE IF EXISTS default.serving_check_hive", "CREATE TABLE default.serving_check_hive (id INT, d DECIMAL(38,9))",
+        "INSERT INTO default.serving_check_hive VALUES (1, 12345678901234567890.123456789)"]) {
+        await c.all(sql, 600, () => false);
+      }
+      await c.close();
+    })().catch((e) => { console.error(e.message); process.exit(1); });
+  ' -- "$HIVE_HOST"
+  hive_fields="{\"host\": \"${HIVE_HOST%:*}\", \"port\": ${HIVE_HOST##*:}, \"database\": \"default\", \"ssl\": false, \"user\": \"hive\"}"
+  hive() {
+    curl -s -o /tmp/xcube-admin.json -w '%{http_code}' -X "$1" \
+      -H "Authorization: Bearer $service" -H 'Content-Type: application/json' \
+      ${3:+--data "$3"} "$CUBE_URL/cubejs-api/v1/semantic/models/hivecheck$2"
+  }
+  status="$(hive POST /connections/test "{\"driver\": \"hive\", \"authMethod\": \"username\", \"fields\": $hive_fields}")"
+  [ "$status" = 200 ] && grep -q '"ok":true' /tmp/xcube-admin.json || { echo "the hive connection test answered $status: $(cat /tmp/xcube-admin.json)"; exit 1; }
+  status="$(hive PUT /connections/hive "{\"baseVersion\": null, \"folderId\": \"froot\", \"driver\": \"hive\", \"authMethod\": \"username\", \"fields\": $hive_fields}")"
+  [ "$status" = 200 ] || { echo "the hive connection answered $status"; cat /tmp/xcube-admin.json; exit 1; }
+  status="$(hive PUT /snapshot '{"baseRevision": null, "folders": [{"id": "froot", "parentId": null}], "items": [{"folderId": "froot", "name": "on_hive", "kind": "cube", "yaml": "cubes:\n  - name: on_hive\n    data_source: hive\n    sql_table: default.serving_check_hive\n    dimensions:\n      - name: id\n        sql: id\n        type: number\n        primary_key: true\n    measures:\n      - name: biggest\n        sql: d\n        type: max\n      - name: n\n        type: count\n"}]}')"
+  case "$status" in 200|201) ;; *) echo "the hive model's snapshot answered $status"; cat /tmp/xcube-admin.json; exit 1 ;; esac
+  hive_revision="$(sed -E 's/.*"revision":([0-9]+).*/\1/' /tmp/xcube-admin.json)"
+  hive_token="$(node -e '
+    const crypto = require("crypto");
+    const part = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
+    const body = `${part({ alg: "HS256", typ: "JWT" })}.${part({ wechartModel: "hivecheck", wechartRevision: Number(process.argv[2]) })}`;
+    console.log(`${body}.${crypto.createHmac("sha256", process.argv[1]).update(body).digest("base64url")}`);
+  ' -- "$API_SECRET" "$hive_revision")"
+  answer="$(curl -s -H "Authorization: $hive_token" -H 'Content-Type: application/json' \
+    --data '{"query": {"measures": ["on_hive.biggest", "on_hive.n"]}}' "$CUBE_URL/cubejs-api/v1/load")"
+  echo "$answer" | grep -q '"on_hive.biggest":"12345678901234567890.123456789"' \
+    || { echo "a query on Hive got: $(echo "$answer" | head -c 400)"; exit 1; }
+  status="$(hive POST /connections/hive/sql '{"sql": "SELECT d FROM default.serving_check_hive", "runId": "image-hive-1"}')"
+  [ "$status" = 200 ] && grep -q '"12345678901234567890.123456789"' /tmp/xcube-admin.json || { echo "a Hive SQL run answered $status: $(cat /tmp/xcube-admin.json)"; exit 1; }
+  status="$(hive POST /connections/hive/sql '{"sql": "SELECT '"'"'${env:HOME}'"'"'", "runId": "image-hive-2"}')"
+  [ "$status" = 400 ] && grep -q '"code":"not_read_only"' /tmp/xcube-admin.json || { echo "a \${ answered $status: $(cat /tmp/xcube-admin.json)"; exit 1; }
+  echo "Hive check passed: a cube on a hive connection answers its DECIMAL(38,9) whole, and the SQL runner reads it and refuses \${."
+fi

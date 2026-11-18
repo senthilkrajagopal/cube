@@ -1,0 +1,49 @@
+{
+  "about": "The hive driver's password, scheme v1, in golden-v1.json's form: `aad` and `envelopes` entries, sealed to the same development key (dev-credential-key.pub.jwk). Development values only.",
+  "aad": [
+    {
+      "driver": "hive",
+      "field": "password",
+      "fields": {
+        "host": "hive.example",
+        "port": 10000,
+        "database": "default"
+      },
+      "aad": "[\"wechart/data-source-secret/v1\",\"hive\",\"password\",[[\"host\",\"hive.example\"],[\"port\",\"10000\"],[\"ssl\",\"\"],[\"sslCa\",\"\"],[\"sslRejectUnauthorized\",\"\"]]]"
+    },
+    {
+      "driver": "hive",
+      "field": "password",
+      "fields": {
+        "host": "hive.example",
+        "port": 10001,
+        "database": "sales",
+        "ssl": true,
+        "sslRejectUnauthorized": true,
+        "sslCa": "-----BEGIN CERTIFICATE-----\nMIIgolden\n-----END CERTIFICATE-----"
+      },
+      "aad": "[\"wechart/data-source-secret/v1\",\"hive\",\"password\",[[\"host\",\"hive.example\"],[\"port\",\"10001\"],[\"ssl\",\"true\"],[\"sslCa\",\"-----BEGIN CERTIFICATE-----\\nMIIgolden\\n-----END CERTIFICATE-----\"],[\"sslRejectUnauthorized\",\"true\"]]]"
+    }
+  ],
+  "envelopes": [
+    {
+      "driver": "hive",
+      "field": "password",
+      "fields": {
+        "host": "hive.example",
+        "port": 10001,
+        "database": "sales",
+        "ssl": true,
+        "sslRejectUnauthorized": true,
+        "sslCa": "-----BEGIN CERTIFICATE-----\nMIIgolden\n-----END CERTIFICATE-----"
+      },
+      "secret": "hive-dev-password",
+      "envelope": {
+        "v": 1,
+        "kid": "uYWeMx6i173fsiolFp1xi-qiav50k52AGinM56Y8JEw",
+        "enc": "AUMCpJzDE9U6ccPrJ69vblHdHKu4_61EdGLTRR8p6lg",
+        "ct": "p31h7D1Hzf-INcS0_rOVYa27sR1v0tDtTXrvCfehNJ7qUZZ0GYZneWIwkjTPelMLzlnMcW9_q7QPbIGSI1V99727tXkh0RT2-qYqmqDEzb9OHA1CNiFgUYieTSqIxck75w_YhAodxSSutELTIRHaWmTMp5h6IEuSKx2MtGzwb3NoEgYY4u8C2xkryDjc7ogiw_VrLQzhM1swZKCXyYr4q4hvpN3SJ3rjW9qwJj1eqxV4cSGX-ap19dslJOL6yH2snTURcT71lf2IE79TjI0cgrBwYXp5Z_Z9NQr0NXBx3q4Ds4MS5AOMfJIRqSTuV7pBo4JODjAFj6sRuGFDiJ491Oy8yBPCIbUs2pSL-X0VnkQ"
+      }
+    }
+  ]
+}

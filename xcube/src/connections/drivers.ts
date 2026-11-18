@@ -16,10 +16,11 @@ import { makeClickHouseDriver } from './clickhouse';
 import { makeDuckdbDriver } from './duckdb';
 import { baseUrlProblems, makeEngineDriver } from './engine';
 import { withoutEnv } from './env';
+import { makeHiveDriver } from './hive';
 import { makeTrinoDriver } from './trino';
 
 export const DRIVER_TYPES = [
-  'postgres', 'redshift', 'mysql', 'snowflake', 'bigquery', 'mssql', 'oracle', 'dremio', 'duckdb', 'clickhouse', 'trino', 'athena', 'engine',
+  'postgres', 'redshift', 'mysql', 'snowflake', 'bigquery', 'mssql', 'oracle', 'dremio', 'duckdb', 'clickhouse', 'trino', 'athena', 'engine', 'hive',
 ] as const;
 
 export type DriverType = (typeof DRIVER_TYPES)[number];
@@ -198,6 +199,19 @@ const awsAccessKey = [text('accessKeyId', { required: true }), secret('secretAcc
 const engineCheck = (f: Fields) => baseUrlProblems(f.baseUrl);
 
 const clickhouseCheck = (f: Fields) => [...hostProblems(f), ...unsafeNames(f, ['database'])];
+
+/**
+ * What a value that a driver writes into a connection string or a statement
+ * can't hold: a quote, a backtick, `;`, a backslash, whitespace, a comment's
+ * start, or a character that separates a URL's options or parts.
+ */
+const OPTION_UNSAFE = /['"`;\\\s,=&?@:/{}]|--|\/\*/;
+
+const optionUnsafe = (fields: Fields, keys: string[]) => keys
+  .filter((key) => typeof fields[key] === 'string' && OPTION_UNSAFE.test(fields[key] as string))
+  .map((key) => `${key} can't hold a quote, a backtick, whitespace, -- or /*, or any of ; \\ , = & ? @ : / { }`);
+
+const hiveCheck = (f: Fields) => [...hostProblems(f), ...optionUnsafe(f, ['database'])];
 
 const trinoCheck = (f: Fields) => [...hostProblems(f), ...unsafeNames(f, ['catalog', 'schema'])];
 
@@ -608,7 +622,55 @@ export const DRIVERS: Record<DriverType, DriverSpec> = {
     },
     make: makeEngineDriver,
   },
+  /**
+   * Apache Hive (HiveServer2) or Spark's Thrift server, over the binary
+   * transport, with or without TLS: SASL PLAIN, a user alone (its password a
+   * placeholder) or a user and password. xcube's driver (`hive.ts`).
+   */
+  hive: {
+    cubeType: 'hive',
+    connection: [text('host', { required: true }), text('port', { kind: 'number' }), text('database', { required: true }), ...tlsFields],
+    auth: {
+      username: [text('user', { required: true })],
+      password: [text('user', { required: true }), secret('password')],
+    },
+    target: ['host', 'port', ...TLS_TARGET],
+    check: hiveCheck,
+    config(f, auth, s) {
+      checked(this, f, auth);
+      const ssl = tls(f, s, false, true);
+      return {
+        flavour: 'hive',
+        host: str(f.host),
+        port: num(f.port, 10000),
+        database: str(f.database),
+        ssl: ssl ? { rejectUnauthorized: ssl.rejectUnauthorized, ca: ssl.ca } : false,
+        mechanism: 'plain',
+        user: str(f.user),
+        password: auth === 'password' ? s.password : undefined,
+        readOnly: true,
+      };
+    },
+    make: makeHiveDriver,
+  },
 };
+
+/** A driver type, and whether this deployment can connect one: `reason` says why not, where it can't. */
+export interface DriverAvailability {
+  type: DriverType;
+  available: boolean;
+  reason?: string;
+}
+
+/**
+ * Every driver type xcube takes, each marked available or not, for the
+ * client's catalog of what it can offer (`GET …/drivers`). Every one is, so
+ * far: each driver is in the image. JDBC types, whose vendor jars are
+ * mounted, will be available only with their jar.
+ */
+export function driverAvailability(): DriverAvailability[] {
+  return DRIVER_TYPES.map((type) => ({ type, available: true }));
+}
 
 export function isDriverType(type: unknown): type is DriverType {
   return typeof type === 'string' && (DRIVER_TYPES as readonly string[]).includes(type);

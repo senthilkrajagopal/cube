@@ -29,6 +29,7 @@ import {
 } from '../store/revisions';
 import { ConnectionError } from '../connections/connections';
 import { duckdbPool } from '../connections/duckdb';
+import { driverAvailability } from '../connections/drivers';
 import { CredentialError } from '../credentials/credentials';
 import { MODEL_ID, SnapshotError } from '../model/snapshot';
 import { checkDataSourceName } from '../names/items';
@@ -722,6 +723,12 @@ export function initAdminRoutes(
     }
     return req.params.name;
   };
+
+  // The driver types a connection may use, each available or not here: the same for every model.
+  app.get(`${base}/drivers`, auth, handle('drivers', async (req, res) => {
+    modelOf(req);
+    res.json({ drivers: driverAvailability() });
+  }));
 
   app.get(`${base}/connections`, auth, handle('connections', async (req, res) => {
     const model = modelOf(req);

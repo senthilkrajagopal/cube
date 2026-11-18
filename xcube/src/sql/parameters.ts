@@ -61,10 +61,10 @@ export interface SqlBind {
 
 /**
  * Where binding isn't proven: their drivers take no binds (Dremio's job API,
- * Cube Store's, Trino's), or a value isn't yet shown to be taken as one
+ * Cube Store's, Trino's, Hive's: HiveServer2 binds nothing), or a value isn't yet shown to be taken as one
  * literal (Athena's execution parameters).
  */
-export const UNBOUND_DIALECTS = new Set<SqlDialect>(['dremio', 'trino', 'athena', 'cubestore']);
+export const UNBOUND_DIALECTS = new Set<SqlDialect>(['dremio', 'trino', 'athena', 'cubestore', 'hive']);
 
 /** A dialect's name as a refusal says it. */
 export const DIALECT_NAMES: Record<SqlDialect, string> = {
@@ -81,6 +81,7 @@ export const DIALECT_NAMES: Record<SqlDialect, string> = {
   trino: 'Trino',
   athena: 'Athena',
   cubestore: 'Cube Store',
+  hive: 'Hive',
 };
 
 /** A number's decimal string: at most 38 digits, at most 30 after the point (every dialect's exact decimal holds it). */
