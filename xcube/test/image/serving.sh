@@ -123,6 +123,12 @@ grep -qi "x-xcube-revision: check@$revision" /tmp/xcube-headers.txt
 echo "$answer" | grep -q '"serving_check.total":"42"'
 echo "Serving check passed: revision $revision imported and queried."
 
+# No JVM in a deployment that opens no JDBC connection: none of the server's threads is one, after it
+# started and answered a Postgres query (wechart's db_support R1 test 2).
+jvm_threads="$(docker exec "$NAME" sh -c 'cat /proc/1/task/*/comm' | grep -cE '^(VM Thread|GC Thread|C[12] CompilerThre|Reference Handl)' || true)"
+[ "$jvm_threads" = 0 ] || { echo "the server runs $jvm_threads JVM threads without a JDBC connection"; exit 1; }
+echo "JVM check passed: no JVM thread without a JDBC connection."
+
 # Items mode: a folder tree, a root cube and a folder's own cube bound to it.
 admin() {
   curl -s -o /tmp/xcube-admin.json -w '%{http_code}' -X "$1" \
@@ -252,11 +258,15 @@ status="$(conn POST /connections/default/sql '{"sql": "DELETE FROM public.servin
 [ "$status" = 400 ] && grep -q '"code":"not_read_only"' /tmp/xcube-admin.json || { echo "a write answered $status: $(cat /tmp/xcube-admin.json)"; exit 1; }
 echo "SQL runner check passed: read-only SQL on the connection, capped, a write refused."
 
-# The drivers a connection may use, `hive` and `impala` among them (wechart's db_support R2).
+# The drivers a connection may use, `hive` and `impala` among them, and `db2` unavailable without its jar (wechart's db_support R2).
 status="$(signed GET /drivers)"
 [ "$status" = 200 ] && grep -q '{"type":"hive","available":true}' /tmp/xcube-admin.json && grep -q '{"type":"impala","available":true}' /tmp/xcube-admin.json \
+  && grep -q '{"type":"db2","available":false,"reason":"No driver jar is mounted for db2: this deployment sets no XCUBE_JDBC_DRIVERS_DIR"}' /tmp/xcube-admin.json \
   || { echo "the drivers answered $status: $(cat /tmp/xcube-admin.json)"; exit 1; }
-echo "Drivers check passed: hive and impala are listed, available."
+status="$(signed POST /connections/test '{"driver": "db2", "authMethod": "password", "fields": {"host": "db2.example", "database": "SAMPLE", "user": "u"}}')"
+[ "$status" = 503 ] && grep -q '"code":"driver_unavailable"' /tmp/xcube-admin.json \
+  || { echo "a db2 connection test without its jar answered $status: $(cat /tmp/xcube-admin.json)"; exit 1; }
+echo "Drivers check passed: hive and impala are listed, available; db2 unavailable, its connection test refused driver_unavailable."
 
 # Hive (wechart's db_support R4 test 3), when given a HiveServer2 the container reaches as
 # HIVE_HOST (host:port, SASL PLAIN as `hive`, no password), where `hive` may create a table.

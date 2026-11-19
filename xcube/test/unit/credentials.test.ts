@@ -192,9 +192,9 @@ describe('the engine token\'s vector, scheme v1', () => {
   });
 });
 
-// The hive and impala drivers' passwords (wechart's db_support R3, R11.1), in golden-v1.json's form, sealed
+// The hive, impala and db2 drivers' passwords (wechart's db_support R3, R11.1), in golden-v1.json's form, sealed
 // to the development key: xcube's own vectors, for wechart's sealing test (test/fixtures/<driver>-vector-v1.json).
-describe.each(['hive', 'impala'])('the %s password\'s vector, scheme v1', (driverName) => {
+describe.each(['hive', 'impala', 'db2'])('the %s password\'s vector, scheme v1', (driverName) => {
   const fixtures = path.join(__dirname, '..', 'fixtures');
   const vector = JSON.parse(fs.readFileSync(path.join(fixtures, `${driverName}-vector-v1.json`), 'utf8'));
 

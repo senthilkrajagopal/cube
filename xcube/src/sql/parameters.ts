@@ -40,6 +40,7 @@ export interface SqlParameter {
  * - ClickHouse: its query parameters go in the request's URL, which the server
  *   caps (`http_max_uri_size`, 1 MiB by default): 10,000, short values.
  * - DuckDB and wechart's engine: no limit of theirs; xcube's own, 65,535.
+ * - Db2: 32,767 host variable references in a statement.
  */
 export const MAX_BOUND: Partial<Record<SqlDialect, { total: number; list: number }>> = {
   postgres: { total: 32767, list: 32767 },
@@ -51,6 +52,7 @@ export const MAX_BOUND: Partial<Record<SqlDialect, { total: number; list: number
   oracle: { total: 65535, list: 1000 },
   clickhouse: { total: 10000, list: 10000 },
   duckdb: { total: 65535, list: 65535 },
+  db2: { total: 32767, list: 32767 },
   // Written into the statement as literals (`LITERAL_DIALECTS`): xcube's own, below their statement-length limits.
   trino: { total: 10000, list: 10000 },
   athena: { total: 10000, list: 10000 },
@@ -101,6 +103,7 @@ export const DIALECT_NAMES: Record<SqlDialect, string> = {
   cubestore: 'Cube Store',
   hive: 'Hive',
   impala: 'Impala',
+  db2: 'Db2',
 };
 
 /** A number's decimal string: at most 38 digits, at most 30 after the point (every dialect's exact decimal holds it). */
@@ -185,6 +188,10 @@ function placeholder(dialect: SqlDialect, slot: string, parameter: { type: Param
       text: 'String', number: `Decimal(38, ${scale})`, date: 'Date32', datetime: 'DateTime64(6)', boolean: 'Bool',
     }[type]}}`;
   }
+  if (dialect === 'db2' && type === 'text') {
+    // Typed in the SQL, as every type is: its longest VARCHAR.
+    return `CAST(${slot} AS VARCHAR(32672))`;
+  }
   if (type === 'text' || dialect === 'bigquery') {
     // BigQuery's are typed by its query parameters' `types`.
     return slot;
@@ -211,6 +218,11 @@ function placeholder(dialect: SqlDialect, slot: string, parameter: { type: Param
         return `${slot}::DECIMAL(38, ${scale})`;
       }
       return { date: `${slot}::DATE`, datetime: `${slot}::TIMESTAMP` }[type as string] ?? `${slot}::BOOLEAN`;
+    case 'db2':
+      // Typed in the SQL: Db2 refuses a `?` whose type it can't tell from where it stands (SQL0418N).
+      return {
+        number: `CAST(${slot} AS DECIMAL(31, ${scale}))`, date: `CAST(${slot} AS DATE)`, datetime: `CAST(${slot} AS TIMESTAMP(6))`, boolean: `CAST(${slot} AS BOOLEAN)`,
+      }[type as string] ?? slot;
     case 'oracle':
       if (type === 'number') {
         return `TO_NUMBER(${slot}, '${oracleNumberFormat(String(value))}', 'NLS_NUMERIC_CHARACTERS=''.,''')`;
@@ -262,7 +274,7 @@ function typedLiteral(dialect: SqlDialect, type: ParameterType, value: string | 
 }
 
 /** Whether a dialect's placeholders are positional, one value per place (`?`), rather than named or numbered for reuse. */
-const POSITIONAL = new Set<SqlDialect>(['mysql', 'snowflake']);
+const POSITIONAL = new Set<SqlDialect>(['mysql', 'snowflake', 'db2']);
 
 /** Whether only blanks stand between `at` and the nearest `(` before it, and the nearest `)` after `end`. */
 function inParentheses(sql: string, start: number, end: number): boolean {
@@ -328,6 +340,9 @@ export function bindParameters(
       if (problem) {
         throw new ParameterError('invalid_value', Array.isArray(value) ? `${problem} (each item of the list)` : problem, redacted());
       }
+      if (dialect === 'db2' && type === 'number' && /\d/.test(String(item)) && String(item).replace(/[^0-9]/g, '').length > 31) {
+        throw new ParameterError('invalid_value', `"${name}" is a Number Db2 can't hold: its decimals have at most 31 digits`, redacted());
+      }
       const day = type === 'datetime' ? String(item).slice(0, 10) : item;
       if (dialect === 'clickhouse' && (type === 'date' || type === 'datetime') && (day < CLICKHOUSE_DAYS.first || day > CLICKHOUSE_DAYS.last)) {
         throw new ParameterError(
@@ -349,7 +364,8 @@ export function bindParameters(
     let value = given;
     if (type === 'datetime') {
       value = fullDateTime(String(given));
-      value = dialect === 'clickhouse' ? value.replace('T', ' ') : value;
+      // Db2 reads a timestamp's string with a space too (`YYYY-MM-DD HH:MM:SS.ffffff`).
+      value = dialect === 'clickhouse' || dialect === 'db2' ? value.replace('T', ' ') : value;
     }
     if (LITERAL_DIALECTS.has(dialect)) {
       const literal = typedLiteral(dialect, type, value);

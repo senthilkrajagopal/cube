@@ -10,7 +10,9 @@ import type { LogLevel, LoggerFn } from '@cubejs-backend/shared';
 import { createLogger } from '@cubejs-backend/server-core/dist/src/core/logger';
 
 /** The events printed at `info` as well as `trace`. */
-export const XCUBE_INFO_EVENTS: ReadonlySet<string> = new Set(['xcube: export started', 'xcube: export']);
+export const XCUBE_INFO_EVENTS: ReadonlySet<string> = new Set([
+  'xcube: export started', 'xcube: export', 'xcube: jdbc driver jar', 'xcube: jdbc driver unavailable',
+]);
 
 /** Cube's logger for `production` and `level` (`CUBEJS_LOG_LEVEL`, `info` unset), printing `XCUBE_INFO_EVENTS` at `info`. */
 export function xcubeLogger(production: boolean, level: string = 'info', write: (line: string) => void = (line) => process.stdout.write(`${line}\n`)): LoggerFn {

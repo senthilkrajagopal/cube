@@ -1,0 +1,9 @@
+{
+  "name": "xcube-jdbc-bridge",
+  "private": true,
+  "description": "node-java, built in the image for each architecture against its JDK: the bridge xcube's JDBC session runs on (only node_modules/java is copied into the image)",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "java": "0.18.0"
+  }
+}

@@ -124,6 +124,35 @@ const arch = process.env.TARGETARCH === 'amd64' ? 'x64' : 'arm64';
 JS
 SH
 
+# The JDBC bridge, for the platform the image is built for: node-java, as
+# its own lock has it (`jdbc/package-lock.json`), compiled against JDK 21,
+# and xcube's helper jar (`jdbc/src`). Only node-java's own files are kept:
+# its dependencies (node-gyp, glob, find-java-home) serve its build alone.
+FROM node:24.22.1-trixie-slim AS jdbc
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends openjdk-21-jdk-headless python3 make g++ \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /jdbc
+COPY jdbc/package.json jdbc/package-lock.json ./
+# Its scripts are run below, by name, rather than by npm.
+RUN npm ci --ignore-scripts --no-audit --no-fund
+RUN <<'SH'
+set -eu
+export JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")"
+cd node_modules/java
+node ../node-gyp/bin/node-gyp.js rebuild
+# What its postinstall writes: the directory of libjvm.so, added to PATH as it loads.
+printf '"%s"' ":$(dirname "$(find "$JAVA_HOME" -name libjvm.so | head -1)")" > build/jvm_dll_path.json
+rm -rf build/Release/obj.target build/Release/.deps node_modules
+SH
+
+COPY jdbc/src src
+RUN mkdir classes \
+  && javac --release 21 -d classes $(find src -name '*.java') \
+  && jar --create --file xcube-jdbc.jar -C classes .
+
 FROM cubejs/cube:${CUBE_VERSION}
 
 # The fork's commit the package was built from, the image's version (its tag's, `v<cube>-<commit>`)
@@ -148,5 +177,17 @@ RUN rm -rf /cube/node_modules/@duckdb
 COPY --from=duckdb-node /duckdb-node/@duckdb /cube/node_modules/@duckdb
 COPY --from=duckdb-extensions /duckdb-extensions /cube/duckdb-extensions
 ENV XCUBE_DUCKDB_EXTENSION_DIRECTORY=/cube/duckdb-extensions
+
+# JDBC data sources (Db2): the JRE node-java was compiled against, the bridge,
+# and xcube's helper. No vendor jar is in the image: each is mounted
+# (XCUBE_JDBC_DRIVERS_DIR). The JVM starts only with the first JDBC
+# connection. Node's thread pool is larger than libuv's four, so statements
+# waiting on a JDBC source leave room for the rest (a cancel never waits in it).
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends openjdk-21-jre-headless \
+  && rm -rf /var/lib/apt/lists/*
+COPY --from=jdbc /jdbc/node_modules/java /cube/node_modules/xcube/node_modules/java
+COPY --from=jdbc /jdbc/xcube-jdbc.jar /cube/node_modules/xcube/jdbc/xcube-jdbc.jar
+ENV UV_THREADPOOL_SIZE=16
 
 CMD ["node", "/cube/node_modules/xcube/dist/src/bin/server.js"]

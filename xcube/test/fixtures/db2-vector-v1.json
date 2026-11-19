@@ -1,0 +1,49 @@
+{
+  "about": "The db2 driver's password, scheme v1, in golden-v1.json's form: `aad` and `envelopes` entries, sealed to the same development key (dev-credential-key.pub.jwk). Development values only.",
+  "aad": [
+    {
+      "driver": "db2",
+      "field": "password",
+      "fields": {
+        "host": "db2.example",
+        "port": 50000,
+        "database": "SAMPLE"
+      },
+      "aad": "[\"wechart/data-source-secret/v1\",\"db2\",\"password\",[[\"host\",\"db2.example\"],[\"port\",\"50000\"],[\"ssl\",\"\"],[\"sslCa\",\"\"],[\"sslRejectUnauthorized\",\"\"]]]"
+    },
+    {
+      "driver": "db2",
+      "field": "password",
+      "fields": {
+        "host": "db2.example",
+        "port": 50001,
+        "database": "SALES",
+        "ssl": true,
+        "sslRejectUnauthorized": true,
+        "sslCa": "-----BEGIN CERTIFICATE-----\nMIIgolden\n-----END CERTIFICATE-----"
+      },
+      "aad": "[\"wechart/data-source-secret/v1\",\"db2\",\"password\",[[\"host\",\"db2.example\"],[\"port\",\"50001\"],[\"ssl\",\"true\"],[\"sslCa\",\"-----BEGIN CERTIFICATE-----\\nMIIgolden\\n-----END CERTIFICATE-----\"],[\"sslRejectUnauthorized\",\"true\"]]]"
+    }
+  ],
+  "envelopes": [
+    {
+      "driver": "db2",
+      "field": "password",
+      "fields": {
+        "host": "db2.example",
+        "port": 50001,
+        "database": "SALES",
+        "ssl": true,
+        "sslRejectUnauthorized": true,
+        "sslCa": "-----BEGIN CERTIFICATE-----\nMIIgolden\n-----END CERTIFICATE-----"
+      },
+      "secret": "db2-dev-password",
+      "envelope": {
+        "v": 1,
+        "kid": "uYWeMx6i173fsiolFp1xi-qiav50k52AGinM56Y8JEw",
+        "enc": "icHlxlgcDoLBlOl78KMsc1ApO9O2fr_HdGl6ckJHMhM",
+        "ct": "JPxsjfXdCKKGNAKGmsCk9DDXeddqG9JcZxtjjadefwD8k2oN4wU7sVzwCK6OP8pZPx7x6wVtFZjzjQCapI-1Hyp-dIx0IcXVtQSuzAdT7Cf1N5z_vUvPkFtXA02EOKrEClZFe8tii7gA9UxuGu-urEI0R9w1pZLB6d-bgO8Ul9lxFRE-zAgnOiIKwLJziSOoXsMaGckdDJYZysAC-AHY-Wp4N7cHN1YZ2XdnQ0Ie6gp7uhnMJ5GnCOZWnqS-uHXxansEPKhje3yEHDZJxOrQy8C0dJjOw8tBRMVXlJcW6_KHnEateat9IDHjLn96mwacCOisc-4GxwCyf2x6EJqLmUV9iQfLY3ZCTzpQ0XiHr-k"
+      }
+    }
+  ]
+}

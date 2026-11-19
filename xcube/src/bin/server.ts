@@ -6,6 +6,8 @@
  * Pass `--debug` for Cube's debug output.
  */
 import { setGlobalRuntime } from '../config';
+import { logJdbcDrivers } from '../connections/jvm';
+import { xcubeLogger } from '../logger';
 import { XcubeRuntime } from '../runtime/runtime';
 import { settingsFromEnv } from '../runtime/settings';
 import { XcubeServerContainer } from '../server';
@@ -33,6 +35,9 @@ async function main() {
   process.env.NODE_ENV = 'production';
   // Each compile's transpiler pool; unset, a compile can take gigabytes.
   process.env.CUBEJS_TRANSPILATION_WORKER_THREADS_COUNT ??= '2';
+
+  // The mounted JDBC drivers, read once before any JVM starts: each jar's name, size and SHA-256.
+  logJdbcDrivers(xcubeLogger(true, process.env.CUBEJS_LOG_LEVEL ?? 'info'));
 
   const settings = settingsFromEnv();
   if (settings) {

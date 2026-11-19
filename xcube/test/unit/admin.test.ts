@@ -4,8 +4,10 @@ import request from 'supertest';
 import { CubejsHandlerError } from '@cubejs-backend/api-gateway';
 
 import { initAdminRoutes } from '../../src/admin/routes';
+import { DriverUnavailableError, readJdbcDrivers, resetJdbcDrivers } from '../../src/connections/jvm';
 import { LaneBusyError } from '../../src/runtime/lane';
 import { SnapshotError } from '../../src/model/snapshot';
+import { SqlRunError } from '../../src/sql/runner';
 import { DEFAULT_TOKENS, settingsFromEnv } from '../../src/runtime/settings';
 
 const TOKEN = 'admin-token-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -39,16 +41,47 @@ describe('admin routes', () => {
     await request(a).get(url).set('Authorization', `Bearer ${OLD_TOKEN}`).expect(200);
   });
 
-  test('drivers: every type xcube takes, each available, behind the token', async () => {
-    const { app: a } = app({});
-    const url = '/cubejs-api/v1/semantic/models/dev/drivers';
-    await request(a).get(url).expect(401);
-    const ok = await request(a).get(url).set('Authorization', `Bearer ${TOKEN}`).expect(200);
-    expect(ok.body.drivers.map((d: any) => d.type)).toEqual([
-      'postgres', 'redshift', 'mysql', 'snowflake', 'bigquery', 'mssql', 'oracle', 'dremio', 'duckdb', 'clickhouse', 'trino', 'athena', 'engine', 'hive', 'impala',
-    ]);
-    expect(ok.body.drivers.every((d: any) => d.available === true && d.reason === undefined)).toBe(true);
-    await request(a).get('/cubejs-api/v1/semantic/models/Bad!/drivers').set('Authorization', `Bearer ${TOKEN}`).expect(400);
+  test('drivers: every type xcube takes, each available but a JDBC type without its jar, behind the token', async () => {
+    resetJdbcDrivers(readJdbcDrivers(undefined));
+    try {
+      const { app: a } = app({});
+      const url = '/cubejs-api/v1/semantic/models/dev/drivers';
+      await request(a).get(url).expect(401);
+      const ok = await request(a).get(url).set('Authorization', `Bearer ${TOKEN}`).expect(200);
+      expect(ok.body.drivers.map((d: any) => d.type)).toEqual([
+        'postgres', 'redshift', 'mysql', 'snowflake', 'bigquery', 'mssql', 'oracle', 'dremio', 'duckdb', 'clickhouse', 'trino', 'athena', 'engine', 'hive', 'impala',
+        'db2',
+      ]);
+      expect(ok.body.drivers.filter((d: any) => d.type !== 'db2').every((d: any) => d.available === true && d.reason === undefined)).toBe(true);
+      expect(ok.body.drivers.find((d: any) => d.type === 'db2')).toEqual({
+        type: 'db2', available: false, reason: 'No driver jar is mounted for db2: this deployment sets no XCUBE_JDBC_DRIVERS_DIR',
+      });
+      await request(a).get('/cubejs-api/v1/semantic/models/Bad!/drivers').set('Authorization', `Bearer ${TOKEN}`).expect(400);
+    } finally {
+      resetJdbcDrivers();
+    }
+  });
+
+  test('a JDBC type without its jar: 503 driver_unavailable, for a connection test and a SQL run alike', async () => {
+    const reason = 'No driver jar is mounted for db2: this deployment sets no XCUBE_JDBC_DRIVERS_DIR';
+    const { app: a } = app({
+      status: async () => ({ model: 'dev' }),
+      testConnection: async () => {
+        throw new DriverUnavailableError('db2', reason);
+      },
+      runSql: async () => {
+        throw new SqlRunError('driver_unavailable', reason);
+      },
+    });
+    const tested = await request(a).post('/cubejs-api/v1/semantic/models/dev/connections/test').set('Authorization', `Bearer ${TOKEN}`)
+      .send({ driver: 'db2', authMethod: 'password', fields: { host: 'h', database: 'd', user: 'u' } })
+      .expect(503);
+    expect(tested.body).toEqual({ error: reason, code: 'driver_unavailable', type: 'db2' });
+    const ran = await request(a).post('/cubejs-api/v1/semantic/models/dev/connections/sales/sql').set('Authorization', `Bearer ${TOKEN}`)
+      .send({ sql: 'SELECT 1 FROM SYSIBM.SYSDUMMY1', runId: '00000000-0000-4000-8000-000000000001' })
+      .expect(503);
+    expect(ran.body).toMatchObject({ error: reason, code: 'driver_unavailable' });
+    expect(ran.headers['retry-after']).toBeUndefined();
   });
 
   test('are off without tokens', async () => {

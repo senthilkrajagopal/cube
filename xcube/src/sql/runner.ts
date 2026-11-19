@@ -20,6 +20,7 @@ import { randomUUID } from 'crypto';
 import { duckdbApi } from '../connections/duckdb';
 import { EngineDriver } from '../connections/engine';
 import { HiveError, type HiveDriver, type HiveOperation } from '../connections/hive';
+import { JdbcError, type JdbcDriver, type JdbcStatement } from '../connections/jdbc';
 import { trinoError } from '../connections/trino';
 import type { Refused, StatementKind } from './classify';
 import type { SqlBind } from './parameters';
@@ -55,7 +56,7 @@ export interface SqlAnswer extends SqlRows {
 /** How a run failed: refused, stopped, or failed on the database. */
 export type SqlFailure = 'not_read_only' | 'several_statements' | 'timeout' | 'cancelled' | 'connect_failed' | 'query_failed'
   | 'unknown_connection' | 'unknown_overlay' | 'run_in_progress' | 'busy' | 'invalid_parameters' | 'parameters_unsupported'
-  | 'cap_unsupported' | 'not_select';
+  | 'cap_unsupported' | 'not_select' | 'driver_unavailable';
 
 export class SqlRunError extends Error {
   public constructor(
@@ -199,7 +200,7 @@ export interface SqlSession {
 export type Refuse = (message: string, statement: string, reason?: string) => never;
 
 export type SessionDialect = 'postgres' | 'redshift' | 'mysql' | 'snowflake' | 'bigquery' | 'mssql' | 'oracle' | 'dremio'
-  | 'duckdb' | 'clickhouse' | 'trino' | 'athena' | 'cubestore' | 'hive' | 'impala';
+  | 'duckdb' | 'clickhouse' | 'trino' | 'athena' | 'cubestore' | 'hive' | 'impala' | 'db2';
 
 /** A dialect no case took: the compiler holds every switch over them to all of them. */
 function unknownDialect(dialect: never): never {
@@ -1125,6 +1126,50 @@ async function hiveSession(driver: HiveDriver, caps: SqlCaps): Promise<SqlSessio
 }
 
 /**
+ * A JDBC data source (Db2): a connection of the run's own, read-only as its
+ * driver allows (`readOnly`, which Db2's makes the connection's), the
+ * statement prepared (one per execute) with its `?` bound, and the
+ * database's own time limit (`setQueryTimeout`); its rows read a batch at a
+ * time. A cancel runs on a thread of the JVM's own, at once.
+ */
+async function jdbcSession(driver: JdbcDriver, caps: SqlCaps): Promise<SqlSession> {
+  let connection;
+  try {
+    connection = await driver.openConnection();
+  } catch (e) {
+    await quietly(() => driver.release());
+    throw e;
+  }
+  const open = connection;
+  const seconds = Math.max(1, Math.ceil(caps.timeoutMs / 1000));
+  let statement: JdbcStatement | null = null;
+  let stopping = false;
+  return {
+    async run(sql, rows, binds = []) {
+      const running = await open.execute(sql, binds.map((b) => ({ type: b.type, value: b.value })), seconds, batchOf(rows, caps.maxRows));
+      statement = running;
+      rows.setColumns(running.columns);
+      while (!stopping && !running.done) {
+        const got = await running.fetch(batchOf(rows, caps.maxRows));
+        if (!got.every((row) => rows.add(row)) || !(await rows.ready())) {
+          break;
+        }
+      }
+    },
+    async cancel() {
+      stopping = true;
+      (statement ?? open.running)?.cancel();
+    },
+    async close() {
+      await quietly(() => statement?.close());
+      await quietly(() => open.close());
+      // Its CA's file goes with it.
+      await quietly(() => driver.release());
+    },
+  };
+}
+
+/**
  * Whether a Cube Store plan joins on its router: a join not under a
  * `ClusterSend`. Its router runs it, and nothing stops that once it starts
  * (`endsAtCubeStoreTimeout`); a join multiplies what it reads.
@@ -1255,6 +1300,8 @@ export function openSession(
     case 'hive':
     case 'impala':
       return hiveSession(driver, caps);
+    case 'db2':
+      return jdbcSession(driver, caps);
     default:
       return unknownDialect(dialect);
   }
@@ -1312,6 +1359,10 @@ export function isTimeout(dialect: SessionDialect, e: any, ran?: { ms: number; t
       // Hive's queryTimeout: the operation ends TIMEDOUT (or, on some versions, fails saying so);
       // Impala's EXEC_TIME_LIMIT_S: it fails saying so.
       return e instanceof HiveError && e.kind === 'timeout';
+    case 'db2':
+      // Its driver's SQLTimeoutException; or SQLCODE -952, a statement interrupted, which a cancel is too: the time it came at tells.
+      return e instanceof JdbcError && (e.kind === 'timeout'
+        || (e.vendorCode === -952 && ran !== undefined && ran.ms >= ran.timeoutMs - TIMEOUT_SLACK_MS));
     case 'dremio':
     // It has no statement timeout: the run's clock interrupts it.
     case 'duckdb':

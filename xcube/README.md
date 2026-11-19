@@ -226,6 +226,10 @@ In both modes:
 | `XCUBE_DUCKDB_VOLUMES` | unset | Comma-separated absolute directories a `volume` connection's file may be in. Unset, none may |
 | `XCUBE_EXPORT_FETCH_ROWS` | `50000` | The most rows an export reads from the database in one round trip (1 to 1,000,000), where its driver reads in batches (PostgreSQL, Redshift, BigQuery, Oracle) |
 | `XCUBE_EXPORT_FETCH_BYTES` | `16777216` | About how much of an export's NDJSON one round trip reads (64 KiB to 64 MiB): a batch is this over the rows' average size so far, at most `XCUBE_EXPORT_FETCH_ROWS`, and the first is 1,000 rows. It is also how much may wait unsent before the export waits for its client |
+| `XCUBE_JDBC_DRIVERS_DIR` | unset | Where the JDBC vendors' jars are mounted (read-only), one directory per type: `db2/`. Read once at start, each jar logged with its size and SHA-256; never fetched. Unset, every JDBC type is unavailable (`driver_unavailable`) |
+| `XCUBE_JDBC_MAX_HEAP_MB` | `512` | The JVM's heap (64 to 65,536 MiB). The JVM starts with the first JDBC connection, never before |
+| `XCUBE_JDBC_TRUST_STORE` | unset | A PEM bundle of CA certificates the JVM trusts beside its own, for every JDBC connection without a CA of its own (held in memory; nothing written) |
+| `UV_THREADPOOL_SIZE` | `16` in the image | Node's thread pool. JDBC calls hold at most all but four of its threads; a JDBC cancel or close holds none |
 | `XCUBE_CONNECTION_HEARTBEAT_MS` | `600000` | How often an instance re-writes its report of each connection it holds a driver for (10 s to 30 min), so a report within the hour means an instance running |
 | `CUBEJS_TRANSPILATION_WORKER_THREADS_COUNT` | `2` | Cube's; the image sets it when unset, as unset a compile can take gigabytes |
 
@@ -591,7 +595,8 @@ xcube's credential key, so the client stores them and can't open them.
 **Drivers.** `postgres`, `redshift`, `mysql`, `snowflake`, `bigquery`, `mssql`,
 `oracle`, `dremio`, `duckdb`, `clickhouse`, `trino` and `athena`, through Cube's own drivers,
 and `engine`, wechart's in-memory engine, `hive` (Apache Hive and Spark's
-Thrift server) and `impala` (Apache Impala), through xcube's:
+Thrift server), `impala` (Apache Impala) and `db2` (IBM Db2, over its JDBC
+driver, mounted), through xcube's:
 
 | Driver | Auth methods | Target (what a secret is bound to) |
 | --- | --- | --- |
@@ -610,8 +615,9 @@ Thrift server) and `impala` (Apache Impala), through xcube's:
 | `engine` | `service-token` | baseUrl, sslRejectUnauthorized, sslCa |
 | `hive` | `username` (SASL PLAIN, a placeholder password), `password` | host, port, ssl, sslRejectUnauthorized, sslCa |
 | `impala` | `none` (NOSASL), `username`, `password` (LDAP) | host, port, ssl, sslRejectUnauthorized, sslCa |
+| `db2` | `password` | host, port, ssl, sslRejectUnauthorized, sslCa |
 
-DuckDB, ClickHouse, Trino, Athena, Hive and Impala connections are read-only:
+DuckDB, ClickHouse, Trino, Athena, Hive, Impala and Db2 connections are read-only:
 - **Rollups are built in Cube Store only.** A publish refuses a cube on one
   of them with a pre-aggregation built in the source (`external: false`, or
   `original_sql`).
@@ -691,6 +697,85 @@ Apache Hive's HiveServer2 and Spark's Thrift server.
   (`src/connections/impala-type.ts`), resolving to its dialect.
 - **A dropped connection.** A statement whose connection drops runs on until
   Impala sees its client gone (`idle_client_poll_period_s`, 30 s by default).
+
+**JDBC** data sources (Db2 so far) run on a JVM in Cube's own process, over
+node-java (built into the image for each architecture against its JRE, 21)
+and xcube's helper (`jdbc/src`), never Cube's JDBC driver
+(`src/connections/jvm.ts`, `src/connections/jdbc.ts`).
+- **Jars.** The image holds no vendor jar. Each is mounted under
+  `XCUBE_JDBC_DRIVERS_DIR`, one directory per type (`db2/`), read once at
+  start: every jar found is on the classpath, and each is logged with its
+  size and SHA-256 (`xcube: jdbc driver jar`). A type is available when one
+  of its jars holds its driver class (`com.ibm.db2.jcc.DB2Driver`), read
+  from the jar's directory of entries. Nothing is ever downloaded. Where a
+  type isn't available, a connection test, a stored connection, a SQL run or
+  an export on it answers `503 driver_unavailable`, with a `reason` naming
+  the type and the directory, never what is in it; `GET …/drivers` says so.
+- **The JVM** starts with the first JDBC connection, so a deployment that
+  opens none has none. Its options are xcube's alone, none from a data
+  source: `-Xmx` (`XCUBE_JDBC_MAX_HEAP_MB`), `-Xrs` (Node keeps its signal
+  handlers), `-Duser.timezone=UTC`, UTF-8, no perf file, and the temporary
+  directory for anything it writes, so it runs on a read-only root file
+  system as user 1000. `XCUBE_JDBC_TRUST_STORE`, a PEM bundle, is trusted
+  beside the JRE's own CAs for every connection that takes the JVM's default.
+- **Connections.** The helper makes each from the driver class itself,
+  never through `DriverManager`, with the URL and properties xcube built: no
+  `CUBEJS_JDBC_*` or `CUBEJS_DB_*` value reaches one. Each data source has a
+  pool of 8; a connection that fails as a connection (SQLSTATE `08…`) is
+  dropped.
+- **Rows** are read a batch at a time, as JSON the helper writes, each cell
+  in the SQL runner's form: a decimal as its digits, an integer past 2^53 as
+  its digits, a date `YYYY-MM-DD`, a timestamp as the database holds it (its
+  wall time, never moved by a zone), one with a zone with its offset, a time
+  `HH:MM:SS[.f]`, bytes as `\x` and hex, `NaN` and infinities as the database
+  prints them. A column's `type` is the database's own name (`DECIMAL(31,9)`).
+- **Threads.** node-java runs each call that can wait on the database
+  (connect, execute, fetch) in Node's thread pool; xcube lets JDBC calls hold
+  at most all but four of its threads (`UV_THREADPOOL_SIZE`, 16 in the
+  image), the rest waiting their turn, so files, DNS and crypto keep threads
+  of their own. A cancel and a close run on a thread of the JVM's own, at
+  once, never waiting behind statements running.
+
+**Db2** (`src/connections/db2.ts`) is IBM's driver (`com.ibm.db2.jcc.DB2Driver`,
+its jar mounted under `db2/`; z/OS with the customer's licence jar).
+- **URL and properties.** The URL names the server and database alone
+  (`jdbc:db2://host:port/DATABASE`); every other setting, the user and
+  password among them, is a property, so no field can add an option.
+  `database` and `currentSchema` can't hold a quote, backtick, `;`, a
+  backslash, whitespace, `--`, `/*`, or any of `, = & ? @ : / { }`.
+  `currentSchema` is upper-cased. Always `readOnly`, the server's own error
+  text (`retrieveMessagesFromServerOnGetMessage`), the login timeout, and a
+  socket read timeout past the statement's limit.
+- **TLS** on by default: `sslConnection`, the CA written to a file of its
+  own (mode 0600, in a directory of its own, removed when the driver is
+  released) as `sslCertLocation`, and the host name checked
+  (`sslClientHostnameValidation=BASIC`). IBM's driver has no setting that
+  skips checking the chain: `sslRejectUnauthorized: false` turns off the
+  host name's check only. **Without TLS** the user and password are
+  encrypted (`securityMechanism=9`, AES), never sent in clear; a server that
+  refuses that fails the connection test with the driver's words.
+- **Cube's SQL.** Values are written in as literals (a string's quote
+  doubled; Db2's strings have no other escape), found by Db2's lexer. The
+  dialect (`src/model/db2-dialect.ts`, Db2 LUW 11.1 and later) is xcube's own
+  on `BaseQuery`: `OFFSET n ROWS FETCH FIRST m ROWS ONLY`, GROUP BY
+  expressions (Db2 groups by no ordinal), `TRUNC_TIMESTAMP` for each
+  granularity (a week from Monday), `FROM_UTC_TIMESTAMP` for the zone,
+  labeled durations (`+ 3 MONTHS`), Cube's ISO timestamps read with a space
+  for `T`, and LIKE on both sides lowered for ILIKE. A zone that isn't an
+  IANA name is refused: Db2 would answer UTC's value for it unchanged. No
+  approximate count distinct.
+- **Catalog.** `SYSCAT.SCHEMATA`, `SYSCAT.TABLES` and `SYSCAT.COLUMNS`,
+  tables, views, MQTs and nicknames, Db2's own schemas (`SYS…`, `NULLID`,
+  `SQLJ`, …) left out.
+- **Cube's type.** Cube has no `db2`: xcube adds it to Cube's list
+  (`src/connections/db2-type.ts`), as for Impala.
+- **SQL runner.** A connection of the run's own, read-only as the driver
+  makes it, the statement prepared (one per execute) with its `?` bound, and
+  `setQueryTimeout`; a timeout is the driver's `SQLTimeoutException` or
+  SQLCODE -952 at the limit. A cancel is `Statement.cancel`.
+- **Not run against a server here**, at the user's decision until there is
+  one to name; the JVM, the helper, the session's cancel and the cells are
+  run in the image against PostgreSQL's JDBC driver (`test/image/jdbc.js`).
 
 **DuckDB** runs in Cube's own process, one instance per connection (`src/connections/duckdb.ts`).
 - **Kinds.**
@@ -1054,6 +1139,13 @@ top of them:
      as anything but a read is. It reads a backslash in a backtick name as an
      escape (`` `a\`; drop table t` `` is one name), and a doubled quote as
      two strings, never as a quote.
+   - Db2's: a data-change table reference (`FINAL TABLE`, `NEW TABLE`,
+     `OLD TABLE`); a sequence's `NEXT VALUE FOR` and `PREVIOUS VALUE FOR`
+     (`NEXTVAL`, `PREVVAL`); `EXTERNAL` (a file read as a table); `KEEP …
+     LOCKS` and `EXCLUSIVE`; SYSTOOLS' HTTP functions (`HTTPGETCLOB` and the
+     like); its Oracle-compatible `UTL_…` and `DBMS_…` modules; and `EXPLAIN`,
+     which writes the explain tables. `VALUES` runs as a query. A comment is
+     read nested and not.
    - ClickHouse's FROM clause calls only `numbers`, `zeros`,
      `generate_series`, `generateRandom`, `values`, `null`, `view`, `merge`,
      `format` and `dictionary`, and a statement's own `SETTINGS` or `FORMAT`
@@ -1075,7 +1167,8 @@ top of them:
    BigQuery's dry run must call the statement a `SELECT` before it runs.
    ClickHouse runs it with `readonly=2`, so its login must not be at
    `readonly=1` (Cube's own queries set settings too). DuckDB has its
-   instance's lock (see DuckDB above). Snowflake, Dremio, Trino, Athena, Hive
+   instance's lock (see DuckDB above). Db2's connection is read-only as its
+   driver makes it (`readOnly`). Snowflake, Dremio, Trino, Athena, Hive
    and Impala have the check alone.
 4. **A connection of the run's own**, a pool of one, never one Cube serves
    with, dropped afterwards: nothing it sets outlives the run.
@@ -1086,7 +1179,8 @@ function with an autonomous transaction; and on Trino whatever a catalog's
 connector does on a read; on Hive and Spark a user's own UDFs, and views
 (an operator should also set `hive.server2.builtin.udf.blacklist=reflect,reflect2,java_method,in_file`,
 `hive.variable.substitute=false` and SQL-standard authorization); on Impala
-a UDF someone created.
+a UDF someone created; on Db2 a function that modifies data (a login with
+`SELECT` only, and `EXECUTE` on `SYSPROC.ADMIN_CMD` revoked).
 
 **Caps per run**, sent with each run (R50's by default):
 - **Rows** (`maxRows`, 10,000; at most 100,000): read as they come, one past
@@ -1645,6 +1739,11 @@ never written into the SQL.
   - BigQuery: `@p1`, with its `types` (`DATETIME` for a date and time) on
     the dry run and the job;
   - DuckDB: `$1`, `$1::DECIMAL(38, 2)`, `$1::DATE`, `$1::TIMESTAMP`, `$1::BOOLEAN`;
+  - Db2: `?`, every one typed (Db2 refuses a `?` whose type it can't tell):
+    `CAST(? AS VARCHAR(32672))`, `CAST(? AS DECIMAL(31, 2))`,
+    `CAST(? AS DATE)`, `CAST(? AS TIMESTAMP(6))` (sent with a space for the
+    `T`), `CAST(? AS BOOLEAN)`. A number of more than 31 digits is refused
+    (`invalid_value`): Db2's decimals hold no more.
   - ClickHouse: `{p1:String}`, `{p1:Decimal(38, 2)}`, `{p1:Date32}`,
     `{p1:DateTime64(6)}`, `{p1:Bool}`, as its query parameters. A date, or
     a date and time, outside 1900-01-01 to 2299-12-31 is refused
@@ -1720,6 +1819,7 @@ none were known yet):
 | 422 | `query_failed` | The database's message. DuckDB refusing a file or URL outside the source adds `reason: "outside_source"` |
 | 502 | `connect_failed` | |
 | 503 | `busy` | `Retry-After` |
+| 503 | `driver_unavailable` | A JDBC type whose vendor jar isn't mounted here; the message names the type and directory. No `Retry-After` |
 
 #### `POST …/connections/{name}/export`
 
@@ -1793,6 +1893,7 @@ timeoutMs? }` (`src/sql/export.ts`).
   | Oracle | 65,535 | 1,000 | ORA-01795: expressions in a list |
   | ClickHouse | 10,000 | 10,000 | xcube's: its parameters go in the URL, which the server caps (`http_max_uri_size`, 1 MiB by default) |
   | DuckDB, wechart's engine | 65,535 | 65,535 | xcube's |
+  | Db2 | 32,767 | 32,767 | Host variable references in a statement |
   | Trino, Athena, Hive, Impala | 10,000 | 10,000 | xcube's: each value is written in as a literal |
 
   The refusals above are `400 invalid_parameters` with the reason, before
@@ -1843,9 +1944,13 @@ holding one; `waiting` those waiting for one.
 
 The driver types a connection may use, for the client's catalog of what it
 can offer: `{ drivers: [{ type, available, reason? }] }`, in the order of
-`DRIVER_TYPES`. The same for every model. Every type is available today; a
-JDBC type will be available only where its vendor jar is mounted, with a
-`reason` naming the type and directory where it isn't.
+`DRIVER_TYPES`. The same for every model. Each driver in the image is
+available; a JDBC type (`db2`) only where its vendor's jar is mounted
+(`XCUBE_JDBC_DRIVERS_DIR`), with a `reason` naming the type and directory
+where it isn't:
+`{ "type": "db2", "available": false, "reason": "No driver jar is mounted for db2: this deployment sets no XCUBE_JDBC_DRIVERS_DIR" }`.
+A connection test, a stored connection, a SQL run or an export on a type
+that isn't available answers `503` with `code: "driver_unavailable"`.
 
 #### `GET …/meta`
 
@@ -2212,6 +2317,7 @@ that fails when it changes:
 | Each driver's option names: every connection field reaches the driver, and no `CUBEJS_DB_*` or `PG*` value does | `test/image/drivers-env.js`, in the image (CI) |
 | Policies, routing, overlays, connections and refresh, end to end | The integration tests and `test/image/serving.sh` |
 | DuckDB's extensions for the image's platform, and its `allowed_directories` on `s3://` | `test/image/duckdb.sh`, in the image (by hand) |
+| node-java (`jdbc/package-lock.json`) built against the image's JRE 21, the JVM started only with a JDBC connection, the helper's cells, binds, time limit and cancel | `test/image/jdbc.js`, in the image, offline and against a PostgreSQL through its JDBC driver (by hand) |
 
 To move:
 

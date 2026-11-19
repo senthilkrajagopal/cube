@@ -15,7 +15,7 @@
  */
 
 export type SqlDialect = 'postgres' | 'redshift' | 'mysql' | 'snowflake' | 'bigquery' | 'mssql' | 'oracle' | 'dremio'
-  | 'duckdb' | 'clickhouse' | 'trino' | 'athena' | 'cubestore' | 'hive' | 'impala';
+  | 'duckdb' | 'clickhouse' | 'trino' | 'athena' | 'cubestore' | 'hive' | 'impala' | 'db2';
 
 export type StatementKind = 'select' | 'explain';
 
@@ -110,6 +110,8 @@ interface Rules {
   impalaHints?: boolean;
   /** A doubled quote isn't the quote: it closes the string or name and opens another (Impala). */
   noDoubledQuotes?: boolean;
+  /** Db2: `VALUES` runs as a query; data-change table references, sequences and lock clauses refused. */
+  db2?: boolean;
   /** What may come between EXPLAIN and the statement, beyond the common options. */
   explainOptions?: Set<string>;
   /** Names refused anywhere, unquoted: statements that write or lock, and the words that start them. */
@@ -362,6 +364,21 @@ const RULES: Record<SqlDialect, Rules> = {
     deniedWords: new Set(WRITES),
     deniedFunction: HIVE_FUNCTIONS,
     deniedFunctionIs: { what: 'function', why: 'it runs code or reads files on the server' },
+  },
+  // IBM Db2 (LUW 11.1 and later): its EXPLAIN writes the explain tables; a quote is doubled in a string
+  // or name, never a backslash; its comments are read nested and not.
+  db2: {
+    ...base,
+    db2: true,
+    explain: 'writes',
+    readings: readings([false], BOTH),
+    // EXTERNAL reads a file as a table (`FROM EXTERNAL '/path' USING (…)`); KEEP … LOCKS and EXCLUSIVE take locks.
+    deniedWords: new Set([...WRITES, 'EXTERNAL', 'KEEP', 'EXCLUSIVE']),
+    // Its Oracle-compatible modules that reach files, mail or the network, run SQL from a string, or act.
+    deniedName: /^(utl_.*|dbms_(?!(lob|utility)$).*)$/,
+    // SYSTOOLS' HTTP functions: the server calls a URL.
+    deniedFunction: /^http(get|post|put|delete|head)?(blob|clob)?(verbose)?$/,
+    deniedFunctionIs: { what: 'function', why: 'the server calls a URL with it' },
   },
   // Apache Impala. Its SET, USE, REFRESH, INVALIDATE METADATA, COMPUTE STATS, LOAD DATA, :SHUTDOWN(),
   // ALTER and COMMENT are statements, refused as any but a read is; after a WITH it takes only a
@@ -663,6 +680,26 @@ function checkHive(sql: string, lexed: Lexed, refuse: (message: string, refused?
   }
 }
 
+/**
+ * Db2's own, beyond the words refused anywhere:
+ * - a data-change table reference, `FINAL TABLE (INSERT …)`, `NEW TABLE`,
+ *   `OLD TABLE`: the statement in it writes;
+ * - a sequence's `NEXT VALUE FOR` (and `NEXTVAL`), which moves it, and
+ *   `PREVIOUS VALUE FOR` (`PREVVAL`), which reads a session's own.
+ */
+function checkDb2(tokens: Token[], refuse: (message: string, refused?: Refused) => never) {
+  for (let k = 0; k < tokens.length; k++) {
+    const t = tokens[k];
+    if (isWord(t, 'FINAL', 'NEW', 'OLD') && isWord(tokens[k + 1], 'TABLE')) {
+      refuse(`${t.value} TABLE (…) reads what a statement in it writes: only reads run here`, { kind: 'clause', name: `${t.value} TABLE` });
+    }
+    if ((isWord(t, 'NEXT', 'PREVIOUS') && isWord(tokens[k + 1], 'VALUE')) || isWord(t, 'NEXTVAL', 'PREVVAL')) {
+      const name = t.value.startsWith('N') ? 'NEXT VALUE' : 'PREVIOUS VALUE';
+      refuse(`${name} FOR reads a sequence${name === 'NEXT VALUE' ? ', and moves it' : '\'s value of the session'}: only reads of tables run here`, { kind: 'clause', name });
+    }
+  }
+}
+
 /** Checks one reading of a statement: what it is, and that it is a read. */
 function check(sql: string, rules: Rules, reading: Reading, redacted: () => string): { statement: StatementKind; cut: number | null } {
   let lexed: Lexed;
@@ -711,7 +748,7 @@ function check(sql: string, rules: Rules, reading: Reading, redacted: () => stri
   const first = tokens[start];
   let statement: StatementKind;
   let query = start;
-  if (isWord(first, 'SELECT', 'WITH')) {
+  if (isWord(first, 'SELECT', 'WITH') || (rules.db2 && isWord(first, 'VALUES'))) {
     statement = 'select';
   } else if (isWord(first, 'EXPLAIN') && start === 0) {
     statement = 'explain';
@@ -719,7 +756,9 @@ function check(sql: string, rules: Rules, reading: Reading, redacted: () => stri
       refuse('This database has no EXPLAIN statement: only a SELECT runs here', 'explain');
     }
     if (rules.explain === 'writes') {
-      refuse('Oracle\'s EXPLAIN PLAN writes the plan into PLAN_TABLE: only a SELECT runs here', 'explain');
+      refuse(rules.db2
+        ? 'Db2\'s EXPLAIN writes the plan into the explain tables: only a SELECT runs here'
+        : 'Oracle\'s EXPLAIN PLAN writes the plan into PLAN_TABLE: only a SELECT runs here', 'explain');
     }
     let at = 1;
     if (rules.clickhouse) {
@@ -806,6 +845,9 @@ function check(sql: string, rules: Rules, reading: Reading, redacted: () => stri
   }
   if (rules.hive) {
     checkHive(sql, lexed, (message, refused) => refuse(message, statement, 'not_read_only', refused));
+  }
+  if (rules.db2) {
+    checkDb2(tokens, (message, refused) => refuse(message, statement, 'not_read_only', refused));
   }
   // `WITH SESSION query_max_run_time = '1h' SELECT …`; a query named session is `WITH session AS (…)`.
   if (rules.trino && isWord(tokens[query], 'WITH') && isWord(tokens[query + 1], 'SESSION')
@@ -894,6 +936,12 @@ export function lexedKinds(text: string, dialect: SqlDialect): string[] | null {
  * SQL, whose values the driver writes in as literals (`hive.ts`).
  */
 export function hivePlaceholders(sql: string, dialect: 'hive' | 'impala' = 'hive'): number[] {
+  const rules = RULES[dialect];
+  return lex(sql, rules, rules.readings[0]).tokens.filter((t) => isOp(t, '?')).map((t) => t.start);
+}
+
+/** The places of a JDBC dialect's `?` in Cube's SQL, as `hivePlaceholders` (`db2.ts`). */
+export function jdbcPlaceholders(sql: string, dialect: 'db2'): number[] {
   const rules = RULES[dialect];
   return lex(sql, rules, rules.readings[0]).tokens.filter((t) => isOp(t, '?')).map((t) => t.start);
 }
@@ -1073,6 +1121,7 @@ function writtenPlaceholder(dialect: SqlDialect, tokens: Token[], k: number): st
     case 'redshift':
       return t.value === '$' && next?.kind === 'number' && touches(t, next) ? `$${next.value}` : null;
     case 'mysql':
+    case 'db2':
       return t.value === '?' ? '?' : null;
     case 'snowflake':
       if (t.value === '?') {

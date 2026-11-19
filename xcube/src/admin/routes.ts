@@ -30,6 +30,7 @@ import {
 import { ConnectionError } from '../connections/connections';
 import { duckdbPool } from '../connections/duckdb';
 import { driverAvailability } from '../connections/drivers';
+import { DriverUnavailableError } from '../connections/jvm';
 import { CredentialError } from '../credentials/credentials';
 import { MODEL_ID, SnapshotError } from '../model/snapshot';
 import { checkDataSourceName } from '../names/items';
@@ -276,6 +277,7 @@ const SQL_STATUS: Record<SqlFailure, number> = {
   query_failed: 422,
   connect_failed: 502,
   busy: 503,
+  driver_unavailable: 503,
 };
 
 const overlaySchema = Joi.object({
@@ -431,6 +433,9 @@ export function initAdminRoutes(
       } else if (e instanceof OutOfRangeError) {
         status = 409;
         body = { error: e.message, code: 'reference_range', items: e.items };
+      } else if (e instanceof DriverUnavailableError) {
+        status = 503;
+        body = { error: e.message, code: 'driver_unavailable', type: e.type };
       } else if (e instanceof LaneBusyError) {
         status = 503;
         res.set('Retry-After', String(Math.ceil(e.retryAfterMs / 1000)));
@@ -811,7 +816,7 @@ export function initAdminRoutes(
         ...logged, outcome: e.code, ...(e.partial ? { rows: e.partial.rowCount } : {}), durationMs: Date.now() - started,
       });
       const status = SQL_STATUS[e.code];
-      if (status === 503) {
+      if (status === 503 && e.code !== 'driver_unavailable') {
         res.set('Retry-After', '5');
       }
       res.status(status).json({
@@ -964,7 +969,7 @@ export function initAdminRoutes(
       }
       finished = true;
       const status = SQL_STATUS[e.code];
-      if (status === 503) {
+      if (status === 503 && e.code !== 'driver_unavailable') {
         res.set('Retry-After', '5');
       }
       res.status(status).json({

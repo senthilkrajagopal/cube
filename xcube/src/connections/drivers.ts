@@ -13,14 +13,16 @@ import { keyByDataSource } from '@cubejs-backend/shared';
 
 import { makeAthenaDriver } from './athena';
 import { makeClickHouseDriver } from './clickhouse';
+import { makeDb2Driver } from './db2';
 import { makeDuckdbDriver } from './duckdb';
 import { baseUrlProblems, makeEngineDriver } from './engine';
 import { withoutEnv } from './env';
 import { makeHiveDriver } from './hive';
+import { isJdbcType, jdbcUnavailable } from './jvm';
 import { makeTrinoDriver } from './trino';
 
 export const DRIVER_TYPES = [
-  'postgres', 'redshift', 'mysql', 'snowflake', 'bigquery', 'mssql', 'oracle', 'dremio', 'duckdb', 'clickhouse', 'trino', 'athena', 'engine', 'hive', 'impala',
+  'postgres', 'redshift', 'mysql', 'snowflake', 'bigquery', 'mssql', 'oracle', 'dremio', 'duckdb', 'clickhouse', 'trino', 'athena', 'engine', 'hive', 'impala', 'db2',
 ] as const;
 
 export type DriverType = (typeof DRIVER_TYPES)[number];
@@ -212,6 +214,8 @@ const optionUnsafe = (fields: Fields, keys: string[]) => keys
   .map((key) => `${key} can't hold a quote, a backtick, whitespace, -- or /*, or any of ; \\ , = & ? @ : / { }`);
 
 const hiveCheck = (f: Fields) => [...hostProblems(f), ...optionUnsafe(f, ['database'])];
+
+const db2Check = (f: Fields) => [...hostProblems(f), ...optionUnsafe(f, ['database', 'currentSchema'])];
 
 const trinoCheck = (f: Fields) => [...hostProblems(f), ...unsafeNames(f, ['catalog', 'schema'])];
 
@@ -686,6 +690,36 @@ export const DRIVERS: Record<DriverType, DriverSpec> = {
     },
     make: makeHiveDriver,
   },
+  /**
+   * IBM Db2, over IBM's JDBC driver (its jar mounted: `jvm.ts`), with or
+   * without TLS; a user and password, encrypted where TLS is off. xcube's
+   * driver (`jdbc.ts`, `db2.ts`), its own dialect (`db2-dialect.ts`).
+   */
+  db2: {
+    cubeType: 'db2',
+    connection: [
+      text('host', { required: true }), text('port', { kind: 'number' }), text('database', { required: true }), text('currentSchema'),
+      ...tlsFields,
+    ],
+    auth: { password: [text('user', { required: true }), secret('password')] },
+    target: ['host', 'port', ...TLS_TARGET],
+    check: db2Check,
+    config(f, auth, s) {
+      checked(this, f, auth);
+      const ssl = tls(f, s, false, true);
+      return {
+        host: str(f.host),
+        port: num(f.port, 50000),
+        database: str(f.database),
+        currentSchema: str(f.currentSchema),
+        user: str(f.user),
+        password: s.password,
+        ssl: ssl ? { rejectUnauthorized: ssl.rejectUnauthorized, ca: ssl.ca } : false,
+        readOnly: true,
+      };
+    },
+    make: makeDb2Driver,
+  },
 };
 
 /**
@@ -702,6 +736,7 @@ function registerCubeType(type: string, modulePath: string) {
 }
 
 registerCubeType('impala', require.resolve('./impala-type'));
+registerCubeType('db2', require.resolve('./db2-type'));
 
 /** A driver type, and whether this deployment can connect one: `reason` says why not, where it can't. */
 export interface DriverAvailability {
@@ -712,12 +747,14 @@ export interface DriverAvailability {
 
 /**
  * Every driver type xcube takes, each marked available or not, for the
- * client's catalog of what it can offer (`GET …/drivers`). Every one is, so
- * far: each driver is in the image. JDBC types, whose vendor jars are
- * mounted, will be available only with their jar.
+ * client's catalog of what it can offer (`GET …/drivers`): each driver in the
+ * image is; a JDBC type is only with its vendor's jar mounted (`jvm.ts`).
  */
 export function driverAvailability(): DriverAvailability[] {
-  return DRIVER_TYPES.map((type) => ({ type, available: true }));
+  return DRIVER_TYPES.map((type) => {
+    const reason = isJdbcType(type) ? jdbcUnavailable(type) : null;
+    return reason ? { type, available: false, reason } : { type, available: true };
+  });
 }
 
 export function isDriverType(type: unknown): type is DriverType {

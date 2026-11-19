@@ -95,6 +95,8 @@ const cases = {
   'hive (username)': [{ host: 'xc-host', port: 10000, database: 'xc-db', user: 'xc-user', ssl: false }, 'username', {}, 'hive'],
   impala: [{ host: 'xc-host', port: 21050, database: 'xc-db', user: 'xc-user', ssl: true, sslCa: 'xc-ca' }, 'password', { password: 'xc-password' }],
   'impala (none)': [{ host: 'xc-host', port: 21050, database: 'xc-db', ssl: false }, 'none', {}, 'impala'],
+  db2: [{ host: 'xc-host', port: 50000, database: 'xc-db', user: 'xc-user', ssl: true, sslCa: 'xc-ca' }, 'password', { password: 'xc-password' }],
+  'db2 (no TLS)': [{ host: 'xc-host', port: 50000, database: 'xc-db', user: 'xc-user', ssl: false }, 'password', { password: 'xc-password' }, 'db2'],
   athena: [{ region: 'eu-west-1', workGroup: 'xc-workgroup', s3OutputLocation: 's3://xc-results/', catalog: 'xc-catalog', database: 'xc-db', accessKeyId: 'AKIAXCXCXCXCXCXCXCXC' }, 'access-key', { secretAccessKey: 'xc-secret' }],
 };
 
@@ -126,7 +128,8 @@ const seen = (value, values) => {
   walk(value, 0);
   return [...found];
 };
-const POISONED = [...Object.values(POISON), ...Object.values(AWS_POISON)].filter((p) => p.length > 3);
+// A boolean's word is no value to find: a JDBC driver's properties hold `true` of their own (Db2's readOnly).
+const POISONED = [...Object.values(POISON), ...Object.values(AWS_POISON)].filter((p) => p.length > 3 && p !== 'true');
 
 (async () => {
   let failed = false;
@@ -141,7 +144,11 @@ const POISONED = [...Object.values(POISON), ...Object.values(AWS_POISON)].filter
     try {
       const config = { ...spec.config(fields, auth, secrets), dataSource: 'conn_x', maxPoolSize: 1 };
       const driver = spec.make ? spec.make(config) : CubejsServerCore.createDriver(spec.cubeType, config);
-      const parts = [driver.config, driver.options, driver.poolConfig];
+      const parts = [driver.config, driver.options, driver.poolConfig, driver.target];
+      // A JDBC driver's CA is a file of its own: what it holds.
+      for (const file of driver.target?.files ?? []) {
+        parts.push(require('fs').readFileSync(file, 'utf8'));
+      }
       if (driver.credentials && typeof driver.credentials.getCredentials === 'function') {
         parts.push(await driver.credentials.getCredentials());
         parts.push({ provider: driver.credentials.constructor.name });

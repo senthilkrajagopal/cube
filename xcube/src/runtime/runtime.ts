@@ -35,6 +35,7 @@ import {
 import { Connections, ConnectionError, type ConnectionInput } from '../connections/connections';
 import { CredentialError, CredentialKeys, type SealedV1 } from '../credentials/credentials';
 import { DRIVERS, isDriverType } from '../connections/drivers';
+import { assertJdbcAvailable, isJdbcType, jdbcUnavailable } from '../connections/jvm';
 import { dataSourcesOf, epochOf, targetOf, withIdentityAliases } from '../connections/aliases';
 import { calcVersion, specKey, withCompanions, type CalcSpec } from '../calcs/companions';
 import { CalculationError, planCalculations, type CalcPlan } from '../calcs/requests';
@@ -1917,6 +1918,8 @@ export class XcubeRuntime {
     }
     XcubeRuntime.checkDefault(name, body.folderId);
     const { driver, fields } = this.connections.check(body);
+    // A JDBC type whose vendor jar isn't mounted here: 503, `driver_unavailable`.
+    assertJdbcAvailable(driver);
     const stored = await store.putConnection({
       model,
       name,
@@ -2035,6 +2038,7 @@ export class XcubeRuntime {
   }
 
   public testConnection(input: ConnectionInput) {
+    assertJdbcAvailable(input.driver);
     return this.connections.test(input);
   }
 
@@ -2163,12 +2167,18 @@ export class XcubeRuntime {
       throw new SqlRunError('unknown_connection', `No connection "${on.connection}"${on.overlay === undefined ? '' : ` in overlay "${on.overlay}"`}`);
     }
     const found = connection;
+    const jdbcReason = isJdbcType(found.driver) ? jdbcUnavailable(found.driver) : null;
+    if (jdbcReason) {
+      throw new SqlRunError('driver_unavailable', jdbcReason);
+    }
     // The database's own statement timeout, where Cube's driver sets it from its config.
     const config: Record<string, unknown> = {
       snowflake: { executionTimeout: Math.ceil(request.timeoutMs / 1000) },
       mssql: { requestTimeout: request.timeoutMs },
       // ClickHouse's is a setting sent with the query; its HTTP request outlasts the run's own clock.
       clickhouse: { requestTimeout: request.timeoutMs + 30000 },
+      // Db2's is set on each statement; its socket's read timeout is set past it.
+      db2: { queryTimeout: Math.ceil(request.timeoutMs / 1000) },
     }[found.driver] ?? {};
     return {
       dialect: (isDriverType(found.driver) ? DRIVERS[found.driver].cubeType : found.driver) as SessionDialect,
