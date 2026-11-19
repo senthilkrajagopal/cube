@@ -1,4 +1,4 @@
-import { DEFAULT_LIMITS, type SnapshotLimits } from '../model/snapshot';
+import { DEFAULT_LIMITS, MAX_FILES_RANGE, type SnapshotLimits } from '../model/snapshot';
 import { duckdbSettingsFromEnv } from '../connections/duckdb';
 import { exportFetchFromEnv } from '../sql/export';
 import { assertSchemaName } from '../store/db';
@@ -108,6 +108,13 @@ function number(env: NodeJS.ProcessEnv, name: string, fallback: number): number 
   return value;
 }
 
+function maxFiles(files: number): number {
+  if (files < MAX_FILES_RANGE.min || files > MAX_FILES_RANGE.max) {
+    throw new Error(`XCUBE_MAX_SNAPSHOT_FILES must be from ${MAX_FILES_RANGE.min} to ${MAX_FILES_RANGE.max}`);
+  }
+  return files;
+}
+
 /** Every 10 minutes: a report within the hour then means an instance running. */
 export const DEFAULT_CONNECTION_HEARTBEAT_MS = 10 * 60 * 1000;
 
@@ -185,6 +192,7 @@ export function settingsFromEnv(env: NodeJS.ProcessEnv = process.env): XcubeSett
     limits: {
       ...DEFAULT_LIMITS,
       maxBytes: number(env, 'XCUBE_MAX_SNAPSHOT_BYTES', DEFAULT_LIMITS.maxBytes),
+      maxFiles: maxFiles(number(env, 'XCUBE_MAX_SNAPSHOT_FILES', DEFAULT_LIMITS.maxFiles)),
       fileTypes: fileTypes(env.XCUBE_FILE_TYPES),
     },
     compileQueue: number(env, 'XCUBE_COMPILE_QUEUE', 4),

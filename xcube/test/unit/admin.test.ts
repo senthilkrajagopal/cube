@@ -208,7 +208,16 @@ describe('settingsFromEnv', () => {
       catchUpMs: 10000,
       connectionHeartbeatMs: 600000,
       adminTokens: [TOKEN, OLD_TOKEN],
+      limits: { maxBytes: 33554432, maxFiles: 50000 },
     });
+  });
+
+  test('takes a model\'s most files from 1 to 100000', () => {
+    const env = { XCUBE_DATABASE_URL: 'postgres://x' };
+    expect(settingsFromEnv({ ...env, XCUBE_MAX_SNAPSHOT_FILES: '100000' })!.limits.maxFiles).toBe(100000);
+    expect(settingsFromEnv({ ...env, XCUBE_MAX_SNAPSHOT_FILES: '1' })!.limits.maxFiles).toBe(1);
+    expect(() => settingsFromEnv({ ...env, XCUBE_MAX_SNAPSHOT_FILES: '100001' })).toThrow(/XCUBE_MAX_SNAPSHOT_FILES must be from 1 to 100000/);
+    expect(() => settingsFromEnv({ ...env, XCUBE_MAX_SNAPSHOT_FILES: '0' })).toThrow(/from 1 to 100000/);
   });
 
   test('refuses short tokens, the API secret, bad numbers and schema names', () => {

@@ -1,11 +1,15 @@
+import crypto from 'crypto';
+
 import {
   checkedSnapshot,
   contentHash,
   DEFAULT_LIMITS,
   fileHash,
+  jsonArrayHash,
   MODEL_ID,
   SnapshotError,
 } from '../../src/model/snapshot';
+import { byteChunks } from '../../src/store/revisions';
 
 describe('contentHash', () => {
   // The golden vector wechart tests too: its version is the first 16 characters.
@@ -25,6 +29,16 @@ describe('contentHash', () => {
   test('sorts by byte order, so upper case comes first', () => {
     const a = [{ path: 'b.yml', content: '' }, { path: 'B.yml', content: 'x' }];
     expect(contentHash(a)).toBe(contentHash([a[1], a[0]]));
+  });
+
+  test('is taken a file at a time, over the same bytes as the whole JSON', () => {
+    const entries = [
+      {}, { fileName: 'a.yml', content: 'cubes:\n  - name: "q\'"\n\t\\' }, { fileName: 'é.yml', content: '\u2028 \u{1F600} \u0000' },
+    ];
+    const whole = (e: object[]) => crypto.createHash('sha256').update(JSON.stringify(e), 'utf8').digest('hex');
+    expect(jsonArrayHash(entries)).toBe(whole(entries));
+    expect(jsonArrayHash([entries[1]])).toBe(whole([entries[1]]));
+    expect(jsonArrayHash([])).toBe(whole([]));
   });
 
   test('a file hash is the SHA-256 of its content', () => {
@@ -101,4 +115,12 @@ test('model ids', () => {
   for (const id of ['', 'Dev', '-a', '_a', 'a.b', 'a'.repeat(64)]) {
     expect(MODEL_ID.test(id)).toBe(false);
   }
+});
+
+describe('byteChunks', () => {
+  test('splits contents in order into parts under the byte limit; a larger one alone', () => {
+    const entries: [string, string][] = [['a', 'xx'], ['b', 'é'], ['c', 'xxxxx'], ['d', 'x'], ['e', 'x']];
+    expect(byteChunks(entries, 4).map((part) => part.map(([hash]) => hash))).toEqual([['a', 'b'], ['c'], ['d', 'e']]);
+    expect(byteChunks([], 4)).toEqual([]);
+  });
 });

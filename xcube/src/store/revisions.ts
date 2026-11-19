@@ -6,6 +6,30 @@ import type { AuthoredItem, Folder, PublishedItem } from '../names/items';
 import { filesOf } from '../names/publish';
 import { assertSchemaName, inTransaction } from './db';
 
+/** The most content one INSERT of files carries. */
+export const INSERT_CHUNK_BYTES = 64 * 1024 * 1024;
+
+/** `entries` ([hash, content]) in order, in parts of at most `maxBytes` of content (or one entry, when larger). */
+export function byteChunks(entries: [string, string][], maxBytes: number): [string, string][][] {
+  const parts: [string, string][][] = [];
+  let part: [string, string][] = [];
+  let bytes = 0;
+  for (const entry of entries) {
+    const size = Buffer.byteLength(entry[1], 'utf8');
+    if (part.length && bytes + size > maxBytes) {
+      parts.push(part);
+      part = [];
+      bytes = 0;
+    }
+    part.push(entry);
+    bytes += size;
+  }
+  if (part.length) {
+    parts.push(part);
+  }
+  return parts;
+}
+
 /** `files`: a whole file set per revision (slice 2). `items`: folders and items, resolved by xcube (slice 3). */
 export type ModelMode = 'files' | 'items';
 
@@ -1027,11 +1051,12 @@ export class PgRevisionStore implements RevisionStore {
           missing.set(hashes[i], content);
         }
       });
-      if (missing.size) {
+      // In parts: one array parameter is one string, which V8 caps near 512 MiB.
+      for (const part of byteChunks([...missing.entries()], INSERT_CHUNK_BYTES)) {
         await client.query(
           `INSERT INTO ${s}.files (model, hash, content)
            SELECT $1, * FROM unnest($2::text[], $3::text[])`,
-          [model, [...missing.keys()], [...missing.values()]]
+          [model, part.map(([key]) => key), part.map(([, content]) => content)]
         );
       }
 

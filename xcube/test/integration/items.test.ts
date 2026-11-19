@@ -396,4 +396,24 @@ describeWithDatabase('xcube items and changesets', () => {
     }).expect(422);
     expect(lacking.body.errors[0]).toMatchObject({ folderId: 'fgone', kind: 'folder' });
   });
+
+  test('a model\'s first revision may be a changeset on a null base; a retry of it is unchanged', async () => {
+    const at = (url: string) => `/cubejs-api/v1/semantic/models/fresh${url}`;
+    const send = (method: 'put' | 'post', url: string, body: object) => request(server)[method](at(url))
+      .set('Authorization', `Bearer ${ADMIN_TOKEN}`).send(body);
+    // No folder tree yet: refused, and nothing stored.
+    const treeless = await send('post', '/changesets', { baseRevision: null, upserts: [customers] }).expect(400);
+    expect(treeless.body).toMatchObject({ code: 'invalid_folders', problems: [expect.stringMatching(/no folder tree yet/)] });
+    await send('put', '/folders', { folders }).expect(200);
+
+    const first = await send('post', '/changesets', { baseRevision: null, upserts: [customers] }).expect(201);
+    expect(first.body).toMatchObject({ revision: 1, created: true });
+    // The same changeset again (a client that timed out): already in, so unchanged.
+    const again = await send('post', '/changesets', { baseRevision: null, upserts: [customers] }).expect(200);
+    expect(again.body).toMatchObject({ revision: 1, created: false });
+    // Another one on the null base is a conflict, naming the revision now current.
+    const other = await send('post', '/changesets', { baseRevision: null, upserts: [orders('froot')] }).expect(409);
+    expect(other.body).toMatchObject({ currentRevision: 1 });
+    await send('post', '/changesets', { baseRevision: 1, upserts: [orders('froot')] }).expect(201);
+  });
 });

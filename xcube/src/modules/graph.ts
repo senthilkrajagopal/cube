@@ -72,6 +72,77 @@ function newModuleId(members: string[]): string {
 }
 
 /**
+ * Small components (each sorted) packed into groups of at most `packMax`
+ * items, so a change leaves the packs it doesn't touch as they were: their
+ * versions, and so their compiled modules, stay.
+ * - A component stays with the previous module most of its members were in,
+ *   while that pack has room (in order, when `packMax` was lowered).
+ * - A new component goes, by zone and first member, into a pack of its zone
+ *   with room, or the pack being filled, or a new one. Packing from nothing
+ *   is the same as packing in that order, same zone first.
+ */
+export function packSmall(
+  small: string[][],
+  zoneOfGroup: (members: string[]) => string,
+  previousOf: ReadonlyMap<string, string>,
+  packMax: number,
+): string[][] {
+  const orderOf = (members: string[]) => `${zoneOfGroup(members)}\u0000${members[0]}`;
+  const byOrder = (a: string[], b: string[]) => (orderOf(a) < orderOf(b) ? -1 : 1);
+  const kept = new Map<string, string[][]>();
+  const fresh: string[][] = [];
+  for (const members of small) {
+    const counts = new Map<string, number>();
+    members.forEach((m) => {
+      const id = previousOf.get(m);
+      if (id) {
+        counts.set(id, (counts.get(id) ?? 0) + 1);
+      }
+    });
+    const [id] = [...counts].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))[0] ?? [];
+    if (id) {
+      kept.set(id, [...(kept.get(id) ?? []), members]);
+    } else {
+      fresh.push(members);
+    }
+  }
+
+  const packs: { members: string[]; zones: Set<string> }[] = [];
+  for (const id of [...kept.keys()].sort()) {
+    const pack = { members: [] as string[], zones: new Set<string>() };
+    for (const members of kept.get(id)!.sort(byOrder)) {
+      if (pack.members.length + members.length > packMax) {
+        fresh.push(members);
+      } else {
+        pack.members.push(...members);
+        pack.zones.add(zoneOfGroup(members));
+      }
+    }
+    if (pack.members.length) {
+      packs.push(pack);
+    }
+  }
+
+  let filling: { members: string[]; zones: Set<string> } | undefined;
+  for (const members of fresh.sort(byOrder)) {
+    const zone = zoneOfGroup(members);
+    const fits = (p: { members: string[] }) => p.members.length + members.length <= packMax;
+    let pack = packs.find((p) => p.zones.has(zone) && fits(p));
+    if (!pack && filling && fits(filling)) {
+      pack = filling;
+    }
+    if (!pack) {
+      pack = { members: [], zones: new Set() };
+      packs.push(pack);
+    }
+    pack.members.push(...members);
+    pack.zones.add(zone);
+    filling = pack;
+  }
+  return packs.map((p) => p.members);
+}
+
+/**
  * Groups items into modules that compile independently.
  *
  * - A cube used by items of two or more zones (the first folder under the
@@ -81,7 +152,8 @@ function newModuleId(members: string[]): string {
  * - Everything else is grouped by connected components (union-find) over
  *   references, so every module is reference-closed and every valid query
  *   fits in one.
- * - Small components are packed together, same zone first.
+ * - Small components are packed together, same zone first; a pack a change
+ *   doesn't touch stays as it was (`packSmall`).
  * - Module ids are kept from `previous` by greatest overlap, so a module that
  *   changes keeps its id; new ones are named after their members.
  */
@@ -144,32 +216,18 @@ export function groupModules(
     components.set(root, [...(components.get(root) ?? []), node.fullName]);
   }
 
-  // Pack small components, same zone first, into modules of at most packMax items.
+  // Pack small components into modules of at most packMax items (`packSmall`).
   const large: string[][] = [];
   const small: string[][] = [];
   for (const members of components.values()) {
     (members.length < options.packMin ? small : large).push(members.sort());
   }
-  const zoneOfGroup = (members: string[]) => zoneOf(byName.get(members[0])!.folderId);
-  const orderOf = (members: string[]) => `${zoneOfGroup(members)}\u0000${members[0]}`;
-  small.sort((a, b) => (orderOf(a) < orderOf(b) ? -1 : 1));
-  const packed: string[][] = [];
-  let pack: string[] = [];
-  for (const members of small) {
-    if (pack.length && pack.length + members.length > options.packMax) {
-      packed.push(pack);
-      pack = [];
-    }
-    pack = pack.concat(members);
-  }
-  if (pack.length) {
-    packed.push(pack);
-  }
+  const previousOf = new Map<string, string>();
+  previous.forEach((module) => module.id !== COMMONS && module.members.forEach((m) => previousOf.set(m, module.id)));
+  const packed = packSmall(small, (members) => zoneOf(byName.get(members[0])!.folderId), previousOf, options.packMax);
   const groups = [...large, ...packed].map((members) => members.sort());
 
   // Stable ids: the new group that overlaps a previous module most keeps its id.
-  const previousOf = new Map<string, string>();
-  previous.forEach((module) => module.id !== COMMONS && module.members.forEach((m) => previousOf.set(m, module.id)));
   const overlaps: { group: number; id: string; count: number }[] = [];
   groups.forEach((members, group) => {
     const counts = new Map<string, number>();

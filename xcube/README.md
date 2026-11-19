@@ -207,6 +207,7 @@ In both modes:
 | `XCUBE_RETIRE_GRACE_MS` | `300000` | How long a replaced revision stays compiled |
 | `XCUBE_KEEP_REVISIONS` | `50` | Revisions kept per model |
 | `XCUBE_MAX_SNAPSHOT_BYTES` | `33554432` | The most content one snapshot may hold (also bounded by `CUBEJS_MAX_REQUEST_SIZE`) |
+| `XCUBE_MAX_SNAPSHOT_FILES` | `50000` | The most files (an items model: items) a model may hold, from 1 to 100000 |
 | `XCUBE_FILE_TYPES` | `yaml` | `yaml` takes plain YAML only; `all` also takes JavaScript, Jinja and Python, which Cube runs as code in its own process, so that whoever may import may run code in Cube |
 | `XCUBE_MAX_MODELS` | `1000` | The most models one process follows |
 | `XCUBE_MODULE_PACK_MIN` | `50` | Groups smaller than this are packed together into modules |
@@ -318,7 +319,12 @@ modules it touches.
     using it compiles a copy of it and of what it references. The shared
     cubes also form the `commons` module.
   - Groups under `XCUBE_MODULE_PACK_MIN` items (50) are packed into modules
-    of at most `XCUBE_MODULE_PACK_MAX` (300), same zone first.
+    of at most `XCUBE_MODULE_PACK_MAX` (300), same zone first. A group stays
+    in the pack it was in while that pack has room; a new one joins a pack
+    of its zone with room, or the pack being filled, or a new pack. Adding
+    items so changes only the packs they join: a model grown by batches of
+    changesets compiles each pack about once, whatever order its items
+    come in.
 - **Versions.**
   - A module's version is the hash of its files. A module that didn't
     change keeps its compiled model from one revision to the next, and
@@ -1414,7 +1420,8 @@ Makes the files the model's new current revision, once they compile.
 - A path is ASCII segments ending in `.yml` or `.yaml` (with
   `XCUBE_FILE_TYPES=all`, also `.js`, `.jinja` or `.py`), without `..`. A
   YAML file holding Jinja tags (`{{`, `{%`) is refused unless
-  `XCUBE_FILE_TYPES=all`. At most 10,000 files, 4 MiB each.
+  `XCUBE_FILE_TYPES=all`. At most `XCUBE_MAX_SNAPSHOT_FILES` files (50,000),
+  4 MiB each.
 - The content hash is the SHA-256 of the files sorted by path, as the JSON
   `[{"fileName": path, "content": content}, …]`.
 

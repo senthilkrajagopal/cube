@@ -32,7 +32,7 @@ import { duckdbPool } from '../connections/duckdb';
 import { driverAvailability } from '../connections/drivers';
 import { DriverUnavailableError } from '../connections/jvm';
 import { CredentialError } from '../credentials/credentials';
-import { MODEL_ID, SnapshotError } from '../model/snapshot';
+import { MAX_FILES_RANGE, MODEL_ID, SnapshotError } from '../model/snapshot';
 import { checkDataSourceName } from '../names/items';
 import { PARAMETER_NAME } from '../sql/classify';
 import type { QueueEntry } from '../gateway';
@@ -136,7 +136,8 @@ const itemsSnapshotSchema = Joi.object({
     .allow(null)
     .required(),
   folders: Joi.array().max(100000).items(folderSchema).required(),
-  items: Joi.array().max(20000).items(itemSchema).required(),
+  // The model's own cap is XCUBE_MAX_SNAPSHOT_FILES.
+  items: Joi.array().max(MAX_FILES_RANGE.max).items(itemSchema).required(),
   source: jsonObject(4096).default({}),
 });
 

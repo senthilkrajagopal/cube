@@ -40,9 +40,12 @@ export interface SnapshotLimits {
 export const DEFAULT_LIMITS: SnapshotLimits = {
   maxBytes: 32 * 1024 * 1024,
   maxFileBytes: 4 * 1024 * 1024,
-  maxFiles: 10000,
+  maxFiles: 50000,
   fileTypes: 'yaml',
 };
+
+/** The range `XCUBE_MAX_SNAPSHOT_FILES` may be set in. */
+export const MAX_FILES_RANGE = { min: 1, max: 100000 };
 
 export class SnapshotError extends Error {
   public constructor(
@@ -111,13 +114,24 @@ function sha256(text: string): string {
 }
 
 /**
+ * The SHA-256 of `JSON.stringify(entries)`, taken one entry at a time: the
+ * same bytes, never held as one string. A model's whole JSON can pass V8's
+ * longest string (about 512 MiB) well before its limits do.
+ */
+export function jsonArrayHash(entries: object[]): string {
+  const hash = crypto.createHash('sha256').update('[', 'utf8');
+  entries.forEach((entry, i) => hash.update(i ? `,${JSON.stringify(entry)}` : JSON.stringify(entry), 'utf8'));
+  return hash.update(']', 'utf8').digest('hex');
+}
+
+/**
  * The snapshot's identity: the SHA-256 of its files, sorted by path, as the
  * JSON `[{"fileName": path, "content": content}, …]`. wechart computes the
  * same over its published files (its version is the first 16 characters),
  * so either side can tell whether the other holds the same model.
  */
 export function contentHash(files: SnapshotFile[]): string {
-  return sha256(JSON.stringify(sortedByPath(files).map(({ path, content }) => ({ fileName: path, content }))));
+  return jsonArrayHash(sortedByPath(files).map(({ path, content }) => ({ fileName: path, content })));
 }
 
 /** A file's content is stored once, under this. */

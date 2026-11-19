@@ -1,4 +1,4 @@
-import { COMMONS, groupModules, moduleIndex, type GraphNode } from '../../src/modules/graph';
+import { COMMONS, groupModules, moduleIndex, packSmall, type GraphNode } from '../../src/modules/graph';
 
 const zoneOf = (folderId: string) => folderId.split('/')[0];
 const node = (fullName: string, folderId: string, references: string[] = [], kind: 'cube' | 'view' = 'cube'): GraphNode => (
@@ -93,5 +93,30 @@ describe('groupModules', () => {
     const index = moduleIndex(second);
     expect(index.owner.get('a1')).toBe(id);
     expect(index.owner.get('b1')).not.toBe(id);
+  });
+
+  test('adding items leaves the packs they don\'t join as they were', () => {
+    const options = { packMin: 50, packMax: 3 };
+    const named = (names: string[]) => names.map((n) => node(n, 'a'));
+    const first = groupModules(named(['c1', 'c3', 'c5', 'c7', 'c9', 'd1']), zoneOf, [], options);
+    expect(first.map((m) => m.members)).toEqual(expect.arrayContaining([['c1', 'c3', 'c5'], ['c7', 'c9', 'd1']]));
+    // New names sorting among the old: packed by order alone, every pack would shift.
+    const second = groupModules(named(['c1', 'c2', 'c3', 'c4', 'c5', 'c7', 'c9', 'd1']), zoneOf, first, options);
+    expect(second.filter((m) => first.some((f) => f.id === m.id && f.members.join() === m.members.join()))).toHaveLength(2);
+    expect(second.map((m) => m.members)).toEqual(expect.arrayContaining([['c2', 'c4']]));
+    // A pack with room takes new items of its zone before a new pack starts.
+    const third = groupModules(named(['c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7', 'c9', 'd1']), zoneOf, second, options);
+    expect(third).toHaveLength(3);
+    expect(third.find((m) => m.members.includes('c6'))!.members).toEqual(['c2', 'c4', 'c6']);
+  });
+
+  test('packing keeps a pack under packMax, and packs a zone\'s new items with it first', () => {
+    const zone = (members: string[]) => members[0][0];
+    const previous = new Map([['a1', 'm1'], ['a2', 'm1'], ['a3', 'm1'], ['b1', 'm2']]);
+    // m1 can keep two of its three under a packMax of 2; the third goes with the new ones.
+    expect(packSmall([['a1'], ['a2'], ['a3'], ['b1'], ['b2'], ['a4']], zone, previous, 2))
+      .toEqual([['a1', 'a2'], ['b1', 'b2'], ['a3', 'a4']]);
+    // From nothing: as before, in order of zone and first member, each pack filled before the next starts.
+    expect(packSmall([['b1'], ['a2'], ['a1'], ['b2', 'b3']], zone, new Map(), 3)).toEqual([['a1', 'a2', 'b1'], ['b2', 'b3']]);
   });
 });

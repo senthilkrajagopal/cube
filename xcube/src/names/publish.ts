@@ -3,7 +3,7 @@ import camelCase from 'camelcase';
 import inflection from 'inflection';
 import yaml from 'js-yaml';
 
-import type { SnapshotFile } from '../model/snapshot';
+import { jsonArrayHash, type SnapshotFile } from '../model/snapshot';
 import {
   FolderTree,
   itemKey,
@@ -685,5 +685,5 @@ export function itemsHash(items: AuthoredItem[]): string {
   const sorted = [...items]
     .sort((a, b) => (sortKey(a) < sortKey(b) ? -1 : 1))
     .map(({ folderId, name, kind, yaml: text }) => ({ folderId, name, kind, yaml: text }));
-  return crypto.createHash('sha256').update(JSON.stringify(sorted), 'utf8').digest('hex');
+  return jsonArrayHash(sorted);
 }
