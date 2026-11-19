@@ -171,6 +171,14 @@ describeWithDatabase('xcube modules', () => {
   const load = (revision: number, query: object) => request(server)
     .post('/cubejs-api/v1/load').set('Authorization', token(revision)).send({ query });
   const served = (revision: number) => logs.filter((l) => l.message === 'xcube: serving revision' && l.params.revision === revision);
+  /** What each publish since the last call compiled, as served. */
+  let seenLogs = 0;
+  const published = () => {
+    const fresh = logs.slice(seenLogs);
+    seenLogs = logs.length;
+    return fresh.filter((l) => l.message === 'xcube: compiled a publish\'s modules as served')
+      .map(({ params: { modules, compiledModules, valid } }) => ({ modules, compiledModules, valid }));
+  };
 
   let revision = 0;
 
@@ -186,7 +194,9 @@ describeWithDatabase('xcube modules', () => {
     expect(status.body.modules.map((m: any) => [m.cubes, m.copies]).sort()).toEqual([[1, 0], [1, 1], [1, 1]]);
     expect(status.body.modules.map((m: any) => m.id)).toContain('commons');
     await load(revision, { measures: ['customers.count'] }).expect(200);
-    expect(served(revision)[0].params).toMatchObject({ modules: 3, compiledModules: 3 });
+    // Compiled once, by the publish, as served: activating it compiles nothing more.
+    expect(published()).toEqual([{ modules: 3, compiledModules: 3, valid: true }]);
+    expect(served(revision)[0].params).toMatchObject({ modules: 3, compiledModules: 0 });
   });
 
   test('queries are answered from the module holding their cubes', async () => {
@@ -212,6 +222,53 @@ describeWithDatabase('xcube modules', () => {
     expect(logs.some((l) => l.message.startsWith('xcube: a request names no module'))).toBe(false);
   });
 
+  test('meta takes a scope: only some cubes, without members, as NDJSON, also by POST', async () => {
+    const meta = (url: string) => request(server).get(`/cubejs-api/v1/meta${url}`).set('Authorization', token(revision));
+    const one = await meta('?cubes=orders,nowhere').expect(200);
+    expect(one.body.cubes.map((c: any) => c.name)).toEqual(['orders']);
+    expect(one.body.cubes[0].measures.map((m: any) => m.name)).toEqual(['orders.total']);
+    expect(one.headers['x-xcube-revision']).toBe(`dev@${revision}`);
+    expect((await meta('?cubes=nowhere').expect(200)).body.cubes).toEqual([]);
+
+    // A cube's own fields and its joins' targets: no members, no SQL.
+    const pickers = await meta('?cubes=orders&cubes=leads&members=false').expect(200);
+    expect(pickers.body.cubes.map((c: any) => c.name).sort()).toEqual(['leads', 'orders']);
+    const ordersCube = pickers.body.cubes.find((c: any) => c.name === 'orders');
+    expect(ordersCube).toMatchObject({ name: 'orders', type: 'cube', joins: [{ name: 'customers', relationship: 'belongsTo' }] });
+    expect(Object.keys(ordersCube).sort()).toEqual(['connectedComponent', 'isVisible', 'joins', 'meta', 'name', 'public', 'title', 'type']);
+    // Extended, without members: every cube field extended meta has, the joins whole.
+    const extended = await meta('?extended&cubes=orders&members=false').expect(200);
+    expect(extended.body.cubes[0].joins[0]).toMatchObject({ name: 'customers', relationship: 'belongsTo', sql: expect.any(String) });
+    expect(extended.body.cubes[0].measures).toBeUndefined();
+
+    const all = await meta('').expect(200);
+    const lines = await meta('?format=ndjson').expect(200).expect('Content-Type', 'application/x-ndjson; charset=utf-8');
+    expect(lines.text.endsWith('\n')).toBe(true);
+    expect(lines.text.trimEnd().split('\n').map((l) => JSON.parse(l))).toEqual(all.body.cubes);
+    expect(lines.headers['x-xcube-compiler-id']).toBe(all.body.compilerId);
+    const accepted = await meta('?cubes=leads').set('Accept', 'application/x-ndjson').expect(200);
+    expect(accepted.text.trimEnd().split('\n').map((l) => JSON.parse(l).name)).toEqual(['leads']);
+
+    const posted = await request(server).post('/cubejs-api/v1/meta').set('Authorization', token(revision))
+      .send({ cubes: ['customers', 'leads'], members: false }).expect(200);
+    expect(posted.body.cubes.map((c: any) => c.name).sort()).toEqual(['customers', 'leads']);
+    expect(posted.body.cubes.every((c: any) => c.dimensions === undefined)).toBe(true);
+
+    // The admin meta takes the same scope.
+    const own = await admin('get', '/meta?cubes=orders,leads&members=false').expect(200);
+    expect(own.body.cubes.map((c: any) => [c.name, c.joins, c.measures]).sort())
+      .toEqual([['leads', [{ name: 'customers', relationship: 'belongsTo' }], undefined], ['orders', [{ name: 'customers', relationship: 'belongsTo' }], undefined]]);
+    const ownLines = await admin('get', '/meta?cubes=customers&format=ndjson').expect(200).expect('Content-Type', /x-ndjson/);
+    expect(ownLines.text.trimEnd().split('\n').map((l) => JSON.parse(l).name)).toEqual(['customers']);
+    expect((await admin('get', '/meta?extended=true&cubes=orders').expect(200)).body.cubes[0]).toMatchObject({ name: 'orders', joins: [expect.objectContaining({ sql: expect.any(String) })] });
+    await admin('get', '/meta?members=maybe').expect(400);
+
+    await meta('?members=maybe').expect(400);
+    await request(server).post('/cubejs-api/v1/meta').set('Authorization', token(revision)).send({ cubes: 'orders' }).expect(400);
+    await request(server).post('/cubejs-api/v1/meta').set('Authorization', token(revision)).send({ limit: 1 }).expect(400);
+    await request(server).get('/cubejs-api/v1/meta?cubes=orders').expect(403);
+  });
+
   test('a dry run\'s probe spanning modules is answered', async () => {
     const check = await admin('post', '/changesets?dryRun=true', {
       upserts: [],
@@ -228,7 +285,21 @@ describeWithDatabase('xcube modules', () => {
     revision = res.body.revision;
     const data = await load(revision, { measures: ['campaigns.count', 'leads.count'] }).expect(200);
     expect(Number(data.body.data[0]['campaigns.count'])).toBe(3);
-    expect(served(revision)[0].params).toMatchObject({ modules: 3, compiledModules: 1 });
+    expect(published()).toEqual([{ modules: 3, compiledModules: 1, valid: true }]);
+    expect(served(revision)[0].params).toMatchObject({ modules: 3, compiledModules: 0 });
+  });
+
+  test('a publish that doesn\'t compile retires what it compiled; the next one compiles it afresh', async () => {
+    const broken = { ...campaigns, yaml: campaigns.yaml.replace('type: count', 'type: nonsense') };
+    await admin('post', '/changesets', { baseRevision: revision, upserts: [broken] }).expect(422);
+    expect(published()).toEqual([{ modules: 3, compiledModules: 1, valid: false }]);
+    expect(logs.slice(-5).some((l) => l.message === 'xcube: retired compiled model')).toBe(true);
+    const fixed = { ...campaigns, yaml: campaigns.yaml.replace('type: count', 'type: count\n        title: Campaigns') };
+    const res = await admin('post', '/changesets', { baseRevision: revision, upserts: [fixed] }).expect(201);
+    revision = res.body.revision;
+    expect(published()).toEqual([{ modules: 3, compiledModules: 1, valid: true }]);
+    await load(revision, { measures: ['campaigns.count'] }).expect(200);
+    expect(served(revision)[0].params).toMatchObject({ compiledModules: 0 });
   });
 
   test('a query spanning modules is answered from a union of just those modules', async () => {

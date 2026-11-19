@@ -244,6 +244,11 @@ describeWithDatabase('overlays: previews of unpublished items', () => {
     const published = ['base_orders', 'customers', 'orders', 'orders_x', 'unrelated', 'v_orders', 'widgets'];
     expect(await names('ws1')).toEqual([...published, 'report'].sort());
     expect(await names()).toEqual(published);
+    // Scoped: the overlay's own cube is found through its token only.
+    const scoped = async (overlay?: string) => (await request(server).get('/cubejs-api/v1/meta?cubes=report,orders&members=false')
+      .set('Authorization', token(overlay)).expect(200)).body.cubes.map((c: any) => c.name).sort();
+    expect(await scoped('ws1')).toEqual(['orders', 'report']);
+    expect(await scoped()).toEqual(['orders']);
   });
 
   test('only the modules an overlay changes are compiled; the rest are the published ones', async () => {

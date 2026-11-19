@@ -329,6 +329,10 @@ modules it touches.
   - A module's version is the hash of its files. A module that didn't
     change keeps its compiled model from one revision to the next, and
     publishes compile and validate only the modules that changed.
+  - A publish compiles each changed module once, as the instance taking it
+    will serve it (the same app id and files): activating the revision
+    there compiles nothing more. Other instances compile it as they
+    activate it. A dry run's check is compiled apart, and dropped after.
   - A module keeps its id across revisions: the new group that overlaps it
     most takes it.
 - **Routing.** Clients send the same requests as before.
@@ -343,7 +347,10 @@ modules it touches.
     don't join.
   - `/v1/meta` and `?extended` are each module's own answer, merged. Cube
     computes visibility per cube, so the result is what one model would
-    answer.
+    answer. It is written a cube at a time (chunked, the same bytes as one
+    JSON document), so no size of model makes it one string; a client of a
+    model with thousands of wide cubes reads it as a stream (about 60 KB a
+    cube of 200 members).
   - The jobs API builds each selector context in every module holding the
     pre-aggregations it names; the module travels in the jobs' security
     context.
@@ -544,6 +551,33 @@ and the client's drift check never see it).
   the admin meta, and no authored member may hold `__xc_` (`422`).
 - **Rollups.** A companion reads its cube's rollups for its measure where
   Tesseract can (a moving average of a sum does); nothing is rebuilt.
+
+### Scoped meta
+
+`/v1/meta` answers a whole model, about 60 KB of JSON per wide cube (200
+members). A client that needs only some cubes asks for them; every option
+works with `?extended`, `onlyViews` and overlay tokens, and is filtered as
+the whole answer is (the folder gate, then Cube's visibility and access
+policies). A value it can't read is refused (`400`), as is an unknown field
+of a `POST` body; a `GET` ignores query parameters it doesn't know, as Cube
+does. The admin meta (`GET …/models/:model/meta`) takes `cubes`,
+`members=false` and NDJSON the same way, with its own `extended`, `hidden`
+and `revision`.
+
+| Option | `GET /v1/meta` | `POST /v1/meta` (JSON body) | Answers |
+|---|---|---|---|
+| Cubes | `?cubes=a,b` (repeatable) | `"cubes": ["a", "b"]` | Only those cubes and views; a name the model lacks, or the token can't see, is left out. Asked of only the modules holding them. At most 20,000 names. |
+| Members | `?members=false` | `"members": false` | Each cube without measures, dimensions, segments, hierarchies, folders and pre-aggregations, but with `joins: [{name, relationship}]`. Relationships are Cube's: `belongsTo` (many_to_one), `hasMany` (one_to_many), `hasOne` (one_to_one). With `extended`, the cube's extended fields and whole joins stay. |
+| NDJSON | `?format=ndjson`, or `Accept: application/x-ndjson` | `"format": "ndjson"` | `application/x-ndjson`: a line per cube, as `cubes` lists them, then `{"viewGroups":[…]}` when there are view groups. The compiler id is the `x-xcube-compiler-id` header. |
+| Cube's own | `?extended`, `?onlyViews=true` | `"extended": true`, `"onlyViews": true` | As Cube answers them. |
+
+- **The revision.** Every answer has `x-xcube-revision: <model>@<revision>`
+  (and `x-xcube-generation`), the revision it was answered from: an index
+  of cubes keyed by it is current while it is the model's.
+- **Join-graph components** (`connectedComponent`) are numbered within one
+  answer: compare them only within it.
+- **Size.** A JSON or NDJSON answer is written a cube at a time, so no
+  size of model makes it one string; read it as a stream.
 
 ### Row-sets
 

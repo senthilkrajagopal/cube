@@ -51,6 +51,8 @@ import { engineCodeOf } from './connections/engine';
 import {
   MODULE_KEY, OVERLAY_ID, OverlaySourceError, type XcubeRuntime,
 } from './runtime/runtime';
+import { isMetaAnswer, writeJson, writeNdjson } from './json-stream';
+import { metaScopeOf, MetaScopeError, scopedMeta, type MetaScope } from './meta-scope';
 import { relationNames } from './sql/classify';
 import { ROLE_KEY } from './security/verifier';
 import {
@@ -277,6 +279,8 @@ export class XcubeApiGateway extends ApiGateway {
    * A refusal that says to try again is answered as one: 503, with
    * `Retry-After`, however it reached Cube's error handling (an error from
    * building a driver comes back through Cube's queue as a 400 or a 500).
+   * A meta answer is written a cube at a time (`writeJson`): a model of
+   * many wide cubes outgrows the one string `res.json` would make of it.
    */
   protected override resToResultFn(res: ExpressResponse) {
     const result = super.resToResultFn(res);
@@ -284,6 +288,9 @@ export class XcubeApiGateway extends ApiGateway {
       if ((options.status ?? 200) >= 400 && typeof message?.error === 'string' && message.error.includes(Connections.CHANGING)) {
         res.set('Retry-After', '2');
         return result(message, { status: 503 });
+      }
+      if ((options.status ?? 200) < 300 && isMetaAnswer(message)) {
+        return writeJson(res as any, message, options.status);
       }
       return result(message, options);
     };
@@ -412,6 +419,7 @@ export class XcubeApiGateway extends ApiGateway {
     // last, also answers for these.
     this.initIntrospectionRoutes(app);
     this.initRowSetRoute(app);
+    this.initMetaRoutes(app);
     const runtime = this.xcubeRuntime();
     if (runtime) {
       initAdminRoutes(app, this.basePath, runtime, (type, params) => this.log({ type, ...params }), {
@@ -670,25 +678,82 @@ export class XcubeApiGateway extends ApiGateway {
     return { cancelled, notCancelled };
   }
 
-  /** `/v1/meta` of a model served in modules: every module's own answer, merged. */
+  /** Each `/v1/meta` request's scope, by its context (`initMetaRoutes`). */
+  protected readonly metaScopes = new WeakMap<object, MetaScope>();
+
+  /**
+   * `/v1/meta` of a model served in modules: every module's own answer, merged;
+   * with a scope naming cubes, only the modules holding them. Without members,
+   * the answer is extended meta's (it has each cube's joins), trimmed.
+   */
   public override async meta(args: Parameters<ApiGateway['meta']>[0]) {
-    const runtime = this.xcubeRuntime();
-    const res = runtime?.serving ? hidingCompanions(args.res) : args.res;
-    const modules = runtime?.metaModules(args.context);
-    if (!modules) {
-      return super.meta({ ...args, res });
+    const scope = this.metaScopes.get(args.context);
+    if (scope && !scope.members) {
+      return this.scopedModuleMeta(args, scope, (context, res) => super.metaExtended({ ...args, context, res }));
     }
-    return this.mergedMeta(modules, args.context, res, (context, r) => super.meta({ ...args, context, res: r }));
+    return this.scopedModuleMeta(args, scope, (context, res) => super.meta({ ...args, context, res }));
   }
 
   public override async metaExtended(args: Parameters<ApiGateway['metaExtended']>[0]) {
+    return this.scopedModuleMeta(args, this.metaScopes.get(args.context), (context, res) => super.metaExtended({ ...args, context, res }));
+  }
+
+  protected async scopedModuleMeta(
+    args: { context: any; res: (body: any, options?: any) => any },
+    scope: MetaScope | undefined,
+    ask: (context: any, res: (body: any, options?: any) => any) => Promise<void>,
+  ) {
     const runtime = this.xcubeRuntime();
-    const res = runtime?.serving ? hidingCompanions(args.res) : args.res;
-    const modules = runtime?.metaModules(args.context);
+    const served = runtime?.serving ? hidingCompanions(args.res) : args.res;
+    const res = scope ? (body: any, options?: any) => served((options?.status ?? 200) < 300 ? scopedMeta(body, scope) : body, options) : served;
+    const modules = runtime?.metaModules(args.context, scope?.cubes);
     if (!modules) {
-      return super.metaExtended({ ...args, res });
+      return ask(args.context, res);
     }
-    return this.mergedMeta(modules, args.context, res, (context, r) => super.metaExtended({ ...args, context, res: r }));
+    return this.mergedMeta(modules, args.context, res, ask);
+  }
+
+  /**
+   * `GET /v1/meta` as Cube answers it, and `POST /v1/meta` for a long list of
+   * cubes: the same token, context and visibility, with a scope
+   * (`metaScopeOf`): only some cubes, without members, as NDJSON.
+   */
+  protected initMetaRoutes(app: ExpressApplication) {
+    const userMiddlewares: RequestHandler[] = [
+      this.checkAuth,
+      this.requestContextMiddleware,
+      this.contextRejectionMiddleware,
+      this.logNetworkUsage,
+      this.requestLoggerMiddleware,
+    ];
+    const jsonParser = bodyParser.json({ limit: getEnv('maxRequestSize') });
+    const answer = asyncHandler(async (req, res) => {
+      let scope: MetaScope;
+      try {
+        scope = metaScopeOf(req.method, req.query as Record<string, unknown>, (req as any).body, req.get('accept'));
+      } catch (e: any) {
+        if (e instanceof MetaScopeError) {
+          res.status(400).json({ error: e.message });
+          return;
+        }
+        throw e;
+      }
+      const { context } = req as any;
+      this.metaScopes.set(context, scope);
+      const json = this.resToResultFn(res);
+      const result = scope.format === 'ndjson'
+        ? async (message: any, options: { status?: number } = {}) => ((options.status ?? 200) < 300 && isMetaAnswer(message)
+          ? writeNdjson(res, message)
+          : json(message, options))
+        : json;
+      if (scope.extended) {
+        await this.metaExtended({ context, res: result, onlyViews: scope.onlyViews });
+      } else {
+        await this.meta({ context, res: result, onlyViews: scope.onlyViews });
+      }
+    });
+    app.get(`${this.basePath}/v1/meta`, userMiddlewares, answer);
+    app.post(`${this.basePath}/v1/meta`, jsonParser, userMiddlewares, answer);
   }
 
   /**
@@ -909,14 +974,16 @@ export class XcubeApiGateway extends ApiGateway {
   public async ownMeta(
     model: string,
     extended: boolean,
-    least: { revision?: number; res?: any; hidden?: boolean } = {},
+    least: { revision?: number; res?: any; hidden?: boolean; scope?: MetaScope } = {},
   ): Promise<{ status: number; body: any }> {
     const runtime = this.xcubeRuntime()!;
+    const { scope } = least;
     const context: any = await runtime.adminContext(model, { revision: least.revision, res: least.res });
-    const modules = runtime.metaModules(context) ?? ['all'];
+    const modules = runtime.metaModules(context, scope?.cubes) ?? ['all'];
     let answer: { status: number; body: any } = { status: 500, body: null };
     await this.mergedMeta(modules, context, (body, options) => {
-      answer = { status: options?.status ?? 200, body };
+      const status = options?.status ?? 200;
+      answer = { status, body: scope && status < 300 ? scopedMeta(body, { ...scope, extended }) : body };
     }, async (one, res) => {
       const compilerApi = await this.getCompilerApi(one);
       const metaConfig = await compilerApi.metaConfig(one, {
@@ -928,8 +995,12 @@ export class XcubeApiGateway extends ApiGateway {
       const configs = (extended ? metaConfig : metaConfig.cubes).map((c: any) => ({ ...c, config: withoutCompanions(c.config) }));
       const visible = least.hidden ? allMembersOf(configs) : publicMembersOf(configs);
       if (!extended) {
+        // Without members, each cube's joins instead (`scopedMeta` trims them to name and relationship).
+        const definitions = scope?.members === false
+          ? (await compilerApi.getCompilers({ requestId: one.requestId })).metaTransformer.cubeEvaluator.cubeDefinitions
+          : null;
         res({
-          cubes: visible,
+          cubes: definitions ? visible.map((cube: any) => ({ ...cube, joins: transformJoins(definitions[cube.name]?.joins) ?? [] })) : visible,
           ...(metaConfig.viewGroups?.length ? { viewGroups: metaConfig.viewGroups } : {}),
           compilerId: metaConfig.compilerId,
         });

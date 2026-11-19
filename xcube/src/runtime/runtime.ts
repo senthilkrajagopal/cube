@@ -418,6 +418,9 @@ function queryOf(req: any): unknown {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** How long modules a publish compiled wait for its revision to be activated here before they may be retired. */
+const PRECOMPILED_TTL_MS = 30 * 60 * 1000;
+
 function forbidden(message: string): CubejsHandlerError {
   return new CubejsHandlerError(403, 'Forbidden', message);
 }
@@ -524,6 +527,13 @@ export class XcubeRuntime {
   protected readonly served = new Map<string, ServedRevision>();
 
   protected readonly candidates = new Map<string, Candidate>();
+
+  /**
+   * Modules a publish compiled as they will be served (`compileAsServed`),
+   * by app id: kept from retirement until a revision serving them is
+   * activated, or `PRECOMPILED_TTL_MS` passes.
+   */
+  protected readonly precompiled = new Map<string, { model: string; at: number }>();
 
   /** What revisions a core served before it was replaced, for the next core. */
   protected readonly detached = new Map<string, RevisionData>();
@@ -985,7 +995,13 @@ export class XcubeRuntime {
    * The modules to merge `/v1/meta` from: those of the revision a context is
    * served, when it has several and the context chose none.
    */
-  public metaModules(context: any): string[] | null {
+  /**
+   * The modules `/v1/meta` asks for a context: all of them, or with `cubes`,
+   * those holding the cubes and views named (each's owner, else one that
+   * copies it; a name the revision lacks asks none). `null` when the model
+   * isn't served in modules, or the context already names one.
+   */
+  public metaModules(context: any, cubes?: string[]): string[] | null {
     if (!this.serving || context?.xcubeCandidate !== undefined || context?.xcubeActivate !== undefined) {
       return null;
     }
@@ -1000,7 +1016,17 @@ export class XcubeRuntime {
       || context?.securityContext?.[MODULE_KEY] !== undefined) {
       return null;
     }
-    return [...revision.modules.keys()].sort();
+    if (!cubes) {
+      return [...revision.modules.keys()].sort();
+    }
+    const chosen = new Set<string>();
+    for (const name of cubes) {
+      const holder = revision.owner.get(name) ?? [...(revision.holders.get(name) ?? [])].sort()[0];
+      if (holder) {
+        chosen.add(holder);
+      }
+    }
+    return [...chosen].sort();
   }
 
   /**
@@ -3212,6 +3238,8 @@ export class XcubeRuntime {
 
     await this.recordEnvironmentBases(model, data.files, identities);
     const revision = this.servedRevision(head, data, undefined, identities, calcs);
+    // Modules its publish compiled here are this revision's now, and kept as its residents.
+    revision.modules.forEach((resident) => this.precompiled.delete(resident.appId));
     const reused = revision.state === 'retiring';
     revision.retireAfter = undefined;
     const drop = () => {
@@ -3376,6 +3404,14 @@ export class XcubeRuntime {
       revision.unions.forEach((r) => used.add(r.appId));
       if (revision.whole) {
         used.add(revision.whole.appId);
+      }
+    }
+    const now = Date.now();
+    for (const [appId, { at }] of [...this.precompiled]) {
+      if (now - at < PRECOMPILED_TTL_MS) {
+        used.add(appId);
+      } else {
+        this.precompiled.delete(appId);
       }
     }
     for (const resident of [...this.residents.values()]) {
@@ -3934,7 +3970,9 @@ export class XcubeRuntime {
       check?.securityContext ?? {},
       check?.probes ?? [],
     );
+    const precompiled = validation.precompiled ?? [];
     if (!validation.valid) {
+      this.dropPrecompiled(precompiled);
       if (!check && await this.movedSince(model, head)) {
         // Refused over what is no longer published, maybe a connection only
         // that used: the base is stale, and the client sends again.
@@ -3949,16 +3987,25 @@ export class XcubeRuntime {
       return { ...base, valid: true, probes: validation.probes };
     }
 
-    const result = await this.requireStore().importItems({
-      model,
-      baseRevision: request.baseRevision,
-      items: published.items,
-      itemsHash: hash!,
-      source: request.source,
-      folders,
-      modules,
-      basis,
-    });
+    let result: Awaited<ReturnType<RevisionStore['importItems']>>;
+    try {
+      result = await this.requireStore().importItems({
+        model,
+        baseRevision: request.baseRevision,
+        items: published.items,
+        itemsHash: hash!,
+        source: request.source,
+        folders,
+        modules,
+        basis,
+      });
+    } catch (e) {
+      this.dropPrecompiled(precompiled);
+      throw e;
+    }
+    if (result.outcome !== 'created') {
+      this.dropPrecompiled(precompiled);
+    }
     if ('current' in result) {
       return { status: result.outcome, current: result.current };
     }
@@ -3998,6 +4045,89 @@ export class XcubeRuntime {
   }
 
   /**
+   * A publish's check of its changed modules, each compiled as the resident
+   * this instance will serve it as (the same app id and served files), so
+   * activating the revision finds it compiled: a changed module compiles
+   * once here, not once to check and again to serve. An unchanged module is
+   * already a resident. What it compiled (`precompiled`) is kept until the
+   * revision activates; `publishItems` drops it when nothing is stored.
+   */
+  protected async compileAsServed(
+    model: string,
+    head: ModelHead | null,
+    files: SnapshotFile[],
+    modules: StoredModule[],
+  ): Promise<ValidationResult & { precompiled: string[] }> {
+    const core = this.requireCore();
+    const { modelClaim } = this.servingOptions;
+    const next = { model, generation: head?.generation ?? '', revision: (head?.revision ?? 0) + 1 };
+    const { modules: residents } = this.residentsOf(
+      // The key names a module-less revision's one model: with modules, unused.
+      next, `xcube:${model}:publish`, { files, modules }, await this.identitiesOf(model), await this.calculationsOf(model),
+    );
+    const fresh = [...residents.values()].filter((resident) => !resident.compiled)
+      .sort((a, b) => (a.moduleId < b.moduleId ? -1 : 1));
+    const appIds = fresh.map((resident) => resident.appId);
+    appIds.forEach((appId) => this.precompiled.set(appId, { model, at: Date.now() }));
+
+    const result: ValidationResult = { valid: true, errors: [], cubeMessage: null, probes: [] };
+    const seen = new Set<string>();
+    const started = Date.now();
+    try {
+      for (const resident of fresh) {
+        const validation = await validateSnapshot({
+          files: resident.files,
+          lane: this.lane,
+          priority: Priority.Import,
+          probes: [],
+          withCandidate: (fn) => fn({
+            compile: async () => {
+              const requestId = `xcube-publish-${model}-${resident.moduleId}-${crypto.randomBytes(3).toString('hex')}`;
+              const compilerApi = await core.getCompilerApi({
+                securityContext: { [modelClaim]: model },
+                authInfo: { [modelClaim]: model },
+                requestId,
+                xcubeActivate: resident.appId,
+              });
+              await compilerApi.getCompilers({ requestId });
+              resident.compiled = true;
+            },
+            probe: async () => {
+              throw new Error('xcube: a publish runs no probes');
+            },
+          }),
+        });
+        for (const error of validation.errors) {
+          const key = `${error.path}\u0000${error.message}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            result.errors.push(error);
+          }
+        }
+        if (!validation.valid) {
+          result.valid = false;
+          result.cubeMessage = result.cubeMessage ?? validation.cubeMessage;
+        }
+      }
+    } catch (e) {
+      this.dropPrecompiled(appIds);
+      throw e;
+    }
+    this.log('xcube: compiled a publish\'s modules as served', {
+      model, modules: residents.size, compiledModules: fresh.length, valid: result.valid, compileMs: Date.now() - started,
+    });
+    return { ...result, precompiled: appIds };
+  }
+
+  /** Lets go of what a publish compiled for a revision that won't be served: a module no revision uses is retired. */
+  protected dropPrecompiled(appIds: string[]) {
+    if (appIds.length) {
+      appIds.forEach((appId) => this.precompiled.delete(appId));
+      this.retireUnused();
+    }
+  }
+
+  /**
    * Checks the modules a publish changes, each compiled on its own as it
    * will be served; an unchanged module compiled before. Probes run in the
    * module holding their cubes.
@@ -4010,7 +4140,11 @@ export class XcubeRuntime {
     priority: Priority,
     securityContext: Record<string, unknown>,
     probes: Probe[],
-  ): Promise<ValidationResult> {
+  ): Promise<ValidationResult & { precompiled?: string[] }> {
+    if (priority === Priority.Import && !probes.length && modules.length && this.serving && this.core) {
+      // A publish: its changed modules compiled once, as they will be served here.
+      return this.compileAsServed(model, head, files, modules);
+    }
     if (modules.length <= 1) {
       return this.validate(model, files, priority, securityContext, probes);
     }

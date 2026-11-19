@@ -29,6 +29,8 @@ import {
 } from '../store/revisions';
 import { ConnectionError } from '../connections/connections';
 import { duckdbPool } from '../connections/duckdb';
+import { isMetaAnswer, writeJson, writeNdjson } from '../json-stream';
+import { metaScopeOf, MetaScopeError, type MetaScope } from '../meta-scope';
 import { driverAvailability } from '../connections/drivers';
 import { DriverUnavailableError } from '../connections/jvm';
 import { CredentialError } from '../credentials/credentials';
@@ -628,11 +630,28 @@ export function initAdminRoutes(
     if (least !== undefined && (typeof least !== 'string' || !/^[1-9]\d{0,9}$/.test(least))) {
       throw new AdminError(400, 'bad_request', 'revision is a revision number');
     }
+    // `/v1/meta`'s scope: only some cubes, without members, as NDJSON (`extended` stays this route's).
+    let scope: MetaScope;
+    try {
+      scope = metaScopeOf('GET', req.query as Record<string, unknown>, undefined, req.get('accept'));
+    } catch (e: any) {
+      if (e instanceof MetaScopeError) {
+        throw new AdminError(400, 'bad_request', e.message);
+      }
+      throw e;
+    }
+    const scoped = scope.cubes !== undefined || !scope.members;
     const { status, body } = await reads.meta(model, req.query.extended === 'true', {
       revision: least === undefined ? undefined : Number(least),
       res,
       hidden: req.query.hidden === 'true',
+      ...(scoped ? { scope } : {}),
     });
+    if (status < 300 && isMetaAnswer(body)) {
+      // A cube at a time: a big model's meta outgrows one string.
+      await (scope.format === 'ndjson' ? writeNdjson(res, body) : writeJson(res, body, status));
+      return;
+    }
     res.status(status).json(body);
   }));
 

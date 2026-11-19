@@ -459,6 +459,17 @@ describeWithDatabase('the folder gate and RS256 tokens', () => {
     const nobody = userToken(['nobody']);
     expect(await metaNames(nobody)).toEqual([]);
     expect(await metaNames(userToken([]))).toEqual([]);
+    // Nor when named: a scoped meta is filtered as the whole one is.
+    for (const scoped of ['?cubes=sales,orders', '?cubes=sales&members=false', '?cubes=sales&format=ndjson']) {
+      const got = await request(server).get(`/cubejs-api/v1/meta${scoped}`).set('Authorization', nobody).expect(200);
+      expect({ scoped, body: got.text.trim() }).toEqual({ scoped, body: scoped.includes('ndjson') ? '' : expect.stringMatching(/"cubes":\[\]/) });
+    }
+    const postedMeta = await request(server).post('/cubejs-api/v1/meta').send({ cubes: ['sales'], members: false })
+      .set('Authorization', nobody).expect(200);
+    expect(postedMeta.body.cubes).toEqual([]);
+    const reached = await request(server).get('/cubejs-api/v1/meta?cubes=sales,orders&members=false')
+      .set('Authorization', userToken(['g_ab'])).expect(200);
+    expect(reached.body.cubes.map((c: any) => c.name).sort()).toEqual(['orders', 'sales']);
     // Refused plainly, naming the folder the groups don't reach (a Preview as groups says so).
     const refused = await load(nobody, 'sales.count');
     expect({ status: refused.status, error: refused.body.error })
