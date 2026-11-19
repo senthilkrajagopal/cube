@@ -1,9 +1,10 @@
 /**
- * The JVM xcube's JDBC data sources run on (Db2 so far), and the vendor jars
- * it loads.
+ * The JVM xcube's JDBC data sources run on (Teradata, Db2 and TDV), and the
+ * vendor jars it loads.
  *
  * The jars are mounted, never fetched: `XCUBE_JDBC_DRIVERS_DIR` holds one
- * directory per type (`db2/`), each with that type's `*.jar`. They are read
+ * directory per type, `teradata/`, `db2/`, `tdv/`, each with that type's
+ * `*.jar`. They are read
  * once, before the JVM starts; every jar found, with xcube's helper jar, is
  * the classpath. A type is available when one of its jars holds its driver
  * class; otherwise a connection, test, run or export on it is refused
@@ -24,7 +25,9 @@ import path from 'path';
 
 /** The JDBC types xcube takes, each its directory under `XCUBE_JDBC_DRIVERS_DIR` and its driver class. */
 export const JDBC_TYPES = {
+  teradata: { dir: 'teradata', driverClass: 'com.teradata.jdbc.TeraDriver' },
   db2: { dir: 'db2', driverClass: 'com.ibm.db2.jcc.DB2Driver' },
+  tdv: { dir: 'tdv', driverClass: 'cs.jdbc.driver.CompositeDriver' },
 } as const;
 
 export type JdbcType = keyof typeof JDBC_TYPES;

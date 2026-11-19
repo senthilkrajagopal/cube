@@ -14,6 +14,8 @@ import { keyByDataSource } from '@cubejs-backend/shared';
 import { makeAthenaDriver } from './athena';
 import { makeClickHouseDriver } from './clickhouse';
 import { makeDb2Driver } from './db2';
+import { makeTdvDriver } from './tdv';
+import { makeTeradataDriver, TERADATA_LOGMECHS } from './teradata';
 import { makeDuckdbDriver } from './duckdb';
 import { baseUrlProblems, makeEngineDriver } from './engine';
 import { withoutEnv } from './env';
@@ -22,7 +24,7 @@ import { isJdbcType, jdbcUnavailable } from './jvm';
 import { makeTrinoDriver } from './trino';
 
 export const DRIVER_TYPES = [
-  'postgres', 'redshift', 'mysql', 'snowflake', 'bigquery', 'mssql', 'oracle', 'dremio', 'duckdb', 'clickhouse', 'trino', 'athena', 'engine', 'hive', 'impala', 'db2',
+  'postgres', 'redshift', 'mysql', 'snowflake', 'bigquery', 'mssql', 'oracle', 'dremio', 'duckdb', 'clickhouse', 'trino', 'athena', 'engine', 'hive', 'impala', 'db2', 'teradata', 'tdv',
 ] as const;
 
 export type DriverType = (typeof DRIVER_TYPES)[number];
@@ -216,6 +218,16 @@ const optionUnsafe = (fields: Fields, keys: string[]) => keys
 const hiveCheck = (f: Fields) => [...hostProblems(f), ...optionUnsafe(f, ['database'])];
 
 const db2Check = (f: Fields) => [...hostProblems(f), ...optionUnsafe(f, ['database', 'currentSchema'])];
+
+function teradataCheck(f: Fields): string[] {
+  const problems = [...hostProblems(f), ...optionUnsafe(f, ['database'])];
+  if (str(f.logmech) !== undefined && !(TERADATA_LOGMECHS as readonly string[]).includes(String(f.logmech))) {
+    problems.push(`logmech must be one of ${TERADATA_LOGMECHS.join(', ')}`);
+  }
+  return problems;
+}
+
+const tdvCheck = (f: Fields) => [...hostProblems(f), ...optionUnsafe(f, ['domain', 'dataSource'])];
 
 const trinoCheck = (f: Fields) => [...hostProblems(f), ...unsafeNames(f, ['catalog', 'schema'])];
 
@@ -720,6 +732,68 @@ export const DRIVERS: Record<DriverType, DriverSpec> = {
     },
     make: makeDb2Driver,
   },
+  /**
+   * Teradata Vantage, over Teradata's JDBC driver (its jar mounted: `jvm.ts`),
+   * with or without TLS; a user and password, by TD2 or LDAP. xcube's driver
+   * (`jdbc.ts`, `teradata.ts`), its own dialect (`teradata-dialect.ts`).
+   */
+  teradata: {
+    cubeType: 'teradata',
+    connection: [
+      text('host', { required: true }), text('port', { kind: 'number' }), text('database'), text('logmech'), ...tlsFields,
+    ],
+    auth: { password: [text('user', { required: true }), secret('password')] },
+    target: ['host', 'port', 'logmech', ...TLS_TARGET],
+    check: teradataCheck,
+    config(f, auth, s) {
+      checked(this, f, auth);
+      const ssl = tls(f, s, false, true);
+      return {
+        host: str(f.host),
+        port: num(f.port, ssl ? 443 : 1025),
+        database: str(f.database),
+        logmech: str(f.logmech) ?? 'TD2',
+        user: str(f.user),
+        password: s.password,
+        ssl: ssl ? { rejectUnauthorized: ssl.rejectUnauthorized, ca: ssl.ca } : false,
+        readOnly: true,
+      };
+    },
+    make: makeTeradataDriver,
+  },
+  /**
+   * TIBCO Data Virtualization (Composite), over its JDBC driver (its jar
+   * mounted from the customer's install: `jvm.ts`), with or without TLS; a
+   * user and password in a domain. Its CA is the deployment's
+   * (`XCUBE_JDBC_TRUST_STORE`): TDV's driver reads only the JVM's. xcube's
+   * driver (`jdbc.ts`, `tdv.ts`), its own dialect (`tdv-dialect.ts`).
+   */
+  tdv: {
+    cubeType: 'tdv',
+    connection: [
+      text('host', { required: true }), text('port', { kind: 'number' }), text('domain', { required: true }), text('dataSource', { required: true }),
+      text('ssl', { kind: 'boolean' }), text('sslRejectUnauthorized', { kind: 'boolean' }),
+    ],
+    auth: { password: [text('user', { required: true }), secret('password')] },
+    target: ['host', 'port', 'domain', 'ssl', 'sslRejectUnauthorized'],
+    check: tdvCheck,
+    config(f, auth, s) {
+      checked(this, f, auth);
+      const ssl = bool(f.ssl, true);
+      return {
+        host: str(f.host),
+        port: num(f.port, 9401),
+        domain: str(f.domain) ?? 'composite',
+        // Not `dataSource`: Cube's own key in every driver's config, the data source's name, set over it.
+        publishedDataSource: str(f.dataSource),
+        user: str(f.user),
+        password: s.password,
+        ssl: ssl ? { rejectUnauthorized: bool(f.sslRejectUnauthorized, true) } : false,
+        readOnly: true,
+      };
+    },
+    make: makeTdvDriver,
+  },
 };
 
 /**
@@ -737,6 +811,8 @@ function registerCubeType(type: string, modulePath: string) {
 
 registerCubeType('impala', require.resolve('./impala-type'));
 registerCubeType('db2', require.resolve('./db2-type'));
+registerCubeType('teradata', require.resolve('./teradata-type'));
+registerCubeType('tdv', require.resolve('./tdv-type'));
 
 /** A driver type, and whether this deployment can connect one: `reason` says why not, where it can't. */
 export interface DriverAvailability {

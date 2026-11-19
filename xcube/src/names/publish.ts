@@ -96,7 +96,7 @@ export interface DataSourceRef {
 }
 
 /** The drivers whose rollups xcube builds only in Cube Store: their sources are read, never written (AC-1048). */
-const READ_ONLY_DRIVERS = new Set(['duckdb', 'clickhouse', 'trino', 'athena', 'hive', 'impala', 'db2']);
+const READ_ONLY_DRIVERS = new Set(['duckdb', 'clickhouse', 'trino', 'athena', 'hive', 'impala', 'db2', 'teradata', 'tdv']);
 
 /** The drivers whose cubes take no pre-aggregation at all: wechart's engine holds its tables in memory, and is the fast path itself. */
 const NO_ROLLUP_DRIVERS = new Set(['engine']);

@@ -2061,7 +2061,7 @@ export class XcubeRuntime {
   public async exportTable(
     model: string,
     connection: string,
-    request: { runId: string; schema?: string; table: string; columns?: string[]; timeoutMs: number },
+    request: { runId: string; catalog?: string; schema?: string; table: string; columns?: string[]; timeoutMs: number },
     rows: ExportRows,
   ): Promise<SqlAnswer> {
     const run: SqlRunRequest = {
@@ -2179,6 +2179,9 @@ export class XcubeRuntime {
       clickhouse: { requestTimeout: request.timeoutMs + 30000 },
       // Db2's is set on each statement; its socket's read timeout is set past it.
       db2: { queryTimeout: Math.ceil(request.timeoutMs / 1000) },
+      teradata: { queryTimeout: Math.ceil(request.timeoutMs / 1000) },
+      // TDV's is its connection's requestTimeout.
+      tdv: { queryTimeout: Math.ceil(request.timeoutMs / 1000) },
     }[found.driver] ?? {};
     return {
       dialect: (isDriverType(found.driver) ? DRIVERS[found.driver].cubeType : found.driver) as SessionDialect,

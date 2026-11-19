@@ -21,6 +21,8 @@
 import { CubejsServerCore } from '@cubejs-backend/server-core';
 
 import { XcubeDb2Query } from './db2-dialect';
+import { XcubeTdvQuery } from './tdv-dialect';
+import { XcubeTeradataQuery } from './teradata-dialect';
 import { XcubeHiveQuery } from './hive-dialect';
 import { XcubeImpalaQuery } from './impala-dialect';
 
@@ -114,7 +116,7 @@ export function xcubeDuckDBQuery(): DialectClass {
 
 /**
  * Cube's `dialectFactory`, with xcube's dialects: cube.js's own where it names
- * one, else xcube's for DuckDB, Hive, Impala and Db2, else the driver's, as Cube's default picks it.
+ * one, else xcube's for DuckDB, Hive, Impala, Db2, Teradata and TDV, else the driver's, as Cube's default picks it.
  */
 export function dialectFactory(given?: DialectFactory): DialectFactory {
   return (context) => {
@@ -133,6 +135,12 @@ export function dialectFactory(given?: DialectFactory): DialectFactory {
     }
     if (context.dbType === 'db2') {
       return XcubeDb2Query;
+    }
+    if (context.dbType === 'teradata') {
+      return XcubeTeradataQuery;
+    }
+    if (context.dbType === 'tdv') {
+      return XcubeTdvQuery;
     }
     const driverClass = CubejsServerCore.lookupDriverClass(context.dbType as any) as any;
     return driverClass?.dialectClass ? driverClass.dialectClass() : undefined;

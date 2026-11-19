@@ -101,7 +101,8 @@ describe('the mounted JDBC drivers (R2)', () => {
     const jar = zip({ [DB2_CLASS]: 'class' });
     fs.writeFileSync(path.join(dir, 'db2', 'jcc-12.1.5.0.jar'), jar);
     const read = readJdbcDrivers(dir);
-    expect(read.unavailable).toEqual({});
+    expect(read.unavailable.db2).toBeUndefined();
+    expect(Object.keys(read.unavailable)).toEqual(['teradata', 'tdv']);
     expect(read.jars).toEqual([{
       type: 'db2',
       file: path.join(dir, 'db2', 'jcc-12.1.5.0.jar'),
@@ -249,8 +250,8 @@ describe('Db2\'s values in Cube\'s SQL', () => {
   });
 
   test('the catalog\'s statements name a schema or table as a literal, the system\'s schemas left out', () => {
-    expect(DB2_DIALECT.tablesSql('O\'Brien')).toContain('TABSCHEMA = \'O\'\'Brien\'');
-    expect(DB2_DIALECT.catalogSql()).toMatch(/c\.TABSCHEMA NOT LIKE 'SYS%' AND c\.TABSCHEMA NOT IN \('NULLID', 'SQLJ', 'IBM_RTMON', 'DB2GSE'\)/);
+    expect(DB2_DIALECT.tablesSql!('O\'Brien')).toContain('TABSCHEMA = \'O\'\'Brien\'');
+    expect(DB2_DIALECT.catalogSql!()).toMatch(/c\.TABSCHEMA NOT LIKE 'SYS%' AND c\.TABSCHEMA NOT IN \('NULLID', 'SQLJ', 'IBM_RTMON', 'DB2GSE'\)/);
     expect(DB2_DIALECT.genericType('decfloat')).toBe('decimal');
   });
 });

@@ -110,10 +110,18 @@ export function quoteName(dialect: SessionDialect, name: string): string {
   }
 }
 
-/** The statement an export runs: its columns (all, unless it names them) of one table. */
-export function exportStatement(dialect: SessionDialect, request: { schema?: string; table: string; columns?: string[] }): string {
+/**
+ * The statement an export runs: its columns (all, unless it names them) of
+ * one table. On TDV a table may be named in a published catalog as well,
+ * `"catalog"."schema"."table"`; no other database takes a catalog here.
+ */
+export function exportStatement(dialect: SessionDialect, request: { catalog?: string; schema?: string; table: string; columns?: string[] }): string {
+  if (request.catalog !== undefined && dialect !== 'tdv') {
+    throw new ExportError('A catalog names a table on TDV only: name the table by its schema here');
+  }
   const columns = request.columns?.length ? request.columns.map((c) => quoteName(dialect, c)).join(', ') : '*';
-  const table = [request.schema, request.table].filter((n): n is string => n !== undefined && n !== null).map((n) => quoteName(dialect, n)).join('.');
+  const table = [request.catalog, request.schema, request.table].filter((n): n is string => n !== undefined && n !== null)
+    .map((n) => quoteName(dialect, n)).join('.');
   return `SELECT ${columns} FROM ${table}`;
 }
 

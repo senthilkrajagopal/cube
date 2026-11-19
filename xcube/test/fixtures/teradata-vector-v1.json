@@ -1,0 +1,53 @@
+{
+  "about": "The teradata driver's password, scheme v1, in golden-v1.json's form: `aad` and `envelopes` entries, sealed to the same development key (dev-credential-key.pub.jwk). Development values only.",
+  "aad": [
+    {
+      "driver": "teradata",
+      "field": "password",
+      "fields": {
+        "host": "teradata.example",
+        "port": 1025,
+        "database": "SALES",
+        "logmech": "TD2",
+        "ssl": false
+      },
+      "aad": "[\"wechart/data-source-secret/v1\",\"teradata\",\"password\",[[\"host\",\"teradata.example\"],[\"logmech\",\"TD2\"],[\"port\",\"1025\"],[\"ssl\",\"false\"],[\"sslCa\",\"\"],[\"sslRejectUnauthorized\",\"\"]]]"
+    },
+    {
+      "driver": "teradata",
+      "field": "password",
+      "fields": {
+        "host": "teradata.example",
+        "port": 443,
+        "database": "SALES",
+        "logmech": "LDAP",
+        "ssl": true,
+        "sslRejectUnauthorized": true,
+        "sslCa": "-----BEGIN CERTIFICATE-----\nMIIgolden\n-----END CERTIFICATE-----"
+      },
+      "aad": "[\"wechart/data-source-secret/v1\",\"teradata\",\"password\",[[\"host\",\"teradata.example\"],[\"logmech\",\"LDAP\"],[\"port\",\"443\"],[\"ssl\",\"true\"],[\"sslCa\",\"-----BEGIN CERTIFICATE-----\\nMIIgolden\\n-----END CERTIFICATE-----\"],[\"sslRejectUnauthorized\",\"true\"]]]"
+    }
+  ],
+  "envelopes": [
+    {
+      "driver": "teradata",
+      "field": "password",
+      "fields": {
+        "host": "teradata.example",
+        "port": 443,
+        "database": "SALES",
+        "logmech": "LDAP",
+        "ssl": true,
+        "sslRejectUnauthorized": true,
+        "sslCa": "-----BEGIN CERTIFICATE-----\nMIIgolden\n-----END CERTIFICATE-----"
+      },
+      "secret": "teradata-dev-password",
+      "envelope": {
+        "v": 1,
+        "kid": "uYWeMx6i173fsiolFp1xi-qiav50k52AGinM56Y8JEw",
+        "enc": "FPsAIYrxfjmttW8sWNlYDO-BY6ku_4QT8-lEzOXibjc",
+        "ct": "Ehb-ICwF-iJRCHo0jZY5WWt7qs1LsGU_RRRP3_RjlJjcszI6yk3gl5PikZgmj_wZWPYOmeRi-iGSk8wgOyQkW6y9EwinHmbnYkJj3DRtPcA3b5DmZ4gT9NjGuejvM1ZmRD6oO1Q7OUH3Ay4WUedJPjZTUx1D6F67zJl_I8w81vSu97Wa8Tbl4hlUjTv53WHJl5ASOaQ7APb4euEjJNPwG7CvI2DjQqyhSoYzjtNIdtRIHVvQXb7G-PcW3jrI7guaFxZWxiGsZJJhn5JTEVUPfL0luQalah5H_XXQsi7bNHKf9xOVkKDLAe7HArUHXRqO8R6OQs0kDFCrkIyg7Coo-TDfp39ODhgGgdqZIJkXP5Y"
+      }
+    }
+  ]
+}

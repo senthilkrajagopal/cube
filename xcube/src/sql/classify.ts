@@ -15,7 +15,7 @@
  */
 
 export type SqlDialect = 'postgres' | 'redshift' | 'mysql' | 'snowflake' | 'bigquery' | 'mssql' | 'oracle' | 'dremio'
-  | 'duckdb' | 'clickhouse' | 'trino' | 'athena' | 'cubestore' | 'hive' | 'impala' | 'db2';
+  | 'duckdb' | 'clickhouse' | 'trino' | 'athena' | 'cubestore' | 'hive' | 'impala' | 'db2' | 'teradata' | 'tdv';
 
 export type StatementKind = 'select' | 'explain';
 
@@ -112,6 +112,10 @@ interface Rules {
   noDoubledQuotes?: boolean;
   /** Db2: `VALUES` runs as a query; data-change table references, sequences and lock clauses refused. */
   db2?: boolean;
+  /** Teradata: `SEL` is SELECT; a leading LOCKING only for ACCESS or READ; no FOREIGN TABLE or `name@server`. */
+  teradata?: boolean;
+  /** TDV: no `{` (hints and JDBC escapes), and no procedure in a FROM or JOIN. */
+  tdv?: boolean;
   /** What may come between EXPLAIN and the statement, beyond the common options. */
   explainOptions?: Set<string>;
   /** Names refused anywhere, unquoted: statements that write or lock, and the words that start them. */
@@ -379,6 +383,26 @@ const RULES: Record<SqlDialect, Rules> = {
     // SYSTOOLS' HTTP functions: the server calls a URL.
     deniedFunction: /^http(get|post|put|delete|head)?(blob|clob)?(verbose)?$/,
     deniedFunctionIs: { what: 'function', why: 'the server calls a URL with it' },
+  },
+  // Teradata: a quote doubled in a string or name, never a backslash; comments read nested and not.
+  // Its abbreviations INS, UPD and DEL are writes; SELECT AND CONSUME deletes the row it reads; a macro
+  // (EXEC) or procedure (CALL) may write. Its EXPLAIN doesn't run the request.
+  teradata: {
+    ...base,
+    teradata: true,
+    readings: readings([false], BOTH),
+    deniedWords: new Set([...WRITES, 'INS', 'UPD', 'DEL', 'CONSUME', 'EXEC', 'EXECUTE', 'CALL']),
+    // Table operators that write to or read object storage, or run a program on the nodes.
+    deniedFunction: /^(write_nos|read_nos|script)$/,
+    deniedFunctionIs: { what: 'table operator', why: 'it reads or writes object storage, or runs a program on the database\'s nodes' },
+  },
+  // TIBCO Data Virtualization: a quote doubled; comments read nested and not; no EXPLAIN statement of a JDBC client's.
+  tdv: {
+    ...base,
+    tdv: true,
+    explain: 'none',
+    readings: readings([false], BOTH),
+    deniedWords: new Set([...WRITES, 'CALL', 'EXECUTE', 'EXEC']),
   },
   // Apache Impala. Its SET, USE, REFRESH, INVALIDATE METADATA, COMPUTE STATS, LOAD DATA, :SHUTDOWN(),
   // ALTER and COMMENT are statements, refused as any but a read is; after a WITH it takes only a
@@ -700,6 +724,86 @@ function checkDb2(tokens: Token[], refuse: (message: string, refused?: Refused) 
   }
 }
 
+/**
+ * Teradata's leading LOCKING (or LOCK) modifiers, `LOCKING TABLE t FOR
+ * ACCESS SELECT …`: each must lock for ACCESS or READ (SHARE), never WRITE,
+ * EXCLUSIVE or CHECKSUM. The index of the query they precede.
+ */
+function teradataLocking(tokens: Token[], refuse: (message: string) => never): number {
+  const query = tokens.findIndex((t) => t.depth === 0 && isWord(t, 'SELECT', 'SEL', 'WITH'));
+  if (query === -1) {
+    refuse('LOCKING runs here only before a SELECT');
+  }
+  for (let k = 0; k < query; k++) {
+    if (isWord(tokens[k], 'WRITE', 'EXCLUSIVE', 'EXCL', 'CHECKSUM')) {
+      refuse(`LOCKING … FOR ${tokens[k].value} takes a lock a read doesn't: only ACCESS or READ runs here`);
+    }
+  }
+  if (!tokens.slice(0, query).some((t) => isWord(t, 'ACCESS', 'READ', 'SHARE'))) {
+    refuse('LOCKING runs here only FOR ACCESS or FOR READ');
+  }
+  return query;
+}
+
+/**
+ * Teradata's own, beyond the words and table operators refused anywhere:
+ * QueryGrid, `FOREIGN TABLE (…)@server` and `name@server`, which another
+ * system runs as written.
+ */
+function checkTeradata(tokens: Token[], refuse: (message: string, refused?: Refused) => never) {
+  for (let k = 0; k < tokens.length; k++) {
+    const t = tokens[k];
+    if (isWord(t, 'FOREIGN') && isWord(tokens[k + 1], 'TABLE')) {
+      refuse('FOREIGN TABLE sends its SQL to another system, which runs it as written: only this database\'s tables are read here', { kind: 'clause', name: 'FOREIGN TABLE' });
+    }
+    if (isOp(t, '@') && k > 0 && (tokens[k - 1].kind === 'word' || tokens[k - 1].kind === 'quoted' || isOp(tokens[k - 1], ')'))) {
+      refuse('A name@server reads through QueryGrid from another system: only this database\'s tables are read here', { kind: 'clause', name: '@' });
+    }
+  }
+}
+
+/** The words that end a FROM clause's list of tables. */
+const AFTER_FROM = new Set(['WHERE', 'GROUP', 'HAVING', 'ORDER', 'UNION', 'EXCEPT', 'INTERSECT', 'MINUS', 'QUALIFY', 'WINDOW', 'OFFSET', 'FETCH', 'LIMIT', 'SELECT', 'ON', 'USING']);
+
+/**
+ * TDV's own: any `{` (its `{OPTION …}` hints, which can ship rows to a
+ * source's temporary tables, and JDBC escapes), and a procedure in a FROM or
+ * JOIN, `FROM proc(1) p`: a procedure can write, run Java, or reach
+ * elsewhere.
+ */
+function checkTdv(tokens: Token[], refuse: (message: string, refused?: Refused) => never) {
+  let inFrom: boolean[] = [];
+  for (let k = 0; k < tokens.length; k++) {
+    const t = tokens[k];
+    if (isOp(t, '{')) {
+      refuse('A { … } is a hint or a JDBC escape, which TDV acts on: write the query without it', { kind: 'clause', name: '{' });
+    }
+    if (isWord(t, 'FROM')) {
+      inFrom[t.depth] = true;
+    } else if (t.kind === 'word' && AFTER_FROM.has(t.value)) {
+      inFrom[t.depth] = false;
+    }
+    inFrom = inFrom.slice(0, t.depth + 1);
+    if (isWord(t, 'FROM', 'JOIN') || (isOp(t, ',') && inFrom[t.depth])) {
+      // The name after it, its parts joined by `.` or `/` (a resource's path): a `(` after it calls a procedure.
+      let j = isOp(tokens[k + 1], '/') ? k + 2 : k + 1;
+      let named = false;
+      while ((tokens[j]?.kind === 'word' || tokens[j]?.kind === 'quoted') && !isWord(tokens[j], 'LATERAL')) {
+        named = true;
+        j += 1;
+        if (!isOp(tokens[j], '.') && !isOp(tokens[j], '/')) {
+          break;
+        }
+        j += 1;
+      }
+      if (named && isOp(tokens[j], '(')) {
+        const name = tokens[j - 1].value.toLowerCase();
+        refuse(`${name}(…) in a FROM or JOIN calls a procedure, which can write: only tables and views are read here`, { kind: 'function', name });
+      }
+    }
+  }
+}
+
 /** Checks one reading of a statement: what it is, and that it is a read. */
 function check(sql: string, rules: Rules, reading: Reading, redacted: () => string): { statement: StatementKind; cut: number | null } {
   let lexed: Lexed;
@@ -742,13 +846,16 @@ function check(sql: string, rules: Rules, reading: Reading, redacted: () => stri
 
   // What it is: a query, perhaps in parentheses; an EXPLAIN of one; or SHOW (Cube Store).
   let start = 0;
+  if (rules.teradata && isWord(tokens[0], 'LOCKING', 'LOCK')) {
+    start = teradataLocking(tokens, (message) => refuse(message, 'select'));
+  }
   while (isOp(tokens[start], '(')) {
     start += 1;
   }
   const first = tokens[start];
   let statement: StatementKind;
   let query = start;
-  if (isWord(first, 'SELECT', 'WITH') || (rules.db2 && isWord(first, 'VALUES'))) {
+  if (isWord(first, 'SELECT', 'WITH') || (rules.db2 && isWord(first, 'VALUES')) || (rules.teradata && isWord(first, 'SEL'))) {
     statement = 'select';
   } else if (isWord(first, 'EXPLAIN') && start === 0) {
     statement = 'explain';
@@ -794,7 +901,7 @@ function check(sql: string, rules: Rules, reading: Reading, redacted: () => stri
     while (isOp(tokens[query], '(')) {
       query += 1;
     }
-    if (!isWord(tokens[query], 'SELECT', 'WITH')) {
+    if (!isWord(tokens[query], 'SELECT', 'WITH') && !(rules.teradata && isWord(tokens[query], 'SEL', 'LOCKING', 'LOCK'))) {
       refuse('Only an EXPLAIN of a SELECT runs here', 'explain');
     }
   } else if (rules.cubeStore && isWord(first, 'SHOW', 'DESCRIBE', 'DESC') && start === 0) {
@@ -849,6 +956,12 @@ function check(sql: string, rules: Rules, reading: Reading, redacted: () => stri
   if (rules.db2) {
     checkDb2(tokens, (message, refused) => refuse(message, statement, 'not_read_only', refused));
   }
+  if (rules.teradata) {
+    checkTeradata(tokens, (message, refused) => refuse(message, statement, 'not_read_only', refused));
+  }
+  if (rules.tdv) {
+    checkTdv(tokens, (message, refused) => refuse(message, statement, 'not_read_only', refused));
+  }
   // `WITH SESSION query_max_run_time = '1h' SELECT …`; a query named session is `WITH session AS (…)`.
   if (rules.trino && isWord(tokens[query], 'WITH') && isWord(tokens[query + 1], 'SESSION')
     && !isWord(tokens[query + 2], 'AS') && !isOp(tokens[query + 2], '(')) {
@@ -860,7 +973,7 @@ function check(sql: string, rules: Rules, reading: Reading, redacted: () => stri
   let seen = isWord(tokens[query], 'WITH') && !isOp(tokens[query - 1], '(') ? 0 : 1;
   for (let k = query + 1; k < tokens.length; k++) {
     const t = tokens[k];
-    if (t.depth === 0 && isWord(t, 'SELECT')) {
+    if (t.depth === 0 && (isWord(t, 'SELECT') || (rules.teradata && isWord(t, 'SEL')))) {
       let before = k - 1;
       while (before > query && tokens[before].kind === 'word' && SET_QUANTIFIERS.has(tokens[before].value)) {
         before -= 1;
@@ -941,7 +1054,7 @@ export function hivePlaceholders(sql: string, dialect: 'hive' | 'impala' = 'hive
 }
 
 /** The places of a JDBC dialect's `?` in Cube's SQL, as `hivePlaceholders` (`db2.ts`). */
-export function jdbcPlaceholders(sql: string, dialect: 'db2'): number[] {
+export function jdbcPlaceholders(sql: string, dialect: 'db2' | 'teradata' | 'tdv'): number[] {
   const rules = RULES[dialect];
   return lex(sql, rules, rules.readings[0]).tokens.filter((t) => isOp(t, '?')).map((t) => t.start);
 }
@@ -1122,6 +1235,8 @@ function writtenPlaceholder(dialect: SqlDialect, tokens: Token[], k: number): st
       return t.value === '$' && next?.kind === 'number' && touches(t, next) ? `$${next.value}` : null;
     case 'mysql':
     case 'db2':
+    case 'teradata':
+    case 'tdv':
       return t.value === '?' ? '?' : null;
     case 'snowflake':
       if (t.value === '?') {

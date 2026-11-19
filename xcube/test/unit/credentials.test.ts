@@ -192,13 +192,22 @@ describe('the engine token\'s vector, scheme v1', () => {
   });
 });
 
-// The hive, impala and db2 drivers' passwords (wechart's db_support R3, R11.1), in golden-v1.json's form, sealed
+// The hive, impala, db2, teradata and tdv drivers' passwords (wechart's db_support R3, R11.1), in golden-v1.json's form, sealed
 // to the development key: xcube's own vectors, for wechart's sealing test (test/fixtures/<driver>-vector-v1.json).
-describe.each(['hive', 'impala', 'db2'])('the %s password\'s vector, scheme v1', (driverName) => {
+// Each driver's target, what its password is bound to.
+const VECTOR_TARGETS: Record<string, string[]> = {
+  hive: ['host', 'port', 'ssl', 'sslRejectUnauthorized', 'sslCa'],
+  impala: ['host', 'port', 'ssl', 'sslRejectUnauthorized', 'sslCa'],
+  db2: ['host', 'port', 'ssl', 'sslRejectUnauthorized', 'sslCa'],
+  teradata: ['host', 'port', 'logmech', 'ssl', 'sslRejectUnauthorized', 'sslCa'],
+  tdv: ['host', 'port', 'domain', 'ssl', 'sslRejectUnauthorized'],
+};
+
+describe.each(Object.keys(VECTOR_TARGETS))('the %s password\'s vector, scheme v1', (driverName) => {
   const fixtures = path.join(__dirname, '..', 'fixtures');
   const vector = JSON.parse(fs.readFileSync(path.join(fixtures, `${driverName}-vector-v1.json`), 'utf8'));
 
-  test('binds the password to host, port, ssl, sslCa and sslRejectUnauthorized, byte for byte', () => {
+  test('binds the password to its target, byte for byte', () => {
     expect(vector.aad.length).toBe(2);
     for (const entry of vector.aad) {
       expect(entry.driver).toBe(driverName);
@@ -215,11 +224,11 @@ describe.each(['hive', 'impala', 'db2'])('the %s password\'s vector, scheme v1',
       const keys = new CredentialKeys(dir, [key.kid], key.kid);
       const [{ driver, field, fields, secret, envelope }] = vector.envelopes;
       expect(keys.open(envelope, driver, field, fields)).toBe(secret);
-      for (const bound of ['host', 'port', 'ssl', 'sslRejectUnauthorized', 'sslCa']) {
+      for (const bound of VECTOR_TARGETS[driverName]) {
         expect(() => keys.open(envelope, driver, field, { ...fields, [bound]: 'elsewhere' })).toThrow(CredentialError);
       }
-      // The database isn't the target: changing it keeps the password.
-      expect(keys.open(envelope, driver, field, { ...fields, database: 'other' })).toBe(secret);
+      // The database (TDV's data source) isn't the target: changing it keeps the password.
+      expect(keys.open(envelope, driver, field, { ...fields, database: 'other', dataSource: 'other' })).toBe(secret);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

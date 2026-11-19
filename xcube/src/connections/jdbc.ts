@@ -1,5 +1,5 @@
 /**
- * xcube's JDBC data sources (Db2 so far): a connection made by the vendor's
+ * xcube's JDBC data sources (Teradata, Db2, TDV): a connection made by the vendor's
  * driver class from xcube's settings alone, over node-java and xcube's helper
  * (`jdbc/src`), never Cube's JDBC driver:
  * - the helper makes the connection from the driver class itself, never
@@ -19,6 +19,10 @@
  * - each data source has a pool of connections; a connection that failed
  *   is dropped.
  */
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+
 import { BaseDriver } from '@cubejs-backend/base-driver';
 
 import { assertJdbcAvailable, JDBC_TYPES, jvm, type JdbcType } from './jvm';
@@ -115,9 +119,26 @@ export interface JdbcTarget {
   properties: Record<string, string>;
   /** Files the properties name (a CA certificate), removed when the driver is released. */
   files?: string[];
+  /** Whether the connection is made read-only (`setReadOnly`): Db2's driver makes it so; Teradata's ignores it, TDV's refuses it. */
+  readOnly: boolean;
   connectTimeoutMs?: number;
   queryTimeoutS?: number;
   maxPoolSize?: number;
+}
+
+/**
+ * Writes a CA to a file only this process reads (0600), in a directory of
+ * its own under the temporary directory: what a driver's CA property names
+ * (Db2's `sslCertLocation`, Teradata's `SSLCA`). `remove` deletes both.
+ */
+export function privateCaFile(pem: string, prefix: string): { file: string; remove: () => void } {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const file = path.join(dir, 'ca.pem');
+  fs.writeFileSync(file, pem, { mode: 0o600, flag: 'wx' });
+  return {
+    file,
+    remove: () => fs.rmSync(dir, { recursive: true, force: true }),
+  };
 }
 
 /** A bound value, in the order of the statement's `?`: a boolean bound as one, the rest as text. */
@@ -202,7 +223,7 @@ export class JdbcConnection {
       target.url,
       java.newArray('java.lang.String', keys),
       java.newArray('java.lang.String', keys.map((k) => target.properties[k])),
-      true,
+      target.readOnly,
     ));
     try {
       return new JdbcConnection(java, await raced(opening, ms + 5000, `The data source didn't answer within ${Math.round(ms / 1000)} s`));
@@ -257,6 +278,15 @@ export class JdbcConnection {
     } finally {
       this.running = null;
       await statement.close();
+    }
+  }
+
+  /** The catalog as the driver's DatabaseMetaData reads it (`Jdbc.catalog`): its rows of strings. */
+  public async catalog(what: 'schemas' | 'tables' | 'columns', catalog: string | null, schema: string | null, table: string | null): Promise<(string | null)[][]> {
+    try {
+      return JSON.parse(await inTurn(() => this.java.callStaticMethodP('xcube.jdbc.Jdbc', 'catalog', this.connection, what, catalog, schema, table)));
+    } catch (e) {
+      throw this.failed(e, 'query');
     }
   }
 
@@ -381,23 +411,37 @@ export class JdbcConnections {
 
 /** What differs per JDBC type in Cube's driver: its SQL for a test, its catalog, how a value is written in, its types. */
 export interface JdbcDialect {
+  /**
+   * Its catalog read through the driver's DatabaseMetaData, not its own
+   * views (TDV): a published catalog is then part of each schema's name,
+   * `catalog.schema`.
+   */
+  metadata?: boolean;
   /** A statement that reads one row and nothing else. */
   testSql: string;
   /** Cube's SQL with each `?` replaced by its value as a literal of the database's. */
   inline(sql: string, values: unknown[]): string;
   /** The schemas a user's tables are in: one column, the schema's name. */
-  schemasSql(): string;
+  schemasSql?(): string;
   /** A schema's tables and views: the table's name, its kind. */
-  tablesSql(schema: string): string;
+  tablesSql?(schema: string): string;
   /** A table's columns, in order: the column's name, its type. */
-  columnsSql(schema: string, table: string): string;
+  columnsSql?(schema: string, table: string): string;
   /** Every user table's columns, in order: schema, table, column, type. */
-  catalogSql(): string;
+  catalogSql?(): string;
   /** A database type's generic name (Cube's). */
   genericType(type: string): string | undefined;
 }
 
-/** Cube's driver for a JDBC data source (Db2). */
+/** A schema as a metadata catalog names it: `catalog.schema` where it has a catalog, split back at the first `.`. */
+const schemaName = (catalog: string | null, schema: string | null) => (catalog ? `${catalog}.${schema ?? ''}` : (schema ?? ''));
+
+const schemaParts = (name: string, catalogs: boolean): [string | null, string] => {
+  const dot = name.indexOf('.');
+  return catalogs && dot > 0 ? [name.slice(0, dot), name.slice(dot + 1)] : [null, name];
+};
+
+/** Cube's driver for a JDBC data source (Teradata, Db2, TDV). */
 export class JdbcDriver extends BaseDriver {
   protected readonly pool: JdbcConnections;
 
@@ -453,19 +497,35 @@ export class JdbcDriver extends BaseDriver {
     return { incrementalSchemaLoading: true };
   }
 
+  /** A metadata catalog's rows (`JdbcConnection.catalog`). */
+  protected metadata(what: 'schemas' | 'tables' | 'columns', catalog: string | null, schema: string | null, table: string | null) {
+    return this.withConnection((c) => c.catalog(what, catalog, schema, table));
+  }
+
+  /** Each row's values, as strings trimmed (Db2's and Teradata's catalogs pad their names). */
+  protected async stringsOf(sql: string): Promise<string[][]> {
+    return (await this.rowsOf(sql)).map((r) => Object.values(r).map((v) => (v == null ? '' : String(v).trim())));
+  }
+
+  /** Whether some schema has a catalog: TDV's published ones, then part of each schema's name. */
+  protected catalogs = false;
+
   public override async getSchemas() {
-    const rows = await this.rowsOf(this.dialect.schemasSql());
-    return rows.map((r) => ({ schema_name: String(Object.values(r)[0] ?? '').trim() })).filter((r) => r.schema_name);
+    if (this.dialect.metadata) {
+      const rows = await this.metadata('schemas', null, null, null);
+      this.catalogs = rows.some(([catalog]) => Boolean(catalog));
+      return rows.map(([catalog, schema]) => ({ schema_name: schemaName(catalog, schema) })).filter((r) => r.schema_name);
+    }
+    return (await this.stringsOf(this.dialect.schemasSql!())).map(([name]) => ({ schema_name: name })).filter((r) => r.schema_name);
   }
 
   public override async getTablesForSpecificSchemas(schemas: { schema_name: string }[]) {
     const out: { schema_name: string; table_name: string; table_type?: string }[] = [];
     for (const { schema_name: schema } of schemas) {
-      const rows = await this.rowsOf(this.dialect.tablesSql(schema));
-      out.push(...rows.map((r) => {
-        const [name, kind] = Object.values(r);
-        return { schema_name: schema, table_name: String(name).trim(), table_type: kind == null ? undefined : String(kind).trim() };
-      }));
+      const rows = this.dialect.metadata
+        ? (await this.metadata('tables', ...schemaParts(schema, this.catalogs), null)).map(([, , name, kind]) => [name ?? '', kind ?? ''])
+        : await this.stringsOf(this.dialect.tablesSql!(schema));
+      out.push(...rows.map(([name, kind]) => ({ schema_name: schema, table_name: name, table_type: kind || undefined })));
     }
     return out;
   }
@@ -473,23 +533,23 @@ export class JdbcDriver extends BaseDriver {
   public override async getColumnsForSpecificTables(tables: { schema_name: string; table_name: string }[]) {
     const out: any[] = [];
     for (const { schema_name: schema, table_name: table } of tables) {
-      const rows = await this.rowsOf(this.dialect.columnsSql(schema, table));
-      out.push(...rows.map((r) => {
-        const [name, type] = Object.values(r);
-        return {
-          schema_name: schema, table_name: table, column_name: String(name).trim(), data_type: String(type ?? '').trim().toLowerCase(), attributes: [],
-        };
-      }));
+      const rows = this.dialect.metadata
+        ? (await this.metadata('columns', ...schemaParts(schema, this.catalogs), table)).map(([, , , name, type]) => [name ?? '', type ?? ''])
+        : await this.stringsOf(this.dialect.columnsSql!(schema, table));
+      out.push(...rows.map(([name, type]) => ({
+        schema_name: schema, table_name: table, column_name: name, data_type: type.toLowerCase(), attributes: [],
+      })));
     }
     return out;
   }
 
-  /** Every user table's columns, in one statement: schema, table, column and type, in order. */
+  /** Every user table's columns, in one read: schema, table, column and type, in order. */
   public override async tablesSchema() {
-    const rows = await this.rowsOf(this.dialect.catalogSql());
+    const rows = this.dialect.metadata
+      ? (await this.metadata('columns', null, null, null)).map(([catalog, schema, table, column, type]) => [schemaName(catalog, schema), table ?? '', column ?? '', type ?? ''])
+      : await this.stringsOf(this.dialect.catalogSql!());
     const structure: Record<string, Record<string, { name: string; type: string; attributes: string[] }[]>> = {};
-    for (const r of rows) {
-      const [schema, table, column, type] = Object.values(r).map((v) => String(v ?? '').trim());
+    for (const [schema, table, column, type] of rows) {
       ((structure[schema] ??= {})[table] ??= []).push({ name: column, type: type.toLowerCase(), attributes: [] });
     }
     return structure;

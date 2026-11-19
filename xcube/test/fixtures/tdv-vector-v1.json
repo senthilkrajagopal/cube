@@ -1,0 +1,51 @@
+{
+  "about": "The tdv driver's password, scheme v1, in golden-v1.json's form: `aad` and `envelopes` entries, sealed to the same development key (dev-credential-key.pub.jwk). Development values only.",
+  "aad": [
+    {
+      "driver": "tdv",
+      "field": "password",
+      "fields": {
+        "host": "tdv.example",
+        "port": 9401,
+        "domain": "composite",
+        "dataSource": "sales",
+        "ssl": false
+      },
+      "aad": "[\"wechart/data-source-secret/v1\",\"tdv\",\"password\",[[\"domain\",\"composite\"],[\"host\",\"tdv.example\"],[\"port\",\"9401\"],[\"ssl\",\"false\"],[\"sslRejectUnauthorized\",\"\"]]]"
+    },
+    {
+      "driver": "tdv",
+      "field": "password",
+      "fields": {
+        "host": "tdv.example",
+        "port": 9401,
+        "domain": "ldap",
+        "dataSource": "sales",
+        "ssl": true,
+        "sslRejectUnauthorized": true
+      },
+      "aad": "[\"wechart/data-source-secret/v1\",\"tdv\",\"password\",[[\"domain\",\"ldap\"],[\"host\",\"tdv.example\"],[\"port\",\"9401\"],[\"ssl\",\"true\"],[\"sslRejectUnauthorized\",\"true\"]]]"
+    }
+  ],
+  "envelopes": [
+    {
+      "driver": "tdv",
+      "field": "password",
+      "fields": {
+        "host": "tdv.example",
+        "port": 9401,
+        "domain": "ldap",
+        "dataSource": "sales",
+        "ssl": true,
+        "sslRejectUnauthorized": true
+      },
+      "secret": "tdv-dev-password",
+      "envelope": {
+        "v": 1,
+        "kid": "uYWeMx6i173fsiolFp1xi-qiav50k52AGinM56Y8JEw",
+        "enc": "1z3YC4rjlmY3A78mSIdOU0eCU-kbaMn5MM5V-V4ykFM",
+        "ct": "dGEQeaKf7kru9lsaKVb8xfPYefuF1PtBaJeL9txy2N3JgOTTnLd6ej5FdnkblAEhYfRezSc6Djoxa67ZM6wWgragOW1EaRhs0Tsi37wM3fAQu1rASV5LfeQ6a8WzWGXETXMLYIEZzO2IKZI6foE2UFbA-s8LFs2xNfkKYBHnfcdZvmw-800PxkWnpYF_haX8K-gbwxCWRKq5L67sjpP1eJhRbtHQzg7xwlv3JL0mzqjaP8glVDUpQ3wexuWAcG2Hds2dVBrLzS27kVQzAqNd9JMMG-6Aw2mE0x_bQwNY6IiAbSNJBVHbVFnE36Tqs08LcmdzN-4ytvMH8CDlDIdd4ZG3huM9nWZCP1u5vLT0uFY"
+      }
+    }
+  ]
+}

@@ -200,7 +200,7 @@ export interface SqlSession {
 export type Refuse = (message: string, statement: string, reason?: string) => never;
 
 export type SessionDialect = 'postgres' | 'redshift' | 'mysql' | 'snowflake' | 'bigquery' | 'mssql' | 'oracle' | 'dremio'
-  | 'duckdb' | 'clickhouse' | 'trino' | 'athena' | 'cubestore' | 'hive' | 'impala' | 'db2';
+  | 'duckdb' | 'clickhouse' | 'trino' | 'athena' | 'cubestore' | 'hive' | 'impala' | 'db2' | 'teradata' | 'tdv';
 
 /** A dialect no case took: the compiler holds every switch over them to all of them. */
 function unknownDialect(dialect: never): never {
@@ -1126,13 +1126,14 @@ async function hiveSession(driver: HiveDriver, caps: SqlCaps): Promise<SqlSessio
 }
 
 /**
- * A JDBC data source (Db2): a connection of the run's own, read-only as its
- * driver allows (`readOnly`, which Db2's makes the connection's), the
- * statement prepared (one per execute) with its `?` bound, and the
- * database's own time limit (`setQueryTimeout`); its rows read a batch at a
- * time. A cancel runs on a thread of the JVM's own, at once.
+ * A JDBC data source (Teradata, Db2, TDV): a connection of the run's own,
+ * read-only where its driver makes one so (Db2's; Teradata and TDV have no
+ * read-only session), the statement prepared (one per execute) with its `?`
+ * bound, and the database's own time limit (`setQueryTimeout`; TDV's
+ * `requestTimeout`, its connection's); its rows read a batch at a time. A
+ * cancel runs on a thread of the JVM's own, at once.
  */
-async function jdbcSession(driver: JdbcDriver, caps: SqlCaps): Promise<SqlSession> {
+async function jdbcSession(driver: JdbcDriver, caps: SqlCaps, dialect: 'db2' | 'teradata' | 'tdv'): Promise<SqlSession> {
   let connection;
   try {
     connection = await driver.openConnection();
@@ -1145,6 +1146,9 @@ async function jdbcSession(driver: JdbcDriver, caps: SqlCaps): Promise<SqlSessio
   let statement: JdbcStatement | null = null;
   let stopping = false;
   return {
+    unbindable(binds) {
+      return dialect === 'teradata' && binds.some((b) => b.type === 'boolean') ? 'Teradata has no Boolean type to bind one as' : null;
+    },
     async run(sql, rows, binds = []) {
       const running = await open.execute(sql, binds.map((b) => ({ type: b.type, value: b.value })), seconds, batchOf(rows, caps.maxRows));
       statement = running;
@@ -1301,7 +1305,9 @@ export function openSession(
     case 'impala':
       return hiveSession(driver, caps);
     case 'db2':
-      return jdbcSession(driver, caps);
+    case 'teradata':
+    case 'tdv':
+      return jdbcSession(driver, caps, dialect);
     default:
       return unknownDialect(dialect);
   }
@@ -1363,6 +1369,14 @@ export function isTimeout(dialect: SessionDialect, e: any, ran?: { ms: number; t
       // Its driver's SQLTimeoutException; or SQLCODE -952, a statement interrupted, which a cancel is too: the time it came at tells.
       return e instanceof JdbcError && (e.kind === 'timeout'
         || (e.vendorCode === -952 && ran !== undefined && ran.ms >= ran.timeoutMs - TIMEOUT_SLACK_MS));
+    case 'teradata':
+      // The driver's abort at setQueryTimeout ends the request as a user's abort would (error 3110): the time it came at tells.
+      return e instanceof JdbcError && (e.kind === 'timeout'
+        || (e.vendorCode === 3110 && ran !== undefined && ran.ms >= ran.timeoutMs - TIMEOUT_SLACK_MS));
+    case 'tdv':
+      // Its requestTimeout, worded as a timeout; or the driver's SQLTimeoutException.
+      return e instanceof JdbcError && (e.kind === 'timeout'
+        || (/time ?out|timed out/i.test(e.message) && ran !== undefined && ran.ms >= ran.timeoutMs - TIMEOUT_SLACK_MS));
     case 'dremio':
     // It has no statement timeout: the run's clock interrupts it.
     case 'duckdb':

@@ -230,11 +230,13 @@ const sqlSchema = Joi.object({
 });
 
 /**
- * An export: a table (`table`, with `schema` and `columns`), or a caller's
- * SELECT (`sql`, with `parameters`, whose values may be lists), never both.
+ * An export: a table (`table`, with `schema`, `columns`, and on TDV a
+ * published `catalog`), or a caller's SELECT (`sql`, with `parameters`,
+ * whose values may be lists), never both.
  */
 const exportSchema = Joi.object({
   runId: Joi.string().pattern(RUN_ID).required(),
+  catalog: Joi.string().min(1).max(256),
   schema: Joi.string().min(1).max(256),
   table: Joi.string().min(1).max(256),
   columns: Joi.array().items(Joi.string().min(1).max(256)).min(1).max(4096),
@@ -254,7 +256,7 @@ const exportSchema = Joi.object({
   timeoutMs: Joi.number().integer().min(1000).max(EXPORT_MAX_TIMEOUT_MS)
     .default(EXPORT_TIMEOUT_MS),
 }).xor('table', 'sql')
-  .without('sql', ['schema', 'columns'])
+  .without('sql', ['catalog', 'schema', 'columns'])
   .without('table', ['parameters']);
 
 const sqlCancelSchema = Joi.object({

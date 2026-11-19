@@ -97,6 +97,9 @@ const cases = {
   'impala (none)': [{ host: 'xc-host', port: 21050, database: 'xc-db', ssl: false }, 'none', {}, 'impala'],
   db2: [{ host: 'xc-host', port: 50000, database: 'xc-db', user: 'xc-user', ssl: true, sslCa: 'xc-ca' }, 'password', { password: 'xc-password' }],
   'db2 (no TLS)': [{ host: 'xc-host', port: 50000, database: 'xc-db', user: 'xc-user', ssl: false }, 'password', { password: 'xc-password' }, 'db2'],
+  teradata: [{ host: 'xc-host', port: 443, database: 'xc-db', logmech: 'LDAP', user: 'xc-user', ssl: true, sslCa: 'xc-ca' }, 'password', { password: 'xc-password' }],
+  'teradata (no TLS)': [{ host: 'xc-host', database: 'xc-db', user: 'xc-user', ssl: false }, 'password', { password: 'xc-password' }, 'teradata'],
+  tdv: [{ host: 'xc-host', port: 9401, domain: 'xc-domain', dataSource: 'xc-ds', user: 'xc-user', ssl: true }, 'password', { password: 'xc-password' }],
   athena: [{ region: 'eu-west-1', workGroup: 'xc-workgroup', s3OutputLocation: 's3://xc-results/', catalog: 'xc-catalog', database: 'xc-db', accessKeyId: 'AKIAXCXCXCXCXCXCXCXC' }, 'access-key', { secretAccessKey: 'xc-secret' }],
 };
 

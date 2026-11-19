@@ -15,12 +15,10 @@
  *   fails the connection test with the driver's words.
  * - Always `readOnly`, the server's own messages, and the login timeout.
  */
-import fs from 'fs';
-import os from 'os';
-import path from 'path';
-
 import { jdbcPlaceholders, lexedKinds } from '../sql/classify';
-import { JDBC_CONNECT_MS, JDBC_QUERY_TIMEOUT_S, JdbcDriver, type JdbcDialect, type JdbcTarget } from './jdbc';
+import {
+  JDBC_CONNECT_MS, JDBC_QUERY_TIMEOUT_S, JdbcDriver, privateCaFile, type JdbcDialect, type JdbcTarget,
+} from './jdbc';
 
 export interface Db2Config {
   host: string;
@@ -156,24 +154,14 @@ export const DB2_DIALECT: JdbcDialect = {
   } as Record<string, string>)[type],
 };
 
-/** Writes a CA to a file only this process reads, in a directory of its own: what `sslCertLocation` names. */
-function privateCaFile(pem: string): { file: string; remove: () => void } {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xcube-db2-'));
-  const file = path.join(dir, 'ca.pem');
-  fs.writeFileSync(file, pem, { mode: 0o600, flag: 'wx' });
-  return {
-    file,
-    remove: () => fs.rmSync(dir, { recursive: true, force: true }),
-  };
-}
-
 /** A Db2 driver from a connection's config (`DRIVERS.db2.config`). */
 export function makeDb2Driver(config: Record<string, unknown>): JdbcDriver {
   const c = config as unknown as Db2Config;
-  const ca = c.ssl && c.ssl.ca ? privateCaFile(c.ssl.ca) : null;
+  const ca = c.ssl && c.ssl.ca ? privateCaFile(c.ssl.ca, 'xcube-db2-') : null;
   try {
     const target: JdbcTarget = {
       ...db2Target(c, ca?.file ?? null),
+      readOnly: true,
       files: ca ? [ca.file] : [],
       connectTimeoutMs: c.connectTimeoutMs,
       queryTimeoutS: c.queryTimeout,

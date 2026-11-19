@@ -119,11 +119,20 @@ public final class Run {
       close();
       throw new SQLException("The statement was cancelled before it ran", "57014");
     }
+    // Best effort: a driver without them (TDV's, whose limit is the connection's requestTimeout) still runs.
     if (timeoutS > 0) {
-      s.setQueryTimeout(timeoutS);
+      try {
+        s.setQueryTimeout(timeoutS);
+      } catch (SQLException e) {
+        // The connection's own limit, and xcube's clock, stop it.
+      }
     }
     if (fetchRows > 0) {
-      s.setFetchSize(fetchRows);
+      try {
+        s.setFetchSize(fetchRows);
+      } catch (SQLException e) {
+        // The driver's own batches.
+      }
     }
     for (int i = 0; i < types.length; i++) {
       if ("boolean".equals(types[i])) {

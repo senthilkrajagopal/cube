@@ -41,6 +41,8 @@ export interface SqlParameter {
  *   caps (`http_max_uri_size`, 1 MiB by default): 10,000, short values.
  * - DuckDB and wechart's engine: no limit of theirs; xcube's own, 65,535.
  * - Db2: 32,767 host variable references in a statement.
+ * - Teradata: 2,048, xcube's, below the parameters a request's USING takes.
+ * - TDV: xcube's own, 10,000: TDV documents none.
  */
 export const MAX_BOUND: Partial<Record<SqlDialect, { total: number; list: number }>> = {
   postgres: { total: 32767, list: 32767 },
@@ -53,6 +55,8 @@ export const MAX_BOUND: Partial<Record<SqlDialect, { total: number; list: number
   clickhouse: { total: 10000, list: 10000 },
   duckdb: { total: 65535, list: 65535 },
   db2: { total: 32767, list: 32767 },
+  teradata: { total: 2048, list: 2048 },
+  tdv: { total: 10000, list: 10000 },
   // Written into the statement as literals (`LITERAL_DIALECTS`): xcube's own, below their statement-length limits.
   trino: { total: 10000, list: 10000 },
   athena: { total: 10000, list: 10000 },
@@ -104,6 +108,8 @@ export const DIALECT_NAMES: Record<SqlDialect, string> = {
   hive: 'Hive',
   impala: 'Impala',
   db2: 'Db2',
+  teradata: 'Teradata',
+  tdv: 'TDV',
 };
 
 /** A number's decimal string: at most 38 digits, at most 30 after the point (every dialect's exact decimal holds it). */
@@ -223,6 +229,15 @@ function placeholder(dialect: SqlDialect, slot: string, parameter: { type: Param
       return {
         number: `CAST(${slot} AS DECIMAL(31, ${scale}))`, date: `CAST(${slot} AS DATE)`, datetime: `CAST(${slot} AS TIMESTAMP(6))`, boolean: `CAST(${slot} AS BOOLEAN)`,
       }[type as string] ?? slot;
+    case 'teradata':
+      // A date's and a timestamp's text in ANSI form; Teradata has no BOOLEAN (the session refuses one).
+      return {
+        number: `CAST(${slot} AS DECIMAL(38, ${scale}))`, date: `CAST(${slot} AS DATE FORMAT 'YYYY-MM-DD')`, datetime: `CAST(${slot} AS TIMESTAMP(6))`,
+      }[type as string] ?? slot;
+    case 'tdv':
+      return {
+        number: `CAST(${slot} AS DECIMAL(38, ${scale}))`, date: `CAST(${slot} AS DATE)`, datetime: `CAST(${slot} AS TIMESTAMP)`, boolean: `CAST(${slot} AS BOOLEAN)`,
+      }[type as string] ?? slot;
     case 'oracle':
       if (type === 'number') {
         return `TO_NUMBER(${slot}, '${oracleNumberFormat(String(value))}', 'NLS_NUMERIC_CHARACTERS=''.,''')`;
@@ -274,7 +289,7 @@ function typedLiteral(dialect: SqlDialect, type: ParameterType, value: string | 
 }
 
 /** Whether a dialect's placeholders are positional, one value per place (`?`), rather than named or numbered for reuse. */
-const POSITIONAL = new Set<SqlDialect>(['mysql', 'snowflake', 'db2']);
+const POSITIONAL = new Set<SqlDialect>(['mysql', 'snowflake', 'db2', 'teradata', 'tdv']);
 
 /** Whether only blanks stand between `at` and the nearest `(` before it, and the nearest `)` after `end`. */
 function inParentheses(sql: string, start: number, end: number): boolean {
@@ -365,7 +380,7 @@ export function bindParameters(
     if (type === 'datetime') {
       value = fullDateTime(String(given));
       // Db2 reads a timestamp's string with a space too (`YYYY-MM-DD HH:MM:SS.ffffff`).
-      value = dialect === 'clickhouse' || dialect === 'db2' ? value.replace('T', ' ') : value;
+      value = ['clickhouse', 'db2', 'teradata', 'tdv'].includes(dialect) ? value.replace('T', ' ') : value;
     }
     if (LITERAL_DIALECTS.has(dialect)) {
       const literal = typedLiteral(dialect, type, value);

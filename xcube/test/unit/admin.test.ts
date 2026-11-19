@@ -50,12 +50,15 @@ describe('admin routes', () => {
       const ok = await request(a).get(url).set('Authorization', `Bearer ${TOKEN}`).expect(200);
       expect(ok.body.drivers.map((d: any) => d.type)).toEqual([
         'postgres', 'redshift', 'mysql', 'snowflake', 'bigquery', 'mssql', 'oracle', 'dremio', 'duckdb', 'clickhouse', 'trino', 'athena', 'engine', 'hive', 'impala',
-        'db2',
+        'db2', 'teradata', 'tdv',
       ]);
-      expect(ok.body.drivers.filter((d: any) => d.type !== 'db2').every((d: any) => d.available === true && d.reason === undefined)).toBe(true);
-      expect(ok.body.drivers.find((d: any) => d.type === 'db2')).toEqual({
-        type: 'db2', available: false, reason: 'No driver jar is mounted for db2: this deployment sets no XCUBE_JDBC_DRIVERS_DIR',
-      });
+      const jdbc = ['db2', 'teradata', 'tdv'];
+      expect(ok.body.drivers.filter((d: any) => !jdbc.includes(d.type)).every((d: any) => d.available === true && d.reason === undefined)).toBe(true);
+      for (const type of jdbc) {
+        expect(ok.body.drivers.find((d: any) => d.type === type)).toEqual({
+          type, available: false, reason: `No driver jar is mounted for ${type}: this deployment sets no XCUBE_JDBC_DRIVERS_DIR`,
+        });
+      }
       await request(a).get('/cubejs-api/v1/semantic/models/Bad!/drivers').set('Authorization', `Bearer ${TOKEN}`).expect(400);
     } finally {
       resetJdbcDrivers();

@@ -7,7 +7,9 @@ import java.security.cert.Certificate;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.sql.Connection;
+import java.sql.DatabaseMetaData;
 import java.sql.Driver;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLTimeoutException;
 import java.util.ArrayList;
@@ -47,6 +49,62 @@ public final class Jdbc {
     }, "xcube-jdbc-close");
     t.setDaemon(true);
     t.start();
+  }
+
+  /**
+   * The catalog as the driver's DatabaseMetaData reads it, for a database
+   * whose own views xcube doesn't read (TDV): `schemas` [catalog, schema];
+   * `tables` [catalog, schema, table, type]; `columns` [catalog, schema,
+   * table, column, type], in order. A null or empty argument is any.
+   */
+  public static String catalog(Connection connection, String what, String catalog, String schema, String table) throws SQLException {
+    DatabaseMetaData meta = connection.getMetaData();
+    String cat = catalog == null || catalog.isEmpty() ? null : catalog;
+    String sch = schema == null || schema.isEmpty() ? null : schema;
+    String tab = table == null || table.isEmpty() ? "%" : table;
+    StringBuilder out = new StringBuilder("[");
+    String[] columns;
+    ResultSet rows;
+    switch (what) {
+      case "schemas":
+        rows = meta.getSchemas();
+        columns = new String[] {"TABLE_CATALOG", "TABLE_SCHEM"};
+        break;
+      case "tables":
+        rows = meta.getTables(cat, sch, tab, new String[] {"TABLE", "VIEW"});
+        columns = new String[] {"TABLE_CAT", "TABLE_SCHEM", "TABLE_NAME", "TABLE_TYPE"};
+        break;
+      case "columns":
+        rows = meta.getColumns(cat, sch, tab, "%");
+        columns = new String[] {"TABLE_CAT", "TABLE_SCHEM", "TABLE_NAME", "COLUMN_NAME", "TYPE_NAME"};
+        break;
+      default:
+        throw new IllegalArgumentException("No catalog read " + what);
+    }
+    try {
+      boolean first = true;
+      while (rows.next()) {
+        out.append(first ? "[" : ",[");
+        first = false;
+        for (int i = 0; i < columns.length; i++) {
+          if (i > 0) {
+            out.append(',');
+          }
+          String value;
+          try {
+            value = rows.getString(columns[i]);
+          } catch (SQLException e) {
+            // A driver without the column (an older one's TABLE_CATALOG).
+            value = null;
+          }
+          Json.string(out, value);
+        }
+        out.append(']');
+      }
+    } finally {
+      rows.close();
+    }
+    return out.append(']').toString();
   }
 
   /** Whether the classpath holds a class: a vendor jar provides its driver. */

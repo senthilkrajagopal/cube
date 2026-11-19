@@ -226,9 +226,9 @@ In both modes:
 | `XCUBE_DUCKDB_VOLUMES` | unset | Comma-separated absolute directories a `volume` connection's file may be in. Unset, none may |
 | `XCUBE_EXPORT_FETCH_ROWS` | `50000` | The most rows an export reads from the database in one round trip (1 to 1,000,000), where its driver reads in batches (PostgreSQL, Redshift, BigQuery, Oracle) |
 | `XCUBE_EXPORT_FETCH_BYTES` | `16777216` | About how much of an export's NDJSON one round trip reads (64 KiB to 64 MiB): a batch is this over the rows' average size so far, at most `XCUBE_EXPORT_FETCH_ROWS`, and the first is 1,000 rows. It is also how much may wait unsent before the export waits for its client |
-| `XCUBE_JDBC_DRIVERS_DIR` | unset | Where the JDBC vendors' jars are mounted (read-only), one directory per type: `db2/`. Read once at start, each jar logged with its size and SHA-256; never fetched. Unset, every JDBC type is unavailable (`driver_unavailable`) |
+| `XCUBE_JDBC_DRIVERS_DIR` | unset | Where the JDBC vendors' jars are mounted (read-only), one directory per type: `teradata/`, `db2/`, `tdv/`. Read once at start, each jar logged with its size and SHA-256; never fetched. Unset, every JDBC type is unavailable (`driver_unavailable`) |
 | `XCUBE_JDBC_MAX_HEAP_MB` | `512` | The JVM's heap (64 to 65,536 MiB). The JVM starts with the first JDBC connection, never before |
-| `XCUBE_JDBC_TRUST_STORE` | unset | A PEM bundle of CA certificates the JVM trusts beside its own, for every JDBC connection without a CA of its own (held in memory; nothing written) |
+| `XCUBE_JDBC_TRUST_STORE` | unset | A PEM bundle of CA certificates the JVM trusts beside its own, for every JDBC connection without a CA of its own: TDV's, whose driver reads only the JVM's (held in memory; nothing written) |
 | `UV_THREADPOOL_SIZE` | `16` in the image | Node's thread pool. JDBC calls hold at most all but four of its threads; a JDBC cancel or close holds none |
 | `XCUBE_CONNECTION_HEARTBEAT_MS` | `600000` | How often an instance re-writes its report of each connection it holds a driver for (10 s to 30 min), so a report within the hour means an instance running |
 | `CUBEJS_TRANSPILATION_WORKER_THREADS_COUNT` | `2` | Cube's; the image sets it when unset, as unset a compile can take gigabytes |
@@ -595,8 +595,9 @@ xcube's credential key, so the client stores them and can't open them.
 **Drivers.** `postgres`, `redshift`, `mysql`, `snowflake`, `bigquery`, `mssql`,
 `oracle`, `dremio`, `duckdb`, `clickhouse`, `trino` and `athena`, through Cube's own drivers,
 and `engine`, wechart's in-memory engine, `hive` (Apache Hive and Spark's
-Thrift server), `impala` (Apache Impala) and `db2` (IBM Db2, over its JDBC
-driver, mounted), through xcube's:
+Thrift server), `impala` (Apache Impala), and `teradata`, `db2` and `tdv`
+(Teradata, IBM Db2 and TIBCO Data Virtualization, over their JDBC drivers,
+mounted), through xcube's:
 
 | Driver | Auth methods | Target (what a secret is bound to) |
 | --- | --- | --- |
@@ -615,9 +616,11 @@ driver, mounted), through xcube's:
 | `engine` | `service-token` | baseUrl, sslRejectUnauthorized, sslCa |
 | `hive` | `username` (SASL PLAIN, a placeholder password), `password` | host, port, ssl, sslRejectUnauthorized, sslCa |
 | `impala` | `none` (NOSASL), `username`, `password` (LDAP) | host, port, ssl, sslRejectUnauthorized, sslCa |
+| `teradata` | `password` (`logmech` TD2 or LDAP) | host, port, logmech, ssl, sslRejectUnauthorized, sslCa |
 | `db2` | `password` | host, port, ssl, sslRejectUnauthorized, sslCa |
+| `tdv` | `password` (in its `domain`) | host, port, domain, ssl, sslRejectUnauthorized |
 
-DuckDB, ClickHouse, Trino, Athena, Hive, Impala and Db2 connections are read-only:
+DuckDB, ClickHouse, Trino, Athena, Hive, Impala, Teradata, Db2 and TDV connections are read-only:
 - **Rollups are built in Cube Store only.** A publish refuses a cube on one
   of them with a pre-aggregation built in the source (`external: false`, or
   `original_sql`).
@@ -698,7 +701,7 @@ Apache Hive's HiveServer2 and Spark's Thrift server.
 - **A dropped connection.** A statement whose connection drops runs on until
   Impala sees its client gone (`idle_client_poll_period_s`, 30 s by default).
 
-**JDBC** data sources (Db2 so far) run on a JVM in Cube's own process, over
+**JDBC** data sources (Teradata, Db2 and TDV) run on a JVM in Cube's own process, over
 node-java (built into the image for each architecture against its JRE, 21)
 and xcube's helper (`jdbc/src`), never Cube's JDBC driver
 (`src/connections/jvm.ts`, `src/connections/jdbc.ts`).
@@ -706,7 +709,8 @@ and xcube's helper (`jdbc/src`), never Cube's JDBC driver
   `XCUBE_JDBC_DRIVERS_DIR`, one directory per type (`db2/`), read once at
   start: every jar found is on the classpath, and each is logged with its
   size and SHA-256 (`xcube: jdbc driver jar`). A type is available when one
-  of its jars holds its driver class (`com.ibm.db2.jcc.DB2Driver`), read
+  of its jars holds its driver class (`com.teradata.jdbc.TeraDriver`,
+  `com.ibm.db2.jcc.DB2Driver`, `cs.jdbc.driver.CompositeDriver`), read
   from the jar's directory of entries. Nothing is ever downloaded. Where a
   type isn't available, a connection test, a stored connection, a SQL run or
   an export on it answers `503 driver_unavailable`, with a `reason` naming
@@ -776,6 +780,80 @@ its jar mounted under `db2/`; z/OS with the customer's licence jar).
 - **Not run against a server here**, at the user's decision until there is
   one to name; the JVM, the helper, the session's cancel and the cells are
   run in the image against PostgreSQL's JDBC driver (`test/image/jdbc.js`).
+
+**Teradata** (`src/connections/teradata.ts`) is Teradata's driver
+(`com.teradata.jdbc.TeraDriver`, its jar mounted under `teradata/`).
+- **URL.** A list of parameters, `jdbc:teradata://host/NAME=value,…`, of
+  xcube's names alone: `DATABASE`, `LOGMECH` (`TD2` or `LDAP`), `TMODE=ANSI`,
+  `CHARSET=UTF8`, `LOGON_TIMEOUT`, and `STRICT_NAMES=ON`, so a name the
+  driver doesn't know fails the connection rather than being ignored. With
+  TLS (on by default, port 443) `HTTPS_PORT`, `SSLMODE=VERIFY-FULL` (`REQUIRE`
+  with `sslRejectUnauthorized: false`) and the CA as `SSLCA`, a file of its
+  own; without, `DBS_PORT` (1025), `SSLMODE=DISABLE` and `ENCRYPTDATA=ON`.
+  The user and password are properties. `database` can't hold what
+  separates parameters (`,` `=` `/` `'` …).
+- **No read-only session** (`setReadOnly` does nothing): the check and a
+  login with `SELECT` only. Its check refuses, beyond writes and their
+  abbreviations (`INS`, `UPD`, `DEL`): `SELECT AND CONSUME`; `WRITE_NOS`,
+  `READ_NOS` and `SCRIPT`; QueryGrid's `FOREIGN TABLE` and `name@server`;
+  `EXEC`, `EXECUTE` and `CALL`; and a leading `LOCKING` (or `LOCK`) other than
+  `FOR ACCESS` or `FOR READ`. `SEL` is SELECT; `EXPLAIN` doesn't run the
+  request, and runs.
+- **Cube's SQL.** Values written in as literals (a quote doubled; a boolean
+  as 1 or 0). The dialect (`src/model/teradata-dialect.ts`): `TOP n`, an
+  offset as `QUALIFY ROW_NUMBER() OVER (ORDER BY …)` (Tesseract only; the
+  legacy planner refuses an offset), ORDER BY expressions and only on a
+  statement with a limit (Teradata refuses one in a subquery), each
+  granularity as a `TIMESTAMP(0)` (`TRUNC` cast, an hour and a minute through
+  `TO_CHAR`), `ADD_MONTHS` and intervals of up to 9,999, predicates for
+  true and false, LIKE lowered for ILIKE. **A time zone other than UTC is
+  refused** with a time dimension: Teradata names its zones its own way, and
+  no conversion is guessed until a server shows one across a daylight-saving
+  change.
+- **Catalog.** The X views (`DBC.DatabasesVX`, `TablesVX`, `ColumnsVX`): what
+  the user may access, Teradata's own databases left out, type codes named.
+- **SQL runner.** `setQueryTimeout`, whose abort is read as the timeout at
+  its time (error 3110); a Boolean parameter is refused
+  (`parameters_unsupported`, `teradata_boolean`); a `?` text, a number
+  `CAST(? AS DECIMAL(38, s))`, a date `CAST(? AS DATE FORMAT 'YYYY-MM-DD')`,
+  a date and time `CAST(? AS TIMESTAMP(6))`; 2,048 values a statement.
+
+**TDV** (`src/connections/tdv.ts`) is TIBCO Data Virtualization's driver
+(`cs.jdbc.driver.CompositeDriver`, its jar mounted under `tdv/` from the
+customer's own install).
+- **URL.** `jdbc:compositesw:dbapi@host:port?…` with xcube's properties
+  alone: `domain` (`composite` by default, or an LDAP domain), `dataSource`
+  (the published data source), `encrypt`, `validateRemoteCert` and
+  `validateRemoteHostname` (both on with TLS: TDV's driver checks neither
+  unless asked), `connectTimeout` (seconds) and `requestTimeout`
+  (milliseconds, the statement's limit on the server). Never a trace file,
+  another way of signing in, or a weaker TLS setting. `domain` and
+  `dataSource` can't hold `?` `&` `=` `@` `:` `/` or whitespace. Its CA is
+  the deployment's (`XCUBE_JDBC_TRUST_STORE`): TDV's driver reads only the
+  JVM's trust store.
+- **No read-only session** (`setReadOnly` throws): the check and an account
+  with Read and Select only. Its check refuses any `{` (its `{OPTION …}`
+  hints, which can ship rows to a source's temporary tables, and JDBC
+  escapes), `CALL` and `EXECUTE`, and a procedure in a FROM or JOIN
+  (`FROM proc(1) p`, a path's too): a procedure can write, run Java, or reach
+  elsewhere. A published procedure an information link reads from is
+  refused so too.
+- **Cube's SQL.** Values written in as literals. The dialect
+  (`src/model/tdv-dialect.ts`): `TOP n`, or `OFFSET … FETCH NEXT` with an
+  offset, `TRUNC` for a week (`IW`) and a quarter and `DATE_TRUNC` for the
+  rest, `TZCONVERTOR` for an IANA zone, `TIMESTAMPADD`, LIKE lowered for
+  ILIKE; no function TDV only pushes to a source.
+- **Catalog.** The driver's DatabaseMetaData: a published catalog is part of
+  each schema's name, `catalog.schema`. A table export takes `catalog` to
+  name a table in one: `"catalog"."schema"."table"`.
+- **SQL runner.** `requestTimeout` is the limit (TDV documents no
+  `setQueryTimeout`; xcube sets it where the driver takes it); a `?` text,
+  `CAST(? AS DECIMAL(38, s))`, `DATE`, `TIMESTAMP`, `BOOLEAN`.
+
+**Neither is run against a server**: none is reachable (Teradata's is a VM
+behind a registration, TDV's a licensed build). Their URLs, checks,
+parameters and dialects are tested as text (`test/unit/teradata-tdv.test.ts`),
+and the session they share with Db2 in the image (`test/image/jdbc.js`).
 
 **DuckDB** runs in Cube's own process, one instance per connection (`src/connections/duckdb.ts`).
 - **Kinds.**
@@ -1139,6 +1217,7 @@ top of them:
      as anything but a read is. It reads a backslash in a backtick name as an
      escape (`` `a\`; drop table t` `` is one name), and a doubled quote as
      two strings, never as a quote.
+   - Teradata's and TDV's: see their connections above.
    - Db2's: a data-change table reference (`FINAL TABLE`, `NEW TABLE`,
      `OLD TABLE`); a sequence's `NEXT VALUE FOR` and `PREVIOUS VALUE FOR`
      (`NEXTVAL`, `PREVVAL`); `EXTERNAL` (a file read as a table); `KEEP …
@@ -1739,6 +1818,7 @@ never written into the SQL.
   - BigQuery: `@p1`, with its `types` (`DATETIME` for a date and time) on
     the dry run and the job;
   - DuckDB: `$1`, `$1::DECIMAL(38, 2)`, `$1::DATE`, `$1::TIMESTAMP`, `$1::BOOLEAN`;
+  - Teradata and TDV: `?`, typed as their connections above say;
   - Db2: `?`, every one typed (Db2 refuses a `?` whose type it can't tell):
     `CAST(? AS VARCHAR(32672))`, `CAST(? AS DECIMAL(31, 2))`,
     `CAST(? AS DATE)`, `CAST(? AS TIMESTAMP(6))` (sent with a space for the
@@ -1824,11 +1904,15 @@ none were known yet):
 #### `POST …/connections/{name}/export`
 
 Streams a whole table of a stored connection, for wechart's engine to load,
-through the connection's own credentials: `{ runId, schema?, table, columns?,
-timeoutMs? }` (`src/sql/export.ts`).
+through the connection's own credentials: `{ runId, catalog?, schema?, table,
+columns?, timeoutMs? }` (`src/sql/export.ts`).
 - **Its statement is xcube's own:** `SELECT <columns, or *> FROM
-  <schema>.<table>`, each name quoted for the database. A name holding a quote,
-  bracket, backslash or control character is refused (`400 invalid_export`).
+  <schema>.<table>`, each name quoted for the database, exactly as given (Db2
+  and Teradata fold an unquoted name to upper case: give the catalog's). A
+  name holding a quote, bracket, backslash or control character is refused
+  (`400 invalid_export`). `catalog` names a table in a TDV data source's
+  published catalog, `"catalog"."schema"."table"`; on any other database it
+  is refused.
 - **It is a SQL run** (see SQL runner), with no row or byte cap: the same
   read-only layers, a connection of its own, the database's own statement
   timeout from `timeoutMs` (30 minutes by default, at most 6 hours), and a
@@ -1894,6 +1978,8 @@ timeoutMs? }` (`src/sql/export.ts`).
   | ClickHouse | 10,000 | 10,000 | xcube's: its parameters go in the URL, which the server caps (`http_max_uri_size`, 1 MiB by default) |
   | DuckDB, wechart's engine | 65,535 | 65,535 | xcube's |
   | Db2 | 32,767 | 32,767 | Host variable references in a statement |
+  | Teradata | 2,048 | 2,048 | xcube's, below a request's USING |
+  | TDV | 10,000 | 10,000 | xcube's |
   | Trino, Athena, Hive, Impala | 10,000 | 10,000 | xcube's: each value is written in as a literal |
 
   The refusals above are `400 invalid_parameters` with the reason, before
@@ -1945,7 +2031,7 @@ holding one; `waiting` those waiting for one.
 The driver types a connection may use, for the client's catalog of what it
 can offer: `{ drivers: [{ type, available, reason? }] }`, in the order of
 `DRIVER_TYPES`. The same for every model. Each driver in the image is
-available; a JDBC type (`db2`) only where its vendor's jar is mounted
+available; a JDBC type (`teradata`, `db2`, `tdv`) only where its vendor's jar is mounted
 (`XCUBE_JDBC_DRIVERS_DIR`), with a `reason` naming the type and directory
 where it isn't:
 `{ "type": "db2", "available": false, "reason": "No driver jar is mounted for db2: this deployment sets no XCUBE_JDBC_DRIVERS_DIR" }`.
